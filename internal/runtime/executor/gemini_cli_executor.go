@@ -139,7 +139,8 @@ func (e *GeminiCLIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth
 
 	basePayload = fixGeminiCLIImageAspectRatio(baseModel, basePayload)
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
-	basePayload = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, "gemini", "request", basePayload, originalTranslated, requestedModel)
+	requestPath := helps.PayloadRequestPath(opts)
+	basePayload = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, "gemini", "request", basePayload, originalTranslated, requestedModel, requestPath)
 
 	action := "generateContent"
 	if req.Metadata != nil {
@@ -294,7 +295,8 @@ func (e *GeminiCLIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 
 	basePayload = fixGeminiCLIImageAspectRatio(baseModel, basePayload)
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
-	basePayload = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, "gemini", "request", basePayload, originalTranslated, requestedModel)
+	requestPath := helps.PayloadRequestPath(opts)
+	basePayload = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, "gemini", "request", basePayload, originalTranslated, requestedModel, requestPath)
 
 	projectID := resolveGeminiProjectID(auth)
 
@@ -422,7 +424,9 @@ func (e *GeminiCLIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 					helps.RecordAPIResponseError(ctx, e.cfg, errScan)
 					reporter.PublishFailure(ctx)
 					out <- cliproxyexecutor.StreamChunk{Err: errScan}
+					return
 				}
+				reporter.EnsurePublished(ctx)
 				return
 			}
 
@@ -898,7 +902,14 @@ func parseRetryDelay(errorBody []byte) (*time.Duration, error) {
 		if matches := re.FindStringSubmatch(message); len(matches) > 1 {
 			seconds, err := strconv.Atoi(matches[1])
 			if err == nil {
-				return new(time.Duration(seconds) * time.Second), nil
+				duration := time.Duration(seconds) * time.Second
+				return &duration, nil
+			}
+		}
+		reHuman := regexp.MustCompile(`after\s+((?:\d+h)?(?:\d+m)?(?:\d+s)?)\.?`)
+		if matches := reHuman.FindStringSubmatch(strings.ToLower(message)); len(matches) > 1 {
+			if duration, err := time.ParseDuration(matches[1]); err == nil && duration > 0 {
+				return &duration, nil
 			}
 		}
 	}
