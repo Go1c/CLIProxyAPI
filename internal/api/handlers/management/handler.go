@@ -15,6 +15,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/buildinfo"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	"golang.org/x/crypto/bcrypt"
@@ -40,6 +41,7 @@ type Handler struct {
 	attemptsMu          sync.Mutex
 	failedAttempts      map[string]*attemptInfo // keyed by client IP
 	authManager         *coreauth.Manager
+	usageStats          *usage.RequestStatistics
 	tokenStore          coreauth.Store
 	localPassword       string
 	allowRemoteOverride bool
@@ -58,6 +60,7 @@ func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Man
 		configFilePath:      configFilePath,
 		failedAttempts:      make(map[string]*attemptInfo),
 		authManager:         manager,
+		usageStats:          usage.GetRequestStatistics(),
 		tokenStore:          sdkAuth.GetTokenStore(),
 		allowRemoteOverride: envSecret != "",
 		envSecret:           envSecret,
@@ -119,6 +122,14 @@ func (h *Handler) SetAuthManager(manager *coreauth.Manager) {
 	h.mu.Lock()
 	h.authManager = manager
 	h.mu.Unlock()
+}
+
+// SetUsageStatistics allows replacing the usage statistics reference in tests.
+func (h *Handler) SetUsageStatistics(stats *usage.RequestStatistics) {
+	if h == nil {
+		return
+	}
+	h.usageStats = stats
 }
 
 // SetLocalPassword configures the runtime-local password accepted for localhost requests.
@@ -245,10 +256,6 @@ func (h *Handler) AuthenticateManagementKey(clientIP string, localClient bool, p
 		h.attemptsMu.Unlock()
 	}
 
-	if secretHash == "" && envSecret == "" {
-		return false, http.StatusForbidden, "remote management key not set"
-	}
-
 	if provided == "" {
 		fail()
 		return false, http.StatusUnauthorized, "missing management key"
@@ -261,6 +268,10 @@ func (h *Handler) AuthenticateManagementKey(clientIP string, localClient bool, p
 				return true, 0, ""
 			}
 		}
+	}
+
+	if secretHash == "" && envSecret == "" {
+		return false, http.StatusForbidden, "remote management key not set"
 	}
 
 	if envSecret != "" && subtle.ConstantTimeCompare([]byte(provided), []byte(envSecret)) == 1 {
