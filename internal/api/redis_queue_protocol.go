@@ -14,6 +14,11 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
+const (
+	maxRedisRESPArrayElements   = 64
+	maxRedisRESPBulkStringBytes = 1 << 20
+)
+
 func isRedisRESPPrefix(prefix byte) bool {
 	switch prefix {
 	case '*', '$', '+', '-', ':':
@@ -256,6 +261,9 @@ func readRESPArray(reader *bufio.Reader) ([]string, error) {
 	if err != nil || count < 0 {
 		return nil, fmt.Errorf("protocol error")
 	}
+	if count > maxRedisRESPArrayElements {
+		return nil, fmt.Errorf("array length too large")
+	}
 	args := make([]string, 0, count)
 	for i := 0; i < count; i++ {
 		value, err := readRESPString(reader)
@@ -293,6 +301,9 @@ func readRESPBulkString(reader *bufio.Reader) (string, error) {
 	}
 	if length < 0 {
 		return "", nil
+	}
+	if length > maxRedisRESPBulkStringBytes {
+		return "", fmt.Errorf("bulk string too large")
 	}
 	buf := make([]byte, length+2)
 	if _, err := io.ReadFull(reader, buf); err != nil {

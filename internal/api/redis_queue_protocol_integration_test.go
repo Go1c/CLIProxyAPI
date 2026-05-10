@@ -171,6 +171,30 @@ func readRESPArrayOfBulkStrings(r *bufio.Reader) ([][]byte, error) {
 	return out, nil
 }
 
+func TestRedisProtocol_RejectsOversizedBulkStringBeforeReadingPayload(t *testing.T) {
+	reader := bufio.NewReader(strings.NewReader("*1\r\n$1048577\r\n"))
+
+	_, err := readRESPArray(reader)
+	if err == nil {
+		t.Fatalf("expected oversized bulk string error")
+	}
+	if !strings.Contains(err.Error(), "bulk string too large") {
+		t.Fatalf("expected oversized bulk string error, got %v", err)
+	}
+}
+
+func TestRedisProtocol_RejectsOversizedArrayBeforeReadingElements(t *testing.T) {
+	reader := bufio.NewReader(strings.NewReader("*65\r\n"))
+
+	_, err := readRESPArray(reader)
+	if err == nil {
+		t.Fatalf("expected oversized array error")
+	}
+	if !strings.Contains(err.Error(), "array length too large") {
+		t.Fatalf("expected oversized array error, got %v", err)
+	}
+}
+
 func TestRedisProtocol_ManagementDisabled_RejectsConnection(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
 	redisqueue.SetEnabled(false)
