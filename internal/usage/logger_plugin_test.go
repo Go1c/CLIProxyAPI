@@ -2,8 +2,6 @@ package usage
 
 import (
 	"context"
-	"os"
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -13,15 +11,13 @@ import (
 func TestRequestStatisticsRecordIncludesLatency(t *testing.T) {
 	stats := NewRequestStatistics()
 	stats.Record(context.Background(), coreusage.Record{
-		APIKey:           "test-key",
-		Model:            "gpt-5.4",
-		RequestedAt:      time.Date(2026, 3, 20, 12, 0, 0, 0, time.UTC),
-		Latency:          1500 * time.Millisecond,
-		FirstByteLatency: 250 * time.Millisecond,
+		APIKey:      "test-key",
+		Model:       "gpt-5.4",
+		RequestedAt: time.Date(2026, 3, 20, 12, 0, 0, 0, time.UTC),
+		Latency:     1500 * time.Millisecond,
 		Detail: coreusage.Detail{
 			InputTokens:  10,
 			OutputTokens: 20,
-			CachedTokens: 5,
 			TotalTokens:  30,
 		},
 	})
@@ -34,23 +30,37 @@ func TestRequestStatisticsRecordIncludesLatency(t *testing.T) {
 	if details[0].LatencyMs != 1500 {
 		t.Fatalf("latency_ms = %d, want 1500", details[0].LatencyMs)
 	}
-	if details[0].FirstByteLatencyMs != 250 {
-		t.Fatalf("first_byte_latency_ms = %d, want 250", details[0].FirstByteLatencyMs)
+}
+
+func TestRequestStatisticsCapsPerModelDetails(t *testing.T) {
+	const detailLimit = 1000
+	stats := NewRequestStatistics()
+	base := time.Date(2026, 3, 20, 12, 0, 0, 0, time.UTC)
+	for i := 0; i < detailLimit+5; i++ {
+		stats.Record(context.Background(), coreusage.Record{
+			APIKey:      "test-key",
+			Model:       "gpt-5.4",
+			RequestedAt: base.Add(time.Duration(i) * time.Second),
+			Detail: coreusage.Detail{
+				InputTokens: 1,
+				TotalTokens: 1,
+			},
+		})
 	}
-	if snapshot.TotalCachedTokens != 5 {
-		t.Fatalf("total_cached_tokens = %d, want 5", snapshot.TotalCachedTokens)
+
+	snapshot := stats.Snapshot()
+	model := snapshot.APIs["test-key"].Models["gpt-5.4"]
+	if snapshot.TotalRequests != int64(detailLimit+5) {
+		t.Fatalf("total_requests = %d, want %d", snapshot.TotalRequests, detailLimit+5)
 	}
-	if snapshot.CacheHitRate != 50 {
-		t.Fatalf("cache_hit_rate = %f, want 50", snapshot.CacheHitRate)
+	if model.TotalRequests != int64(detailLimit+5) {
+		t.Fatalf("model total_requests = %d, want %d", model.TotalRequests, detailLimit+5)
 	}
-	if snapshot.AverageLatencyMs != 1500 {
-		t.Fatalf("average_latency_ms = %d, want 1500", snapshot.AverageLatencyMs)
+	if len(model.Details) != detailLimit {
+		t.Fatalf("details len = %d, want %d", len(model.Details), detailLimit)
 	}
-	if snapshot.AverageFirstByteLatencyMs != 250 {
-		t.Fatalf("average_first_byte_latency_ms = %d, want 250", snapshot.AverageFirstByteLatencyMs)
-	}
-	if snapshot.TPS != 1 {
-		t.Fatalf("tps = %f, want 1", snapshot.TPS)
+	if got := model.Details[0].Timestamp; !got.Equal(base.Add(5 * time.Second)) {
+		t.Fatalf("oldest retained timestamp = %s, want %s", got, base.Add(5*time.Second))
 	}
 }
 
@@ -114,77 +124,5 @@ func TestRequestStatisticsMergeSnapshotDedupIgnoresLatency(t *testing.T) {
 	details := snapshot.APIs["test-key"].Models["gpt-5.4"].Details
 	if len(details) != 1 {
 		t.Fatalf("details len = %d, want 1", len(details))
-	}
-}
-
-func TestUsageStatisticsPersistenceRoundTrip(t *testing.T) {
-	stats := NewRequestStatistics()
-	stats.Record(context.Background(), coreusage.Record{
-		APIKey:           "persist-key",
-		Model:            "gpt-5.5",
-		RequestedAt:      time.Date(2026, 5, 2, 12, 0, 0, 0, time.UTC),
-		Latency:          1800 * time.Millisecond,
-		FirstByteLatency: 300 * time.Millisecond,
-		Detail: coreusage.Detail{
-			InputTokens:  12,
-			OutputTokens: 18,
-			CachedTokens: 6,
-			TotalTokens:  30,
-		},
-	})
-
-	path := filepath.Join(t.TempDir(), "usage-statistics.json")
-	if err := SaveStatisticsFile(path, stats.Snapshot()); err != nil {
-		t.Fatalf("SaveStatisticsFile() error = %v", err)
-	}
-
-	restored := NewRequestStatistics()
-	result, err := LoadStatisticsFile(restored, path)
-	if err != nil {
-		t.Fatalf("LoadStatisticsFile() error = %v", err)
-	}
-	if result.Added != 1 || result.Skipped != 0 {
-		t.Fatalf("LoadStatisticsFile() result = %+v, want added=1 skipped=0", result)
-	}
-
-	snapshot := restored.Snapshot()
-	if snapshot.TotalRequests != 1 || snapshot.TotalTokens != 30 || snapshot.TotalCachedTokens != 6 {
-		t.Fatalf("snapshot totals = requests %d tokens %d cached %d", snapshot.TotalRequests, snapshot.TotalTokens, snapshot.TotalCachedTokens)
-	}
-	detail := snapshot.APIs["persist-key"].Models["gpt-5.5"].Details[0]
-	if detail.FirstByteLatencyMs != 300 || detail.LatencyMs != 1800 {
-		t.Fatalf("detail latency = %d first byte = %d", detail.LatencyMs, detail.FirstByteLatencyMs)
-	}
-}
-
-func TestUsageStatisticsPersistenceFlushesOnStop(t *testing.T) {
-	stats := NewRequestStatistics()
-	path := filepath.Join(t.TempDir(), "usage-statistics.json")
-
-	ctx, cancel := context.WithCancel(context.Background())
-	stop := StartPersistence(ctx, stats, path, time.Hour)
-	stats.Record(context.Background(), coreusage.Record{
-		APIKey:      "stop-key",
-		Model:       "gpt-5.5",
-		RequestedAt: time.Date(2026, 5, 2, 13, 0, 0, 0, time.UTC),
-		Detail: coreusage.Detail{
-			InputTokens: 1,
-			TotalTokens: 1,
-		},
-	})
-	cancel()
-	stop()
-
-	if _, err := os.Stat(path); err != nil {
-		t.Fatalf("persisted file stat error = %v", err)
-	}
-
-	restored := NewRequestStatistics()
-	result, err := LoadStatisticsFile(restored, path)
-	if err != nil {
-		t.Fatalf("LoadStatisticsFile() error = %v", err)
-	}
-	if result.Added != 1 {
-		t.Fatalf("LoadStatisticsFile() added = %d, want 1", result.Added)
 	}
 }

@@ -124,8 +124,13 @@ func (h *Handler) SetAuthManager(manager *coreauth.Manager) {
 	h.mu.Unlock()
 }
 
-// SetUsageStatistics allows replacing the usage statistics reference.
-func (h *Handler) SetUsageStatistics(stats *usage.RequestStatistics) { h.usageStats = stats }
+// SetUsageStatistics allows replacing the usage statistics reference in tests.
+func (h *Handler) SetUsageStatistics(stats *usage.RequestStatistics) {
+	if h == nil {
+		return
+	}
+	h.usageStats = stats
+}
 
 // SetLocalPassword configures the runtime-local password accepted for localhost requests.
 func (h *Handler) SetLocalPassword(password string) { h.localPassword = password }
@@ -251,10 +256,6 @@ func (h *Handler) AuthenticateManagementKey(clientIP string, localClient bool, p
 		h.attemptsMu.Unlock()
 	}
 
-	if secretHash == "" && envSecret == "" {
-		return false, http.StatusForbidden, "remote management key not set"
-	}
-
 	if provided == "" {
 		fail()
 		return false, http.StatusUnauthorized, "missing management key"
@@ -267,6 +268,10 @@ func (h *Handler) AuthenticateManagementKey(clientIP string, localClient bool, p
 				return true, 0, ""
 			}
 		}
+	}
+
+	if secretHash == "" && envSecret == "" {
+		return false, http.StatusForbidden, "remote management key not set"
 	}
 
 	if envSecret != "" && subtle.ConstantTimeCompare([]byte(provided), []byte(envSecret)) == 1 {

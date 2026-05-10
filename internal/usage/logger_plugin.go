@@ -11,11 +11,13 @@ import (
 	"sync/atomic"
 	"time"
 
-	internallogging "github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
+	"github.com/gin-gonic/gin"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
 )
 
 var statisticsEnabled atomic.Bool
+
+const maxRequestDetailsPerModel = 1000
 
 func init() {
 	statisticsEnabled.Store(true)
@@ -60,19 +62,10 @@ func StatisticsEnabled() bool { return statisticsEnabled.Load() }
 type RequestStatistics struct {
 	mu sync.RWMutex
 
-	totalRequests     int64
-	successCount      int64
-	failureCount      int64
-	totalTokens       int64
-	totalInputTokens  int64
-	totalCachedTokens int64
-
-	totalLatencyMs          int64
-	latencySamples          int64
-	totalFirstByteLatencyMs int64
-	firstByteSamples        int64
-	firstRequestAt          time.Time
-	lastRequestAt           time.Time
+	totalRequests int64
+	successCount  int64
+	failureCount  int64
+	totalTokens   int64
 
 	apis map[string]*apiStats
 
@@ -84,43 +77,26 @@ type RequestStatistics struct {
 
 // apiStats holds aggregated metrics for a single API key.
 type apiStats struct {
-	TotalRequests           int64
-	TotalTokens             int64
-	TotalInputTokens        int64
-	TotalCachedTokens       int64
-	TotalLatencyMs          int64
-	LatencySamples          int64
-	TotalFirstByteLatencyMs int64
-	FirstByteLatencySamples int64
-	FirstRequestAt          time.Time
-	LastRequestAt           time.Time
-	Models                  map[string]*modelStats
+	TotalRequests int64
+	TotalTokens   int64
+	Models        map[string]*modelStats
 }
 
 // modelStats holds aggregated metrics for a specific model within an API.
 type modelStats struct {
-	TotalRequests           int64
-	TotalTokens             int64
-	TotalInputTokens        int64
-	TotalCachedTokens       int64
-	TotalLatencyMs          int64
-	LatencySamples          int64
-	TotalFirstByteLatencyMs int64
-	FirstByteLatencySamples int64
-	FirstRequestAt          time.Time
-	LastRequestAt           time.Time
-	Details                 []RequestDetail
+	TotalRequests int64
+	TotalTokens   int64
+	Details       []RequestDetail
 }
 
 // RequestDetail stores the timestamp, latency, and token usage for a single request.
 type RequestDetail struct {
-	Timestamp          time.Time  `json:"timestamp"`
-	LatencyMs          int64      `json:"latency_ms"`
-	FirstByteLatencyMs int64      `json:"first_byte_latency_ms"`
-	Source             string     `json:"source"`
-	AuthIndex          string     `json:"auth_index"`
-	Tokens             TokenStats `json:"tokens"`
-	Failed             bool       `json:"failed"`
+	Timestamp time.Time  `json:"timestamp"`
+	LatencyMs int64      `json:"latency_ms"`
+	Source    string     `json:"source"`
+	AuthIndex string     `json:"auth_index"`
+	Tokens    TokenStats `json:"tokens"`
+	Failed    bool       `json:"failed"`
 }
 
 // TokenStats captures the token usage breakdown for a request.
@@ -134,16 +110,10 @@ type TokenStats struct {
 
 // StatisticsSnapshot represents an immutable view of the aggregated metrics.
 type StatisticsSnapshot struct {
-	TotalRequests             int64   `json:"total_requests"`
-	SuccessCount              int64   `json:"success_count"`
-	FailureCount              int64   `json:"failure_count"`
-	TotalTokens               int64   `json:"total_tokens"`
-	TotalInputTokens          int64   `json:"total_input_tokens"`
-	TotalCachedTokens         int64   `json:"total_cached_tokens"`
-	CacheHitRate              float64 `json:"cache_hit_rate"`
-	AverageLatencyMs          int64   `json:"average_latency_ms"`
-	AverageFirstByteLatencyMs int64   `json:"average_first_byte_latency_ms"`
-	TPS                       float64 `json:"tps"`
+	TotalRequests int64 `json:"total_requests"`
+	SuccessCount  int64 `json:"success_count"`
+	FailureCount  int64 `json:"failure_count"`
+	TotalTokens   int64 `json:"total_tokens"`
 
 	APIs map[string]APISnapshot `json:"apis"`
 
@@ -155,28 +125,16 @@ type StatisticsSnapshot struct {
 
 // APISnapshot summarises metrics for a single API key.
 type APISnapshot struct {
-	TotalRequests             int64                    `json:"total_requests"`
-	TotalTokens               int64                    `json:"total_tokens"`
-	TotalInputTokens          int64                    `json:"total_input_tokens"`
-	TotalCachedTokens         int64                    `json:"total_cached_tokens"`
-	CacheHitRate              float64                  `json:"cache_hit_rate"`
-	AverageLatencyMs          int64                    `json:"average_latency_ms"`
-	AverageFirstByteLatencyMs int64                    `json:"average_first_byte_latency_ms"`
-	TPS                       float64                  `json:"tps"`
-	Models                    map[string]ModelSnapshot `json:"models"`
+	TotalRequests int64                    `json:"total_requests"`
+	TotalTokens   int64                    `json:"total_tokens"`
+	Models        map[string]ModelSnapshot `json:"models"`
 }
 
 // ModelSnapshot summarises metrics for a specific model.
 type ModelSnapshot struct {
-	TotalRequests             int64           `json:"total_requests"`
-	TotalTokens               int64           `json:"total_tokens"`
-	TotalInputTokens          int64           `json:"total_input_tokens"`
-	TotalCachedTokens         int64           `json:"total_cached_tokens"`
-	CacheHitRate              float64         `json:"cache_hit_rate"`
-	AverageLatencyMs          int64           `json:"average_latency_ms"`
-	AverageFirstByteLatencyMs int64           `json:"average_first_byte_latency_ms"`
-	TPS                       float64         `json:"tps"`
-	Details                   []RequestDetail `json:"details"`
+	TotalRequests int64           `json:"total_requests"`
+	TotalTokens   int64           `json:"total_tokens"`
+	Details       []RequestDetail `json:"details"`
 }
 
 var defaultRequestStatistics = NewRequestStatistics()
@@ -235,19 +193,6 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 		s.failureCount++
 	}
 	s.totalTokens += totalTokens
-	s.totalInputTokens += detail.InputTokens
-	s.totalCachedTokens += detail.CachedTokens
-	latencyMs := normaliseLatency(record.Latency)
-	firstByteLatencyMs := normaliseLatency(record.FirstByteLatency)
-	if latencyMs > 0 {
-		s.totalLatencyMs += latencyMs
-		s.latencySamples++
-	}
-	if firstByteLatencyMs > 0 {
-		s.totalFirstByteLatencyMs += firstByteLatencyMs
-		s.firstByteSamples++
-	}
-	updateTimeWindow(&s.firstRequestAt, &s.lastRequestAt, timestamp)
 
 	stats, ok := s.apis[statsKey]
 	if !ok {
@@ -255,13 +200,12 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 		s.apis[statsKey] = stats
 	}
 	s.updateAPIStats(stats, modelName, RequestDetail{
-		Timestamp:          timestamp,
-		LatencyMs:          latencyMs,
-		FirstByteLatencyMs: firstByteLatencyMs,
-		Source:             record.Source,
-		AuthIndex:          record.AuthIndex,
-		Tokens:             detail,
-		Failed:             failed,
+		Timestamp: timestamp,
+		LatencyMs: normaliseLatency(record.Latency),
+		Source:    record.Source,
+		AuthIndex: record.AuthIndex,
+		Tokens:    detail,
+		Failed:    failed,
 	})
 
 	s.requestsByDay[dayKey]++
@@ -273,18 +217,6 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 func (s *RequestStatistics) updateAPIStats(stats *apiStats, model string, detail RequestDetail) {
 	stats.TotalRequests++
 	stats.TotalTokens += detail.Tokens.TotalTokens
-	stats.TotalInputTokens += detail.Tokens.InputTokens
-	stats.TotalCachedTokens += detail.Tokens.CachedTokens
-	if detail.LatencyMs > 0 {
-		stats.TotalLatencyMs += detail.LatencyMs
-		stats.LatencySamples++
-	}
-	if detail.FirstByteLatencyMs > 0 {
-		stats.TotalFirstByteLatencyMs += detail.FirstByteLatencyMs
-		stats.FirstByteLatencySamples++
-	}
-	updateTimeWindow(&stats.FirstRequestAt, &stats.LastRequestAt, detail.Timestamp)
-
 	modelStatsValue, ok := stats.Models[model]
 	if !ok {
 		modelStatsValue = &modelStats{}
@@ -292,18 +224,21 @@ func (s *RequestStatistics) updateAPIStats(stats *apiStats, model string, detail
 	}
 	modelStatsValue.TotalRequests++
 	modelStatsValue.TotalTokens += detail.Tokens.TotalTokens
-	modelStatsValue.TotalInputTokens += detail.Tokens.InputTokens
-	modelStatsValue.TotalCachedTokens += detail.Tokens.CachedTokens
-	if detail.LatencyMs > 0 {
-		modelStatsValue.TotalLatencyMs += detail.LatencyMs
-		modelStatsValue.LatencySamples++
-	}
-	if detail.FirstByteLatencyMs > 0 {
-		modelStatsValue.TotalFirstByteLatencyMs += detail.FirstByteLatencyMs
-		modelStatsValue.FirstByteLatencySamples++
-	}
-	updateTimeWindow(&modelStatsValue.FirstRequestAt, &modelStatsValue.LastRequestAt, detail.Timestamp)
 	modelStatsValue.Details = append(modelStatsValue.Details, detail)
+	modelStatsValue.Details = trimRequestDetails(modelStatsValue.Details, maxRequestDetailsPerModel)
+}
+
+func trimRequestDetails(details []RequestDetail, max int) []RequestDetail {
+	if max <= 0 || len(details) <= max {
+		return details
+	}
+	drop := len(details) - max
+	copy(details, details[drop:])
+	var zero RequestDetail
+	for i := max; i < len(details); i++ {
+		details[i] = zero
+	}
+	return details[:max]
 }
 
 // Snapshot returns a copy of the aggregated metrics for external consumption.
@@ -320,39 +255,21 @@ func (s *RequestStatistics) Snapshot() StatisticsSnapshot {
 	result.SuccessCount = s.successCount
 	result.FailureCount = s.failureCount
 	result.TotalTokens = s.totalTokens
-	result.TotalInputTokens = s.totalInputTokens
-	result.TotalCachedTokens = s.totalCachedTokens
-	result.CacheHitRate = cacheHitRate(s.totalCachedTokens, s.totalInputTokens)
-	result.AverageLatencyMs = averageMs(s.totalLatencyMs, s.latencySamples)
-	result.AverageFirstByteLatencyMs = averageMs(s.totalFirstByteLatencyMs, s.firstByteSamples)
-	result.TPS = throughputPerSecond(s.totalRequests, s.firstRequestAt, s.lastRequestAt)
 
 	result.APIs = make(map[string]APISnapshot, len(s.apis))
 	for apiName, stats := range s.apis {
 		apiSnapshot := APISnapshot{
-			TotalRequests:             stats.TotalRequests,
-			TotalTokens:               stats.TotalTokens,
-			TotalInputTokens:          stats.TotalInputTokens,
-			TotalCachedTokens:         stats.TotalCachedTokens,
-			CacheHitRate:              cacheHitRate(stats.TotalCachedTokens, stats.TotalInputTokens),
-			AverageLatencyMs:          averageMs(stats.TotalLatencyMs, stats.LatencySamples),
-			AverageFirstByteLatencyMs: averageMs(stats.TotalFirstByteLatencyMs, stats.FirstByteLatencySamples),
-			TPS:                       throughputPerSecond(stats.TotalRequests, stats.FirstRequestAt, stats.LastRequestAt),
-			Models:                    make(map[string]ModelSnapshot, len(stats.Models)),
+			TotalRequests: stats.TotalRequests,
+			TotalTokens:   stats.TotalTokens,
+			Models:        make(map[string]ModelSnapshot, len(stats.Models)),
 		}
 		for modelName, modelStatsValue := range stats.Models {
 			requestDetails := make([]RequestDetail, len(modelStatsValue.Details))
 			copy(requestDetails, modelStatsValue.Details)
 			apiSnapshot.Models[modelName] = ModelSnapshot{
-				TotalRequests:             modelStatsValue.TotalRequests,
-				TotalTokens:               modelStatsValue.TotalTokens,
-				TotalInputTokens:          modelStatsValue.TotalInputTokens,
-				TotalCachedTokens:         modelStatsValue.TotalCachedTokens,
-				CacheHitRate:              cacheHitRate(modelStatsValue.TotalCachedTokens, modelStatsValue.TotalInputTokens),
-				AverageLatencyMs:          averageMs(modelStatsValue.TotalLatencyMs, modelStatsValue.LatencySamples),
-				AverageFirstByteLatencyMs: averageMs(modelStatsValue.TotalFirstByteLatencyMs, modelStatsValue.FirstByteLatencySamples),
-				TPS:                       throughputPerSecond(modelStatsValue.TotalRequests, modelStatsValue.FirstRequestAt, modelStatsValue.LastRequestAt),
-				Details:                   requestDetails,
+				TotalRequests: modelStatsValue.TotalRequests,
+				TotalTokens:   modelStatsValue.TotalTokens,
+				Details:       requestDetails,
 			}
 		}
 		result.APIs[apiName] = apiSnapshot
@@ -436,9 +353,6 @@ func (s *RequestStatistics) MergeSnapshot(snapshot StatisticsSnapshot) MergeResu
 				if detail.LatencyMs < 0 {
 					detail.LatencyMs = 0
 				}
-				if detail.FirstByteLatencyMs < 0 {
-					detail.FirstByteLatencyMs = 0
-				}
 				if detail.Timestamp.IsZero() {
 					detail.Timestamp = time.Now()
 				}
@@ -470,17 +384,6 @@ func (s *RequestStatistics) recordImported(apiName, modelName string, stats *api
 		s.successCount++
 	}
 	s.totalTokens += totalTokens
-	s.totalInputTokens += detail.Tokens.InputTokens
-	s.totalCachedTokens += detail.Tokens.CachedTokens
-	if detail.LatencyMs > 0 {
-		s.totalLatencyMs += detail.LatencyMs
-		s.latencySamples++
-	}
-	if detail.FirstByteLatencyMs > 0 {
-		s.totalFirstByteLatencyMs += detail.FirstByteLatencyMs
-		s.firstByteSamples++
-	}
-	updateTimeWindow(&s.firstRequestAt, &s.lastRequestAt, detail.Timestamp)
 
 	s.updateAPIStats(stats, modelName, detail)
 
@@ -514,8 +417,21 @@ func dedupKey(apiName, modelName string, detail RequestDetail) string {
 
 func resolveAPIIdentifier(ctx context.Context, record coreusage.Record) string {
 	if ctx != nil {
-		if endpoint := strings.TrimSpace(internallogging.GetEndpoint(ctx)); endpoint != "" {
-			return endpoint
+		if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil {
+			path := ginCtx.FullPath()
+			if path == "" && ginCtx.Request != nil {
+				path = ginCtx.Request.URL.Path
+			}
+			method := ""
+			if ginCtx.Request != nil {
+				method = ginCtx.Request.Method
+			}
+			if path != "" {
+				if method != "" {
+					return method + " " + path
+				}
+				return path
+			}
 		}
 	}
 	if record.Provider != "" {
@@ -525,7 +441,14 @@ func resolveAPIIdentifier(ctx context.Context, record coreusage.Record) string {
 }
 
 func resolveSuccess(ctx context.Context) bool {
-	status := internallogging.GetResponseStatus(ctx)
+	if ctx == nil {
+		return true
+	}
+	ginCtx, ok := ctx.Value("gin").(*gin.Context)
+	if !ok || ginCtx == nil {
+		return true
+	}
+	status := ginCtx.Writer.Status()
 	if status == 0 {
 		return true
 	}
@@ -566,46 +489,6 @@ func normaliseLatency(latency time.Duration) int64 {
 		return 0
 	}
 	return latency.Milliseconds()
-}
-
-func updateTimeWindow(first, last *time.Time, timestamp time.Time) {
-	if first == nil || last == nil || timestamp.IsZero() {
-		return
-	}
-	if first.IsZero() || timestamp.Before(*first) {
-		*first = timestamp
-	}
-	if last.IsZero() || timestamp.After(*last) {
-		*last = timestamp
-	}
-}
-
-func cacheHitRate(cachedTokens, inputTokens int64) float64 {
-	if inputTokens <= 0 || cachedTokens <= 0 {
-		return 0
-	}
-	return float64(cachedTokens) / float64(inputTokens) * 100
-}
-
-func averageMs(totalMs, samples int64) int64 {
-	if totalMs <= 0 || samples <= 0 {
-		return 0
-	}
-	return totalMs / samples
-}
-
-func throughputPerSecond(totalRequests int64, first, last time.Time) float64 {
-	if totalRequests <= 0 || first.IsZero() || last.IsZero() {
-		return 0
-	}
-	elapsed := last.Sub(first).Seconds()
-	if elapsed <= 0 {
-		return float64(totalRequests)
-	}
-	if elapsed < 1 {
-		elapsed = 1
-	}
-	return float64(totalRequests) / elapsed
 }
 
 func formatHour(hour int) string {

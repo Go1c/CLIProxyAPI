@@ -69,10 +69,6 @@ func (h *Handler) ImportUsageStatistics(c *gin.Context) {
 	}
 
 	result := h.usageStats.MergeSnapshot(payload.Usage)
-	if err := usage.SaveConfiguredStatistics(); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to persist usage statistics"})
-		return
-	}
 	snapshot := h.usageStats.Snapshot()
 	c.JSON(http.StatusOK, gin.H{
 		"added":           result.Added,

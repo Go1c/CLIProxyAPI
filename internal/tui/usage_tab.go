@@ -121,19 +121,13 @@ func (m usageTabModel) renderContent() string {
 	successCnt := int64(getFloat(usageMap, "success_count"))
 	failureCnt := int64(getFloat(usageMap, "failure_count"))
 	totalTokens := int64(getFloat(usageMap, "total_tokens"))
-	totalInputTokens := int64(getFloat(usageMap, "total_input_tokens"))
-	totalCachedTokens := int64(getFloat(usageMap, "total_cached_tokens"))
-	cacheHitRate := getFloat(usageMap, "cache_hit_rate")
-	avgLatencyMs := int64(getFloat(usageMap, "average_latency_ms"))
-	avgFirstByteMs := int64(getFloat(usageMap, "average_first_byte_latency_ms"))
-	tps := getFloat(usageMap, "tps")
 
 	// ━━━ Overview Cards ━━━
-	cardWidth := 22
+	cardWidth := 20
 	if m.width > 0 {
-		cardWidth = (m.width - 4) / 3
-		if cardWidth < 18 {
-			cardWidth = 18
+		cardWidth = (m.width - 6) / 4
+		if cardWidth < 16 {
+			cardWidth = 16
 		}
 	}
 	cardStyle := lipgloss.NewStyle().
@@ -156,56 +150,38 @@ func (m usageTabModel) renderContent() string {
 		"%s\n%s\n%s",
 		lipgloss.NewStyle().Foreground(colorMuted).Render(T("usage_total_tokens")),
 		lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("214")).Render(formatLargeNumber(totalTokens)),
-		lipgloss.NewStyle().Foreground(colorMuted).Render(fmt.Sprintf("%s: %s", T("usage_cached"), formatLargeNumber(totalCachedTokens))),
+		lipgloss.NewStyle().Foreground(colorMuted).Render(fmt.Sprintf("%s: %s", T("usage_total_token_l"), formatLargeNumber(totalTokens))),
 	))
 
-	// Cache hit rate
-	card3 := cardStyle.Copy().BorderForeground(lipgloss.Color("76")).Render(fmt.Sprintf(
-		"%s\n%s\n%s",
-		lipgloss.NewStyle().Foreground(colorMuted).Render(T("usage_cache_hit")),
-		lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("76")).Render(formatPercentage(cacheHitRate)),
-		lipgloss.NewStyle().Foreground(colorMuted).Render(fmt.Sprintf("%s: %s", T("usage_input"), formatLargeNumber(totalInputTokens))),
-	))
-
-	// First byte latency
-	card4 := cardStyle.Copy().BorderForeground(lipgloss.Color("170")).Render(fmt.Sprintf(
-		"%s\n%s\n%s",
-		lipgloss.NewStyle().Foreground(colorMuted).Render(T("usage_first_byte")),
-		lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("170")).Render(formatLatency(avgFirstByteMs)),
-		lipgloss.NewStyle().Foreground(colorMuted).Render(fmt.Sprintf("%s: %s", T("usage_avg_latency"), formatLatency(avgLatencyMs))),
-	))
-
-	// TPS
-	card5 := cardStyle.Copy().BorderForeground(lipgloss.Color("105")).Render(fmt.Sprintf(
-		"%s\n%s\n%s",
-		lipgloss.NewStyle().Foreground(colorMuted).Render(T("usage_tps")),
-		lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("105")).Render(fmt.Sprintf("%.2f", tps)),
-		lipgloss.NewStyle().Foreground(colorMuted).Render(T("usage_avg_recorded")),
-	))
-
-	// RPM / TPM
+	// RPM
 	rpm := float64(0)
 	if totalReqs > 0 {
 		if rByH, ok := usageMap["requests_by_hour"].(map[string]any); ok && len(rByH) > 0 {
 			rpm = float64(totalReqs) / float64(len(rByH)) / 60.0
 		}
 	}
+	card3 := cardStyle.Copy().BorderForeground(lipgloss.Color("76")).Render(fmt.Sprintf(
+		"%s\n%s\n%s",
+		lipgloss.NewStyle().Foreground(colorMuted).Render(T("usage_rpm")),
+		lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("76")).Render(fmt.Sprintf("%.2f", rpm)),
+		lipgloss.NewStyle().Foreground(colorMuted).Render(fmt.Sprintf("%s: %d", T("usage_total_reqs"), totalReqs)),
+	))
+
+	// TPM
 	tpm := float64(0)
 	if totalTokens > 0 {
 		if tByH, ok := usageMap["tokens_by_hour"].(map[string]any); ok && len(tByH) > 0 {
 			tpm = float64(totalTokens) / float64(len(tByH)) / 60.0
 		}
 	}
-	card6 := cardStyle.Copy().BorderForeground(lipgloss.Color("39")).Render(fmt.Sprintf(
+	card4 := cardStyle.Copy().BorderForeground(lipgloss.Color("170")).Render(fmt.Sprintf(
 		"%s\n%s\n%s",
-		lipgloss.NewStyle().Foreground(colorMuted).Render(T("usage_rpm")+" / "+T("usage_tpm")),
-		lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("39")).Render(fmt.Sprintf("%.2f / %.2f", rpm, tpm)),
-		lipgloss.NewStyle().Foreground(colorMuted).Render(fmt.Sprintf("%s: %d", T("usage_total_reqs"), totalReqs)),
+		lipgloss.NewStyle().Foreground(colorMuted).Render(T("usage_tpm")),
+		lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("170")).Render(fmt.Sprintf("%.2f", tpm)),
+		lipgloss.NewStyle().Foreground(colorMuted).Render(fmt.Sprintf("%s: %s", T("usage_total_tokens"), formatLargeNumber(totalTokens))),
 	))
 
-	sb.WriteString(lipgloss.JoinHorizontal(lipgloss.Top, card1, " ", card2, " ", card3))
-	sb.WriteString("\n")
-	sb.WriteString(lipgloss.JoinHorizontal(lipgloss.Top, card4, " ", card5, " ", card6))
+	sb.WriteString(lipgloss.JoinHorizontal(lipgloss.Top, card1, " ", card2, " ", card3, " ", card4))
 	sb.WriteString("\n\n")
 
 	// ━━━ Requests by Hour (ASCII bar chart) ━━━
@@ -270,8 +246,6 @@ func (m usageTabModel) renderContent() string {
 							sb.WriteString(tableCellStyle.Render(mRow))
 							sb.WriteString("\n")
 
-							sb.WriteString(m.renderPerformanceBreakdown(stats))
-
 							// Token type breakdown from details
 							sb.WriteString(m.renderTokenBreakdown(stats))
 
@@ -286,23 +260,6 @@ func (m usageTabModel) renderContent() string {
 
 	sb.WriteString("\n")
 	return sb.String()
-}
-
-// renderPerformanceBreakdown displays model-level cache, first-byte, and TPS aggregates.
-func (m usageTabModel) renderPerformanceBreakdown(modelStats map[string]any) string {
-	cacheHitRate := getFloat(modelStats, "cache_hit_rate")
-	firstByteMs := int64(getFloat(modelStats, "average_first_byte_latency_ms"))
-	tps := getFloat(modelStats, "tps")
-	if cacheHitRate == 0 && firstByteMs == 0 && tps == 0 {
-		return ""
-	}
-	parts := []string{
-		fmt.Sprintf("%s:%s", T("usage_cache_hit"), formatPercentage(cacheHitRate)),
-		fmt.Sprintf("%s:%s", T("usage_first_byte"), formatLatency(firstByteMs)),
-		fmt.Sprintf("%s:%.2f", T("usage_tps"), tps),
-	}
-	return fmt.Sprintf("    │  %s\n",
-		lipgloss.NewStyle().Foreground(colorMuted).Render(strings.Join(parts, "  ")))
 }
 
 // renderTokenBreakdown aggregates input/output/cached/reasoning tokens from model details.
@@ -403,23 +360,6 @@ func (m usageTabModel) renderLatencyBreakdown(modelStats map[string]any) string 
 	return fmt.Sprintf("    │  %s: avg %dms  min %dms  max %dms\n",
 		lipgloss.NewStyle().Foreground(colorMuted).Render(T("usage_time")),
 		avgLatency, minLatency, maxLatency)
-}
-
-func formatPercentage(value float64) string {
-	if value <= 0 {
-		return "0.00%"
-	}
-	return fmt.Sprintf("%.2f%%", value)
-}
-
-func formatLatency(ms int64) string {
-	if ms <= 0 {
-		return "0ms"
-	}
-	if ms >= 1000 {
-		return fmt.Sprintf("%.2fs", float64(ms)/1000)
-	}
-	return fmt.Sprintf("%dms", ms)
 }
 
 // renderBarChart renders a simple ASCII horizontal bar chart.

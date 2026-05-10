@@ -2,9 +2,16 @@ package registry
 
 import "testing"
 
+func TestCodexFreeModelsIncludeGPT55(t *testing.T) {
+	model := findModelInfo(GetCodexFreeModels(), "gpt-5.5")
+	if model == nil {
+		t.Fatal("expected codex free tier to include gpt-5.5")
+	}
+	assertGPT55ModelInfo(t, "free", model)
+}
+
 func TestCodexStaticModelsIncludeGPT55(t *testing.T) {
 	tierModels := map[string][]*ModelInfo{
-		"free": GetCodexFreeModels(),
 		"team": GetCodexTeamModels(),
 		"plus": GetCodexPlusModels(),
 		"pro":  GetCodexProModels(),

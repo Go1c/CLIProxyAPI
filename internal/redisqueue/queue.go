@@ -9,6 +9,7 @@ import (
 const (
 	defaultRetentionSeconds int64 = 60
 	maxRetentionSeconds     int64 = 3600
+	maxQueueItems                 = 10000
 )
 
 type queueItem struct {
@@ -34,12 +35,6 @@ func init() {
 
 func SetEnabled(value bool) {
 	enabled.Store(value)
-	if !value {
-		global.clear()
-	}
-}
-
-func SetUsageStatisticsEnabled(value bool) {
 	if !value {
 		global.clear()
 	}
@@ -97,6 +92,7 @@ func (q *queue) enqueue(payload []byte) {
 		enqueuedAt: now,
 		payload:    append([]byte(nil), payload...),
 	})
+	q.enforceMaxItemsLocked()
 	q.maybeCompactLocked()
 }
 
@@ -140,8 +136,21 @@ func (q *queue) pruneLocked(now time.Time) {
 	}
 	cutoff := now.Add(-time.Duration(windowSeconds) * time.Second)
 	for q.head < len(q.items) && q.items[q.head].enqueuedAt.Before(cutoff) {
+		q.items[q.head] = queueItem{}
 		q.head++
 	}
+}
+
+func (q *queue) enforceMaxItemsLocked() {
+	available := len(q.items) - q.head
+	if available <= maxQueueItems {
+		return
+	}
+	drop := available - maxQueueItems
+	for i := q.head; i < q.head+drop; i++ {
+		q.items[i] = queueItem{}
+	}
+	q.head += drop
 }
 
 func (q *queue) maybeCompactLocked() {
