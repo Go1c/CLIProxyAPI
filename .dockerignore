@@ -20,6 +20,8 @@ auths/*
 logs/*
 conv/*
 config.yaml
+web/management-panel/node_modules/*
+web/management-panel/dist/*
 
 # Development/editor
 bin/*

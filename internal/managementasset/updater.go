@@ -93,6 +93,10 @@ func runAutoUpdater(ctx context.Context) {
 			log.Debug("management asset auto-updater skipped: disable-auto-update-panel is enabled")
 			return
 		}
+		if strings.TrimSpace(os.Getenv("MANAGEMENT_STATIC_PATH")) != "" {
+			log.Debug("management asset auto-updater skipped: MANAGEMENT_STATIC_PATH is set")
+			return
+		}
 
 		configPath, _ := schedulerConfigPath.Load().(string)
 		staticDir := StaticDir(configPath)
