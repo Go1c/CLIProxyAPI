@@ -13,6 +13,7 @@ import (
 	gin "github.com/gin-gonic/gin"
 	proxyconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	internallogging "github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/redisqueue"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v6/sdk/access"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
@@ -119,6 +120,7 @@ func TestManagementUsageRoutesRemainAvailableWithAPIKeyUsage(t *testing.T) {
 	paths := []string{
 		"/v0/management/usage",
 		"/v0/management/usage/export",
+		"/v0/management/usage-queue",
 		"/v0/management/api-key-usage",
 	}
 
@@ -132,6 +134,48 @@ func TestManagementUsageRoutesRemainAvailableWithAPIKeyUsage(t *testing.T) {
 		if rr.Code != http.StatusOK {
 			t.Fatalf("%s returned status %d, want %d; body=%s", path, rr.Code, http.StatusOK, rr.Body.String())
 		}
+	}
+}
+
+func TestManagementUsageQueuePopsJSONPayloadsForHTTPConsumers(t *testing.T) {
+	const password = "test-management-password"
+	server := newTestManagementServer(t, password)
+
+	redisqueue.SetEnabled(false)
+	redisqueue.SetEnabled(true)
+	t.Cleanup(func() { redisqueue.SetEnabled(false) })
+
+	redisqueue.Enqueue([]byte(`{"request_id":"req-1","model":"gpt-test"}`))
+	redisqueue.Enqueue([]byte(`{"request_id":"req-2","model":"gpt-test"}`))
+	redisqueue.Enqueue([]byte(`{"request_id":"req-3","model":"gpt-test"}`))
+
+	req := httptest.NewRequest(http.MethodGet, "/v0/management/usage-queue?count=2", nil)
+	req.RemoteAddr = "127.0.0.1:12345"
+	req.Header.Set("Authorization", "Bearer "+password)
+	rr := httptest.NewRecorder()
+	server.engine.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("unexpected status %d; body=%s", rr.Code, rr.Body.String())
+	}
+
+	var payload []map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("failed to decode usage queue response: %v; body=%s", err, rr.Body.String())
+	}
+	if len(payload) != 2 {
+		t.Fatalf("response item count = %d, want 2", len(payload))
+	}
+	if got := payload[0]["request_id"]; got != "req-1" {
+		t.Fatalf("first request_id = %v, want req-1", got)
+	}
+	if got := payload[1]["request_id"]; got != "req-2" {
+		t.Fatalf("second request_id = %v, want req-2", got)
+	}
+
+	remaining := redisqueue.PopOldest(10)
+	if len(remaining) != 1 || string(remaining[0]) != `{"request_id":"req-3","model":"gpt-test"}` {
+		t.Fatalf("remaining queue = %q, want only req-3", remaining)
 	}
 }
 

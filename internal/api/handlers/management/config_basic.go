@@ -193,7 +193,15 @@ func (h *Handler) PutUsageStatisticsEnabled(c *gin.Context) {
 	h.updateBoolField(c, func(v bool) { h.cfg.UsageStatisticsEnabled = v })
 }
 
-// UsageStatisticsEnabled
+// UsageStatisticsAggregationEnabled
+func (h *Handler) GetUsageStatisticsAggregationEnabled(c *gin.Context) {
+	c.JSON(200, gin.H{"usage-statistics-aggregation-enabled": h.cfg.UsageStatisticsAggregationEnabled})
+}
+func (h *Handler) PutUsageStatisticsAggregationEnabled(c *gin.Context) {
+	h.updateBoolField(c, func(v bool) { h.cfg.UsageStatisticsAggregationEnabled = v })
+}
+
+// LoggingToFile
 func (h *Handler) GetLoggingToFile(c *gin.Context) {
 	c.JSON(200, gin.H{"logging-to-file": h.cfg.LoggingToFile})
 }

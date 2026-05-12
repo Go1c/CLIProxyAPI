@@ -63,17 +63,22 @@ logs-max-total-size-mb: 0
 # When exceeded, the oldest error log files are deleted. Default is 10. Set to 0 to disable cleanup.
 error-logs-max-files: 10
 
-# When false, disable usage statistics aggregation and persistence.
+# When true, publish request usage events for external collectors such as CPA-Manager.
 usage-statistics-enabled: false
 
+# When true, also keep legacy in-process usage aggregation and snapshot persistence.
+# Disable this when CPA-Manager is the usage system of record.
+usage-statistics-aggregation-enabled: false
+
 # Optional file path for automatic usage statistics persistence.
-# Defaults to usage-statistics.json next to config.yaml when usage statistics are enabled.
+# Used only when usage-statistics-aggregation-enabled is true.
+# Defaults to usage-statistics.json next to config.yaml.
 usage-statistics-path: ""
 
-# How often usage statistics are flushed to disk. Defaults to 30 seconds when omitted or <= 0.
+# How often legacy usage statistics are flushed to disk. Defaults to 30 seconds when omitted or <= 0.
 usage-statistics-flush-interval-seconds: 30
 
-# How long (in seconds) Redis usage queue items are retained in memory for the RESP interface (LPOP/RPOP).
+# How long (in seconds) usage queue items are retained in memory for HTTP/RESP collectors.
 # Default: 60. Max: 3600.
 redis-usage-queue-retention-seconds: 60
 

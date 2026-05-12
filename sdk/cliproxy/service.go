@@ -482,6 +482,7 @@ func (s *Service) Run(ctx context.Context) error {
 		ctx = context.Background()
 	}
 
+	internalusage.SetStatisticsEnabled(s.cfg.UsageStatisticsAggregationEnabled)
 	usage.StartDefault(ctx)
 	stopUsagePersistence := internalusage.StartPersistence(ctx, internalusage.GetRequestStatistics(), s.usageStatisticsPath(), s.usageStatisticsFlushInterval())
 	defer stopUsagePersistence()
@@ -799,7 +800,7 @@ func (s *Service) Shutdown(ctx context.Context) error {
 }
 
 func (s *Service) usageStatisticsPath() string {
-	if s == nil || s.cfg == nil || !s.cfg.UsageStatisticsEnabled {
+	if s == nil || s.cfg == nil || !s.cfg.UsageStatisticsAggregationEnabled {
 		return ""
 	}
 	if path := strings.TrimSpace(s.cfg.UsageStatisticsPath); path != "" {

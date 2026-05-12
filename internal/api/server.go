@@ -508,6 +508,7 @@ func (s *Server) registerManagementRoutes() {
 	mgmt.Use(s.managementAvailabilityMiddleware(), s.mgmt.Middleware())
 	{
 		mgmt.GET("/usage", s.mgmt.GetUsageStatistics)
+		mgmt.GET("/usage-queue", s.mgmt.GetUsageQueue)
 		mgmt.GET("/usage/export", s.mgmt.ExportUsageStatistics)
 		mgmt.POST("/usage/import", s.mgmt.ImportUsageStatistics)
 
@@ -535,6 +536,9 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/usage-statistics-enabled", s.mgmt.GetUsageStatisticsEnabled)
 		mgmt.PUT("/usage-statistics-enabled", s.mgmt.PutUsageStatisticsEnabled)
 		mgmt.PATCH("/usage-statistics-enabled", s.mgmt.PutUsageStatisticsEnabled)
+		mgmt.GET("/usage-statistics-aggregation-enabled", s.mgmt.GetUsageStatisticsAggregationEnabled)
+		mgmt.PUT("/usage-statistics-aggregation-enabled", s.mgmt.PutUsageStatisticsAggregationEnabled)
+		mgmt.PATCH("/usage-statistics-aggregation-enabled", s.mgmt.PutUsageStatisticsAggregationEnabled)
 
 		mgmt.GET("/proxy-url", s.mgmt.GetProxyURL)
 		mgmt.PUT("/proxy-url", s.mgmt.PutProxyURL)
@@ -1001,8 +1005,10 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 		}
 	}
 
+	if oldCfg == nil || oldCfg.UsageStatisticsAggregationEnabled != cfg.UsageStatisticsAggregationEnabled {
+		usage.SetStatisticsEnabled(cfg.UsageStatisticsAggregationEnabled)
+	}
 	if oldCfg == nil || oldCfg.UsageStatisticsEnabled != cfg.UsageStatisticsEnabled {
-		usage.SetStatisticsEnabled(cfg.UsageStatisticsEnabled)
 		redisqueue.SetUsageStatisticsEnabled(cfg.UsageStatisticsEnabled)
 	}
 

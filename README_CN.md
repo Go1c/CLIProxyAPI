@@ -55,9 +55,10 @@ docker compose up -d --build
 
 从 [`config.example.yaml`](config.example.yaml) 开始。PPAP 里最常用的相关配置：
 
-- `usage-statistics-enabled`：启用内置使用量快照。
-- `usage-statistics-path`：可选，把快照文件放到指定路径。
-- `redis-usage-queue-retention-seconds`：Redis usage queue 启用时的保留时间。
+- `usage-statistics-enabled`：发布请求用量事件，供 CPA-Manager 等外部采集器消费。
+- `usage-statistics-aggregation-enabled`：启用旧的进程内使用量快照；改用 CPA-Manager 作为统计源后建议保持关闭。
+- `usage-statistics-path`：可选，把旧快照文件放到指定路径。
+- `redis-usage-queue-retention-seconds`：usage queue 事件保留时间，HTTP/RESP 采集都会使用。
 - `oauth-model-alias`：配置友好模型别名，同时兼容老配置写法。
 
 对于明确支持 thinking levels 的模型，PPAP 可以自动暴露：
@@ -89,7 +90,7 @@ PPAP 已把 `gpt-5.3-codex-spark` 加入本地 usage 成本估算。官方 previ
 
 - 管理面板源码：[`web/management-panel`](web/management-panel)
 - 管理 API 文档：[help.router-for.me/cn/management/api](https://help.router-for.me/cn/management/api)
-- Usage 接口：`/v0/management/usage`、`/v0/management/usage/export`、`/v0/management/usage/import`
+- Usage 接口：`/v0/management/usage`、`/v0/management/usage-queue`、`/v0/management/usage/export`、`/v0/management/usage/import`
 - Amp CLI 指南：[help.router-for.me/cn/agent-client/amp-cli.html](https://help.router-for.me/cn/agent-client/amp-cli.html)
 
 Release 里的 `management.html` 与后端二进制来自同一个 tag，运行中的 PPAP 可以直接把面板更新地址指向本仓库。

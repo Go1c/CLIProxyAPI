@@ -62,8 +62,11 @@ type Config struct {
 	// When exceeded, the oldest error log files are deleted. Default is 10. Set to 0 to disable cleanup.
 	ErrorLogsMaxFiles int `yaml:"error-logs-max-files" json:"error-logs-max-files"`
 
-	// UsageStatisticsEnabled toggles usage aggregation; when false, usage data is discarded.
+	// UsageStatisticsEnabled toggles usage event publishing for external collectors.
 	UsageStatisticsEnabled bool `yaml:"usage-statistics-enabled" json:"usage-statistics-enabled"`
+
+	// UsageStatisticsAggregationEnabled toggles legacy in-process usage aggregation and persistence.
+	UsageStatisticsAggregationEnabled bool `yaml:"usage-statistics-aggregation-enabled,omitempty" json:"usage-statistics-aggregation-enabled,omitempty"`
 
 	// UsageStatisticsPath stores the automatic usage snapshot. When empty, it defaults to usage-statistics.json next to config.yaml.
 	UsageStatisticsPath string `yaml:"usage-statistics-path,omitempty" json:"usage-statistics-path,omitempty"`

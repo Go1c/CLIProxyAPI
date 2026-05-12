@@ -54,9 +54,10 @@ Keep `config.yaml`, `.env`, OAuth files, API keys, auth directories, logs, and g
 
 Start from [`config.example.yaml`](config.example.yaml). The most useful PPAP-specific settings are:
 
-- `usage-statistics-enabled`: enable built-in usage snapshots.
-- `usage-statistics-path`: optionally move the usage snapshot away from the config directory.
-- `redis-usage-queue-retention-seconds`: tune Redis usage queue retention when Redis usage queueing is enabled.
+- `usage-statistics-enabled`: publish request usage events for external collectors such as CPA-Manager.
+- `usage-statistics-aggregation-enabled`: keep the legacy in-process usage snapshot enabled. Leave this off when CPA-Manager is the usage system of record.
+- `usage-statistics-path`: optionally move the legacy usage snapshot away from the config directory.
+- `redis-usage-queue-retention-seconds`: tune HTTP/RESP usage queue retention when usage publishing is enabled.
 - `oauth-model-alias`: define friendly model aliases while preserving old config compatibility.
 
 For models that declare thinking levels, PPAP can expose automatic aliases such as:
@@ -88,7 +89,7 @@ References:
 
 - Management panel source: [`web/management-panel`](web/management-panel)
 - Management API docs: [help.router-for.me/management/api](https://help.router-for.me/management/api)
-- Usage endpoints: `/v0/management/usage`, `/v0/management/usage/export`, `/v0/management/usage/import`
+- Usage endpoints: `/v0/management/usage`, `/v0/management/usage-queue`, `/v0/management/usage/export`, `/v0/management/usage/import`
 - Amp CLI guide: [help.router-for.me/agent-client/amp-cli.html](https://help.router-for.me/agent-client/amp-cli.html)
 
 The release asset `management.html` is built from the same tag as the backend binaries, so a running PPAP instance can point its panel updater at this repository.

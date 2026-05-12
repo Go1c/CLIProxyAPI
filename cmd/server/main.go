@@ -418,7 +418,7 @@ func main() {
 			configFileExists = true
 		}
 	}
-	usage.SetStatisticsEnabled(cfg.UsageStatisticsEnabled)
+	usage.SetStatisticsEnabled(cfg.UsageStatisticsAggregationEnabled)
 	redisqueue.SetUsageStatisticsEnabled(cfg.UsageStatisticsEnabled)
 	redisqueue.SetRetentionSeconds(cfg.RedisUsageQueueRetentionSeconds)
 	coreauth.SetQuotaCooldownDisabled(cfg.DisableCooling)

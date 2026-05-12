@@ -1,12 +1,20 @@
 package management
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/redisqueue"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
+)
+
+const (
+	defaultUsageQueuePopCount = 100
+	maxUsageQueuePopCount     = 1000
 )
 
 type usageExportPayload struct {
@@ -30,6 +38,49 @@ func (h *Handler) GetUsageStatistics(c *gin.Context) {
 		"usage":           snapshot,
 		"failed_requests": snapshot.FailureCount,
 	})
+}
+
+// GetUsageQueue pops raw usage events for external collectors such as CPA-Manager.
+func (h *Handler) GetUsageQueue(c *gin.Context) {
+	count, ok := parseUsageQueueCount(c.Query("count"))
+	if !ok {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid count"})
+		return
+	}
+
+	items := redisqueue.PopOldest(count)
+	payload := make([]json.RawMessage, 0, len(items))
+	for _, item := range items {
+		trimmed := bytes.TrimSpace(item)
+		if len(trimmed) == 0 {
+			continue
+		}
+		if json.Valid(trimmed) {
+			payload = append(payload, append(json.RawMessage(nil), trimmed...))
+			continue
+		}
+		encoded, err := json.Marshal(string(item))
+		if err != nil {
+			continue
+		}
+		payload = append(payload, encoded)
+	}
+
+	c.JSON(http.StatusOK, payload)
+}
+
+func parseUsageQueueCount(raw string) (int, bool) {
+	if raw == "" {
+		return defaultUsageQueuePopCount, true
+	}
+	count, err := strconv.Atoi(raw)
+	if err != nil || count <= 0 {
+		return 0, false
+	}
+	if count > maxUsageQueuePopCount {
+		count = maxUsageQueuePopCount
+	}
+	return count, true
 }
 
 // ExportUsageStatistics returns a complete usage snapshot for backup/migration.

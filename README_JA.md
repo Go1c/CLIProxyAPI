@@ -55,9 +55,10 @@ docker compose up -d --build
 
 [`config.example.yaml`](config.example.yaml) から始めてください。PPAP でよく使う設定:
 
-- `usage-statistics-enabled`: built-in usage snapshot を有効化。
-- `usage-statistics-path`: snapshot file の保存先を指定。
-- `redis-usage-queue-retention-seconds`: Redis usage queue retention を調整。
+- `usage-statistics-enabled`: CPA-Manager などの external collector 向けに request usage events を publish。
+- `usage-statistics-aggregation-enabled`: legacy in-process usage snapshot を有効化。CPA-Manager を usage source of record にする場合は無効のままにしてください。
+- `usage-statistics-path`: legacy snapshot file の保存先を指定。
+- `redis-usage-queue-retention-seconds`: HTTP/RESP usage queue retention を調整。
 - `oauth-model-alias`: friendly model alias を定義し、legacy config style も維持。
 
 thinking levels を宣言している model では、PPAP は次のような aliases を自動で公開できます。
@@ -89,7 +90,7 @@ References:
 
 - Management panel source: [`web/management-panel`](web/management-panel)
 - Management API docs: [help.router-for.me/management/api](https://help.router-for.me/management/api)
-- Usage endpoints: `/v0/management/usage`, `/v0/management/usage/export`, `/v0/management/usage/import`
+- Usage endpoints: `/v0/management/usage`, `/v0/management/usage-queue`, `/v0/management/usage/export`, `/v0/management/usage/import`
 - Amp CLI guide: [help.router-for.me/agent-client/amp-cli.html](https://help.router-for.me/agent-client/amp-cli.html)
 
 Release asset の `management.html` は backend binaries と同じ tag から build されます。
