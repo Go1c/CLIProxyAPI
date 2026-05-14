@@ -77,7 +77,7 @@ jobs:
             BUILD_DATE=${{ github.event.head_commit.timestamp }}
 
       - name: Prepare SSH
-        if: ${{ github.event_name == 'push' || inputs.deploy == true }}
+        if: ${{ (github.event_name == 'workflow_dispatch' && inputs.deploy == true) || (github.event_name == 'push' && vars.PRODUCTION_DEPLOY_ENABLED == 'true') }}
         env:
           PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
           PROD_SSH_KNOWN_HOSTS: ${{ secrets.PROD_SSH_KNOWN_HOSTS }}
@@ -94,7 +94,7 @@ jobs:
           fi
 
       - name: Deploy
-        if: ${{ github.event_name == 'push' || inputs.deploy == true }}
+        if: ${{ (github.event_name == 'workflow_dispatch' && inputs.deploy == true) || (github.event_name == 'push' && vars.PRODUCTION_DEPLOY_ENABLED == 'true') }}
         env:
           PROD_HOST: ${{ secrets.PROD_HOST }}
           PROD_USER: ${{ secrets.PROD_USER }}
