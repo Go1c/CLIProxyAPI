@@ -785,6 +785,13 @@ func newProxyAwareWebsocketDialer(cfg *config.Config, auth *cliproxyauth.Auth) *
 		}).DialContext,
 	}
 
+	// Force the VSCode-aligned TLS fingerprint for the Codex websocket handshake.
+	// NewCodexRustlsNetDialTLSContext performs proxy handling internally, so gorilla's
+	// Proxy hook must stay nil while it is in use; gorilla uses NetDialTLSContext for
+	// wss:// and bypasses NetDialContext/Proxy.
+	dialer.NetDialTLSContext = helps.NewCodexRustlsNetDialTLSContext(cfg, auth)
+	dialer.Proxy = nil
+
 	proxyURL := ""
 	if auth != nil {
 		proxyURL = strings.TrimSpace(auth.ProxyURL)
