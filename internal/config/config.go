@@ -116,8 +116,8 @@ type Config struct {
 	// Codex defines a list of Codex API key configurations as specified in the YAML configuration file.
 	CodexKey []CodexKey `yaml:"codex-api-key" json:"codex-api-key"`
 
-	// CodexHeaderDefaults configures fallback headers for Codex OAuth model requests.
-	// These are used only when the client does not send its own headers.
+	// CodexHeaderDefaults configures header values for Codex model requests.
+	// Configured values take precedence over matching client-supplied headers.
 	CodexHeaderDefaults CodexHeaderDefaults `yaml:"codex-header-defaults" json:"codex-header-defaults"`
 
 	// ClaudeKey defines a list of Claude API key configurations as specified in the YAML configuration file.
@@ -169,12 +169,27 @@ type ClaudeHeaderDefaults struct {
 	StabilizeDeviceProfile *bool  `yaml:"stabilize-device-profile,omitempty" json:"stabilize-device-profile,omitempty"`
 }
 
-// CodexHeaderDefaults configures fallback header values injected into Codex
-// model requests for OAuth/file-backed auth when the client omits them.
-// UserAgent applies to HTTP and websocket requests; BetaFeatures only applies to websockets.
+const (
+	DefaultCodexHeaderUserAgent    = "codex_vscode/0.128.0 (Ubuntu 22.4.0; x86_64) dumb (codex_exec; 0.128.0)"
+	DefaultCodexHeaderOriginator   = "codex_vscode"
+	DefaultCodexHeaderBetaFeatures = "terminal_resize_reflow"
+)
+
+// CodexHeaderDefaults configures header values injected into Codex model
+// requests. Configured values take precedence over matching client-supplied
+// headers; empty values fall back to the built-in Codex profile.
 type CodexHeaderDefaults struct {
 	UserAgent    string `yaml:"user-agent" json:"user-agent"`
+	Originator   string `yaml:"originator" json:"originator"`
 	BetaFeatures string `yaml:"beta-features" json:"beta-features"`
+}
+
+func DefaultCodexHeaderDefaults() CodexHeaderDefaults {
+	return CodexHeaderDefaults{
+		UserAgent:    DefaultCodexHeaderUserAgent,
+		Originator:   DefaultCodexHeaderOriginator,
+		BetaFeatures: DefaultCodexHeaderBetaFeatures,
+	}
 }
 
 // TLSConfig holds HTTPS server settings.
@@ -630,6 +645,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.Pprof.Addr = DefaultPprofAddr
 	cfg.AmpCode.RestrictManagementToLocalhost = false // Default to false: API key auth is sufficient
 	cfg.RemoteManagement.PanelGitHubRepository = DefaultPanelGitHubRepository
+	cfg.CodexHeaderDefaults = DefaultCodexHeaderDefaults()
 	if err = yaml.Unmarshal(data, &cfg); err != nil {
 		if optional {
 			// In cloud deploy mode, if YAML parsing fails, return empty config instead of error.
@@ -808,6 +824,7 @@ func (cfg *Config) SanitizeCodexHeaderDefaults() {
 		return
 	}
 	cfg.CodexHeaderDefaults.UserAgent = strings.TrimSpace(cfg.CodexHeaderDefaults.UserAgent)
+	cfg.CodexHeaderDefaults.Originator = strings.TrimSpace(cfg.CodexHeaderDefaults.Originator)
 	cfg.CodexHeaderDefaults.BetaFeatures = strings.TrimSpace(cfg.CodexHeaderDefaults.BetaFeatures)
 }
 

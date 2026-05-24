@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -30,8 +31,9 @@ import (
 )
 
 const (
-	codexUserAgent             = "codex-tui/0.118.0 (Mac OS 26.3.1; arm64) iTerm.app/3.6.9 (codex-tui; 0.118.0)"
-	codexOriginator            = "codex-tui"
+	codexUserAgent             = config.DefaultCodexHeaderUserAgent
+	codexOriginator            = config.DefaultCodexHeaderOriginator
+	codexDefaultBetaFeatures   = config.DefaultCodexHeaderBetaFeatures
 	codexDefaultImageToolModel = "gpt-image-2"
 )
 
@@ -139,7 +141,7 @@ func (e *CodexExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth
 	if err := e.PrepareRequest(httpReq, auth); err != nil {
 		return nil, err
 	}
-	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	httpClient := helps.NewCodexRustlsHTTPClient(ctx, e.cfg, auth, 0)
 	return httpClient.Do(httpReq)
 }
 
@@ -209,7 +211,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		AuthType:  authType,
 		AuthValue: authValue,
 	})
-	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	httpClient := helps.NewCodexRustlsHTTPClient(ctx, e.cfg, auth, 0)
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
@@ -360,7 +362,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 		AuthType:  authType,
 		AuthValue: authValue,
 	})
-	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	httpClient := helps.NewCodexRustlsHTTPClient(ctx, e.cfg, auth, 0)
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
@@ -459,7 +461,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		AuthValue: authValue,
 	})
 
-	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	httpClient := helps.NewCodexRustlsHTTPClient(ctx, e.cfg, auth, 0)
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
@@ -771,41 +773,25 @@ func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, s
 		ginHeaders = ginCtx.Request.Header
 	}
 
-	if ginHeaders.Get("X-Codex-Beta-Features") != "" {
-		r.Header.Set("X-Codex-Beta-Features", ginHeaders.Get("X-Codex-Beta-Features"))
-	}
 	misc.EnsureHeader(r.Header, ginHeaders, "Version", "")
-	misc.EnsureHeader(r.Header, ginHeaders, "X-Codex-Turn-Metadata", "")
-	misc.EnsureHeader(r.Header, ginHeaders, "X-Client-Request-Id", "")
-	cfgUserAgent, _ := codexHeaderDefaults(cfg, auth)
+	cfgUserAgent, cfgOriginator, cfgBetaFeatures := codexHeaderDefaults(cfg, auth)
+	ensureHeaderWithPriority(r.Header, ginHeaders, "x-codex-beta-features", cfgBetaFeatures, codexDefaultBetaFeatures)
+	ensureCodexIdentityHeaders(r.Header, ginHeaders)
 	ensureHeaderWithConfigPrecedence(r.Header, ginHeaders, "User-Agent", cfgUserAgent, codexUserAgent)
-
-	if strings.Contains(r.Header.Get("User-Agent"), "Mac OS") {
-		misc.EnsureHeader(r.Header, ginHeaders, "Session_id", uuid.NewString())
-	}
+	ensureHeaderWithConfigPrecedence(r.Header, ginHeaders, "Originator", cfgOriginator, codexOriginator)
 
 	if stream {
 		r.Header.Set("Accept", "text/event-stream")
 	} else {
 		r.Header.Set("Accept", "application/json")
 	}
-	r.Header.Set("Connection", "Keep-Alive")
 
-	isAPIKey := false
-	if auth != nil && auth.Attributes != nil {
-		if v := strings.TrimSpace(auth.Attributes["api_key"]); v != "" {
-			isAPIKey = true
-		}
-	}
-	if originator := strings.TrimSpace(ginHeaders.Get("Originator")); originator != "" {
-		r.Header.Set("Originator", originator)
-	} else if !isAPIKey {
-		r.Header.Set("Originator", codexOriginator)
-	}
-	if !isAPIKey {
+	if !codexAuthUsesAPIKey(auth) {
 		if auth != nil && auth.Metadata != nil {
 			if accountID, ok := auth.Metadata["account_id"].(string); ok {
-				r.Header.Set("Chatgpt-Account-Id", accountID)
+				if trimmed := strings.TrimSpace(accountID); trimmed != "" {
+					setHeaderCasePreserved(r.Header, "ChatGPT-Account-ID", trimmed)
+				}
 			}
 		}
 	}
@@ -814,6 +800,60 @@ func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, s
 		attrs = auth.Attributes
 	}
 	util.ApplyCustomHeadersFromAttrs(r, attrs)
+}
+
+type codexTurnMetadata struct {
+	SessionID           string `json:"session_id"`
+	ThreadSource        string `json:"thread_source"`
+	TurnID              string `json:"turn_id"`
+	Sandbox             string `json:"sandbox"`
+	TurnStartedAtUnixMS int64  `json:"turn_started_at_unix_ms"`
+}
+
+func ensureCodexIdentityHeaders(target http.Header, source http.Header) {
+	if target == nil {
+		return
+	}
+	sessionID := codexSessionIDForHeaders(target, source)
+	ensureHeaderCasePreserved(target, source, "session_id", "", sessionID)
+	ensureHeaderWithPriority(target, source, "x-client-request-id", "", sessionID)
+	ensureHeaderWithPriority(target, source, "x-codex-window-id", "", sessionID+":0")
+	ensureHeaderWithPriority(target, source, "x-codex-turn-metadata", "", defaultCodexTurnMetadata(sessionID))
+}
+
+func codexSessionIDForHeaders(target http.Header, source http.Header) string {
+	for _, key := range []string{"session_id", "x-client-request-id"} {
+		if val := strings.TrimSpace(headerValueCaseInsensitive(target, key)); val != "" {
+			return val
+		}
+		if val := strings.TrimSpace(headerValueCaseInsensitive(source, key)); val != "" {
+			return val
+		}
+	}
+	return newCodexHeaderUUID()
+}
+
+func defaultCodexTurnMetadata(sessionID string) string {
+	meta := codexTurnMetadata{
+		SessionID:           sessionID,
+		ThreadSource:        "user",
+		TurnID:              newCodexHeaderUUID(),
+		Sandbox:             "seccomp",
+		TurnStartedAtUnixMS: time.Now().UnixMilli(),
+	}
+	data, err := json.Marshal(meta)
+	if err != nil {
+		return ""
+	}
+	return string(data)
+}
+
+func newCodexHeaderUUID() string {
+	id, err := uuid.NewV7()
+	if err == nil {
+		return id.String()
+	}
+	return uuid.NewString()
 }
 
 func newCodexStatusErr(statusCode int, body []byte) statusErr {
