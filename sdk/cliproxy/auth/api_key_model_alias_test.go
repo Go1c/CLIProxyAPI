@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 )
 
 func TestLookupAPIKeyUpstreamModel(t *testing.T) {
@@ -16,8 +16,6 @@ func TestLookupAPIKeyUpstreamModel(t *testing.T) {
 				Models: []internalconfig.GeminiModel{
 					{Name: "gemini-2.5-pro-exp-03-25", Alias: "g25p"},
 					{Name: "gemini-2.5-flash(low)", Alias: "g25f"},
-					{Name: "gemini-2.5-pro-high", Alias: "g25p-fast"},
-					{Name: "explicit-upstream", Alias: "explicit-high"},
 				},
 			},
 		},
@@ -37,14 +35,11 @@ func TestLookupAPIKeyUpstreamModel(t *testing.T) {
 	}{
 		// Fast path + suffix preservation
 		{"alias with suffix", "a1", "g25p(8192)", "gemini-2.5-pro-exp-03-25(8192)"},
-		{"alias with hyphen suffix", "a1", "g25p-high", "gemini-2.5-pro-exp-03-25(high)"},
 		{"alias without suffix", "a1", "g25p", "gemini-2.5-pro-exp-03-25"},
-		{"explicit hyphen alias wins", "a1", "explicit-high", "explicit-upstream"},
 
 		// Config suffix takes priority
 		{"config suffix priority", "a1", "g25f(high)", "gemini-2.5-flash(low)"},
 		{"config suffix no user suffix", "a1", "g25f", "gemini-2.5-flash(low)"},
-		{"hyphen config suffix priority", "a1", "g25p-fast-low", "gemini-2.5-pro-high"},
 
 		// Case insensitive
 		{"uppercase alias", "a1", "G25P", "gemini-2.5-pro-exp-03-25"},
@@ -150,7 +145,7 @@ func TestApplyAPIKeyModelAlias(t *testing.T) {
 
 	ctx := context.Background()
 	apiKeyAuth := &Auth{ID: "a1", Provider: "gemini", Attributes: map[string]string{"api_key": "k"}}
-	oauthAuth := &Auth{ID: "oauth-auth", Provider: "gemini", Attributes: map[string]string{"auth_kind": "oauth"}}
+	oauthAuth := &Auth{ID: "oauth-auth", Provider: "claude", Attributes: map[string]string{"auth_kind": "oauth"}}
 	_, _ = mgr.Register(ctx, apiKeyAuth)
 
 	tests := []struct {

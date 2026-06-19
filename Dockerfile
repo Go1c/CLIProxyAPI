@@ -1,6 +1,8 @@
-FROM golang:1.26-alpine AS builder
+FROM golang:1.26-bookworm AS builder
 
 WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential git && rm -rf /var/lib/apt/lists/*
 
 COPY go.mod go.sum ./
 
@@ -12,28 +14,15 @@ ARG VERSION=dev
 ARG COMMIT=none
 ARG BUILD_DATE=unknown
 
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w -X 'main.Version=${VERSION}' -X 'main.Commit=${COMMIT}' -X 'main.BuildDate=${BUILD_DATE}'" -o ./CLIProxyAPI ./cmd/server/
+RUN CGO_ENABLED=1 GOOS=linux go build -buildvcs=false -ldflags="-s -w -X 'main.Version=${VERSION}' -X 'main.Commit=${COMMIT}' -X 'main.BuildDate=${BUILD_DATE}'" -o ./CLIProxyAPI ./cmd/server/
 
-FROM node:24-alpine AS management-panel
+FROM debian:bookworm
 
-WORKDIR /app/web/management-panel
+RUN apt-get update && apt-get install -y --no-install-recommends tzdata ca-certificates && rm -rf /var/lib/apt/lists/*
 
-COPY web/management-panel/package.json web/management-panel/package-lock.json ./
-
-RUN npm ci
-
-COPY web/management-panel/ ./
-
-RUN npm run build && cp dist/index.html dist/management.html
-
-FROM alpine:3.22.0
-
-RUN apk add --no-cache tzdata
-
-RUN mkdir -p /CLIProxyAPI/static
+RUN mkdir /CLIProxyAPI
 
 COPY --from=builder ./app/CLIProxyAPI /CLIProxyAPI/CLIProxyAPI
-COPY --from=management-panel ./app/web/management-panel/dist/management.html /CLIProxyAPI/static/management.html
 
 COPY config.example.yaml /CLIProxyAPI/config.example.yaml
 
@@ -42,7 +31,6 @@ WORKDIR /CLIProxyAPI
 EXPOSE 8317
 
 ENV TZ=Asia/Shanghai
-ENV MANAGEMENT_STATIC_PATH=/CLIProxyAPI/static
 
 RUN cp /usr/share/zoneinfo/${TZ} /etc/localtime && echo "${TZ}" > /etc/timezone
 

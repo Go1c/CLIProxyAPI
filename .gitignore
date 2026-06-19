@@ -1,11 +1,9 @@
 # Binaries
 cli-proxy-api
 *.exe
-build/
 
 # Configuration
 config.yaml
-local-smoke-config.yaml
 .env
 
 # Generated content
@@ -14,6 +12,8 @@ logs/*
 conv/*
 temp/*
 refs/*
+plugins/*
+examples/plugin/bin/*
 
 # Storage backends
 pgstore/*
@@ -26,7 +26,6 @@ static/*
 # Authentication data
 auths/*
 !auths/.gitkeep
-local-smoke-auth/
 
 # Documentation
 docs/*
@@ -42,6 +41,7 @@ GEMINI.md
 .gemini/*
 .serena/*
 .agent/*
+.agents
 .agents/*
 .opencode/*
 .idea/*
@@ -53,3 +53,4 @@ _bmad-output/*
 # macOS
 .DS_Store
 ._*
+.gocache/

@@ -30,7 +30,7 @@ remote-management:
   # disable-auto-update-panel: false
 
   # GitHub repository for the management control panel. Accepts a repository URL or releases API URL.
-  panel-github-repository: "https://github.com/daishuge/playful-proxy-api-panel"
+  panel-github-repository: "https://github.com/router-for-me/Cli-Proxy-API-Management-Center"
 
 # Authentication directory (supports ~ for home directory)
 auth-dir: "~/.cli-proxy-api"
@@ -49,7 +49,31 @@ pprof:
   enable: false
   addr: "127.0.0.1:8316"
 
-# When true, disable high-overhead HTTP middleware features to reduce per-request memory usage under high concurrency.
+# Standard dynamic library plugins are trusted in-process code. They are disabled by default.
+# Build Go examples with go build -buildmode=c-shared for the target GOOS/GOARCH.
+# Other languages can implement the same C ABI and JSON method protocol.
+# Plugin executors require a matching auth record with the same provider key.
+# If the same provider is configured as OpenAI-compatible, the native executor wins.
+# Plugin command-line flags and Management API routes are optional capabilities.
+# Existing native flags/routes and higher-priority plugin flags/routes cannot be replaced.
+# Plugin list Management API reads Logo and ConfigFields from plugin metadata for management UI display.
+# Per-plugin enabled only controls plugins.configs.<pluginID>.enabled and does not implicitly change global plugins.enabled.
+plugins:
+  enabled: false
+  dir: "plugins"
+  # Additional plugin store registries. The built-in official registry is always included.
+  # store-sources:
+  #   - "https://example.com/cliproxy-plugins/registry.json"
+  configs:
+    example:
+      enabled: true
+      priority: 1
+      config1: true
+      config2: "string"
+      config3: 3
+      mode: "safe" # enum example: safe, fast
+
+# When true, disable high-overhead request logging and HTTP middleware features to reduce per-request memory usage under high concurrency.
 commercial-mode: false
 
 # When true, write application logs to rotating files instead of stdout
@@ -63,22 +87,11 @@ logs-max-total-size-mb: 0
 # When exceeded, the oldest error log files are deleted. Default is 10. Set to 0 to disable cleanup.
 error-logs-max-files: 10
 
-# When true, publish request usage events for external collectors such as CPA-Manager.
+# When false, disable in-memory usage statistics aggregation
 usage-statistics-enabled: false
 
-# When true, also keep legacy in-process usage aggregation and snapshot persistence.
-# Disable this when CPA-Manager is the usage system of record.
-usage-statistics-aggregation-enabled: false
-
-# Optional file path for automatic usage statistics persistence.
-# Used only when usage-statistics-aggregation-enabled is true.
-# Defaults to usage-statistics.json next to config.yaml.
-usage-statistics-path: ""
-
-# How often legacy usage statistics are flushed to disk. Defaults to 30 seconds when omitted or <= 0.
-usage-statistics-flush-interval-seconds: 30
-
-# How long (in seconds) usage queue items are retained in memory for HTTP/RESP collectors.
+# How long (in seconds) usage queue items are retained in memory for the Management API.
+# The local Redis RESP usage output is disabled.
 # Default: 60. Max: 3600.
 redis-usage-queue-retention-seconds: 60
 
@@ -106,10 +119,34 @@ max-retry-interval: 30
 # When true, disable auth/model cooldown scheduling globally (prevents blackout windows after failure states).
 disable-cooling: false
 
-# disable-image-generation supports: false (default), true, or "chat".
+# When true, persist per-auth cooldown status as .cds files next to auth files.
+# Default is false; when false, cooldown status is kept in memory only.
+save-cooldown-status: false
+
+# Cooldown duration in seconds for transient upstream errors (408/500/502/503/504).
+# Set to 0 to keep the legacy 60-second cooldown; set to -1 to disable transient error cooldowns.
+transient-error-cooldown-seconds: 0
+
+# When true, globally disable Claude request cloaking (the Claude Code CLI disguise and
+# system prompt replacement), so the original system prompt is passed through to Claude as-is.
+# Individual credentials can still override this: a claude-api-key entry via its "cloak.mode",
+# or a Claude OAuth/token file via a "cloak_mode" value. Default false keeps the per-client
+# "auto" behavior (cloak only non-Claude-Code clients).
+disable-claude-cloak-mode: false
+
+# disable-image-generation supports: false (default), true, "chat", or "passthrough".
 # - true: disable image_generation everywhere (also returns 404 for /v1/images/generations and /v1/images/edits).
 # - "chat": disable image_generation injection on non-images endpoints, but keep /v1/images/generations and /v1/images/edits enabled.
+# - "passthrough": never inject or strip image_generation on non-images endpoints (forward the client payload unchanged); behaves like "chat" on /v1/images/* endpoints.
 disable-image-generation: false
+
+# Base model used by the legacy hosted image_generation tool path when a Codex image request is not proxied directly through the Image API.
+# Must start with "gpt-" (case-insensitive). If unset or invalid, defaults to "gpt-5.4-mini".
+# gpt-image-2-base-model: "gpt-5.4-mini"
+
+# How long video IDs returned by /openai/v1/videos and xAI video creation stay bound
+# to the credential that created them. Default: 3h.
+video-result-auth-cache-ttl: "3h"
 
 # Core auth auto-refresh worker pool size (OAuth/file-based auth token refresh).
 # When > 0, overrides the default worker count (16).
@@ -126,19 +163,23 @@ routing:
   strategy: "round-robin" # round-robin (default), fill-first
   # Enable universal session-sticky routing for all clients.
   # Session IDs are extracted from: metadata.user_id (Claude Code session format),
-  # X-Session-ID, Session_id (Codex), X-Amp-Thread-Id (Amp CLI),
-  # X-Client-Request-Id (PI), conversation_id, or first few messages hash.
+  # X-Session-ID, Session_id (Codex), X-Client-Request-Id (PI), conversation_id,
+  # or first few messages hash.
   # Automatic failover is always enabled when bound auth becomes unavailable.
   session-affinity: false # default: false
   # How long session-to-auth bindings are retained. Default: 1h
   session-affinity-ttl: "1h"
 
-# When true, enable authentication for the WebSocket API (/v1/ws).
-ws-auth: false
+# Codex provider behavior.
+codex:
+  # When true, and routing.strategy is fill-first or routing.session-affinity is true,
+  # remap Codex prompt_cache_key and installation identity per selected auth.
+  # Some superstitious users believe request tracking identifiers can be used
+  # as evidence for TOS enforcement bans; this option only satisfies those odd concerns.
+  identity-confuse: false
 
-# When true, enable Gemini CLI internal endpoints (/v1internal:*).
-# Default is false for safety.
-enable-gemini-cli-endpoint: false
+# When true, enable authentication for the WebSocket API (/v1/ws).
+ws-auth: true
 
 # When > 0, emit blank lines every N seconds for non-streaming responses to prevent idle timeouts.
 nonstream-keepalive-interval: 0
@@ -161,6 +202,7 @@ nonstream-keepalive-interval: 0
 # gemini-api-key:
 #   - api-key: "AIzaSy...01"
 #     prefix: "test" # optional: require calls like "test/gemini-3-pro-preview" to target this credential
+#     disable-cooling: false # optional: per-auth override for auth/model cooldown scheduling
 #     base-url: "https://generativelanguage.googleapis.com"
 #     headers:
 #       X-Custom-Header: "custom-value"
@@ -180,6 +222,7 @@ nonstream-keepalive-interval: 0
 # codex-api-key:
 #   - api-key: "sk-atSM..."
 #     prefix: "test" # optional: require calls like "test/gpt-5-codex" to target this credential
+#     disable-cooling: false # optional: per-auth override for auth/model cooldown scheduling
 #     base-url: "https://www.example.com" # use the custom codex API endpoint
 #     headers:
 #       X-Custom-Header: "custom-value"
@@ -199,6 +242,7 @@ nonstream-keepalive-interval: 0
 #   - api-key: "sk-atSM..." # use the official claude API key, no need to set the base url
 #   - api-key: "sk-atSM..."
 #     prefix: "test" # optional: require calls like "test/claude-sonnet-latest" to target this credential
+#     disable-cooling: false # optional: per-auth override for auth/model cooldown scheduling
 #     base-url: "https://www.example.com" # use the custom claude API endpoint
 #     headers:
 #       X-Custom-Header: "custom-value"
@@ -216,6 +260,10 @@ nonstream-keepalive-interval: 0
 #       mode: "auto"                 # "auto" (default): cloak only when client is not Claude Code
 #                                    # "always": always apply cloaking
 #                                    # "never": never apply cloaking
+#       # This "cloak" block applies to this claude-api-key entry only. For Claude OAuth
+#       # credentials, set the same options in the auth/token JSON file via "cloak_mode" /
+#       # "cloak_strict_mode" / "cloak_sensitive_words" / "cloak_cache_user_id". The top-level
+#       # "disable-claude-cloak-mode: true" disables cloaking for all Claude credentials at once.
 #       strict-mode: false           # false (default): prepend Claude Code prompt to user system messages
 #                                    # true: strip all user system messages, keep only Claude Code prompt
 #       sensitive-words:             # optional: words to obfuscate with zero-width characters
@@ -240,13 +288,13 @@ nonstream-keepalive-interval: 0
 #   timeout: "600"
 #   stabilize-device-profile: false  # optional, default false; set true to enable per-auth/API-key fingerprint pinning
 
-# Default headers for Codex model requests.
-# Configured values take precedence over matching client-supplied headers;
-# empty values fall back to the built-in Codex VS Code profile.
+# Default headers for Codex OAuth model requests.
+# These are used only for file-backed/OAuth Codex requests when the client
+# does not send the header. `user-agent` applies to HTTP and websocket requests;
+# `beta-features` only applies to websocket requests. They do not apply to codex-api-key entries.
 # codex-header-defaults:
-#   user-agent: "codex_vscode/0.128.0 (Ubuntu 22.4.0; x86_64) dumb (codex_exec; 0.128.0)"
-#   originator: "codex_vscode"
-#   beta-features: "terminal_resize_reflow"
+#   user-agent: "codex_cli_rs/0.114.0 (Mac OS 14.2.0; x86_64) vscode/1.111.0"
+#   beta-features: "multi_agent"
 
 # OpenAI compatibility providers
 # openai-compatibility:
@@ -254,6 +302,7 @@ nonstream-keepalive-interval: 0
 #     disabled: false # optional: set to true to disable this provider without removing it
 #     prefix: "test" # optional: require calls like "test/kimi-k2" to target this provider's credentials
 #     base-url: "https://openrouter.ai/api/v1" # The base URL of the provider.
+#     disable-cooling: false # optional: per-provider override for auth/model cooldown scheduling
 #     headers:
 #       X-Custom-Header: "custom-value"
 #     api-key-entries:
@@ -264,6 +313,7 @@ nonstream-keepalive-interval: 0
 #     models: # The models supported by the provider.
 #       - name: "moonshotai/kimi-k2:free" # The actual model name.
 #         alias: "kimi-k2"               # The alias used in the API.
+#         image: false                   # optional: set true to allow this model on /v1/images/generations and /v1/images/edits
 #         thinking:                      # optional: omit to default to levels ["low","medium","high"]
 #           levels: ["low", "medium", "high"]
 #       # You may repeat the same alias to build an internal model pool.
@@ -296,58 +346,15 @@ nonstream-keepalive-interval: 0
 #       - "imagen-3.0-generate-002"
 #       - "imagen-*"
 
-# Amp Integration
-# ampcode:
-#   # Configure upstream URL for Amp CLI OAuth and management features
-#   upstream-url: "https://ampcode.com"
-#   # Optional: Override API key for Amp upstream (otherwise uses env or file)
-#   upstream-api-key: ""
-#   # Per-client upstream API key mapping
-#   # Maps client API keys (from top-level api-keys) to different Amp upstream API keys.
-#   # Useful when different clients need to use different Amp accounts/quotas.
-#   # If a client key isn't mapped, falls back to upstream-api-key (default behavior).
-#   upstream-api-keys:
-#     - upstream-api-key: "amp_key_for_team_a"    # Upstream key to use for these clients
-#       api-keys:                                 # Client keys that use this upstream key
-#         - "your-api-key-1"
-#         - "your-api-key-2"
-#     - upstream-api-key: "amp_key_for_team_b"
-#       api-keys:
-#         - "your-api-key-3"
-#   # Restrict Amp management routes (/api/auth, /api/user, etc.) to localhost only (default: false)
-#   restrict-management-to-localhost: false
-#   # Force model mappings to run before checking local API keys (default: false)
-#   force-model-mappings: false
-#   # Amp Model Mappings
-#   # Route unavailable Amp models to alternative models available in your local proxy.
-#   # Useful when Amp CLI requests models you don't have access to (e.g., Claude Opus 4.5)
-#   # but you have a similar model available (e.g., Claude Sonnet 4).
-#   model-mappings:
-#     - from: "claude-opus-4-5-20251101"          # Model requested by Amp CLI
-#       to: "gemini-claude-opus-4-5-thinking"     # Route to this available model instead
-#     - from: "claude-sonnet-4-5-20250929"
-#       to: "gemini-claude-sonnet-4-5-thinking"
-#     - from: "claude-haiku-4-5-20251001"
-#       to: "gemini-2.5-flash"
-
 # Global OAuth model name aliases (per channel)
 # These aliases rename model IDs for both model listing and request routing.
-# Supported channels: gemini-cli, vertex, aistudio, antigravity, claude, codex, kimi.
-# NOTE: Aliases do not apply to gemini-api-key, codex-api-key, claude-api-key, openai-compatibility, vertex-api-key, or ampcode.
+# Supported channels: vertex, aistudio, antigravity, claude, codex, kimi, xai.
+# NOTE: Aliases do not apply to gemini-api-key, codex-api-key, claude-api-key, openai-compatibility, or vertex-api-key.
 # NOTE: Because aliases affect the merged /v1 model list and merged request routing, overlapping
-# client-visible names can become ambiguous across providers. /api/provider/{provider}/... helps
-# you select the protocol surface, but inference backend selection can still follow the resolved
-# model/alias. For strict backend pinning, use unique aliases/prefixes or avoid overlapping names.
+# client-visible names can become ambiguous across providers. For strict backend pinning, use
+# unique aliases/prefixes or avoid overlapping names.
 # You can repeat the same name with different aliases to expose multiple client model names.
-# Models that declare thinking levels automatically expose -low, -medium, -high, and -xhigh
-# aliases when the level is supported (for example, gpt-5.3-codex-spark-high).
-# Requests may use either model(high) or model-high. Explicit configured names and aliases
-# keep priority over automatic suffix parsing, so old configs remain compatible.
 # oauth-model-alias:
-#   gemini-cli:
-#     - name: "gemini-2.5-pro"          # original model name under this channel
-#       alias: "g2.5p"                  # client-visible alias
-#       fork: true                      # when true, keep original and also add the alias as an extra model (default: false)
 #   vertex:
 #     - name: "gemini-2.5-pro"
 #       alias: "g2.5p"
@@ -363,22 +370,18 @@ nonstream-keepalive-interval: 0
 #   codex:
 #     - name: "gpt-5"
 #       alias: "g5"
-#     # Optional: pin an alias to a fixed upstream reasoning effort.
-#     # Requests to spark-fast or spark-fast-low both resolve to gpt-5.3-codex-spark(high).
-#     - name: "gpt-5.3-codex-spark-high"
-#       alias: "spark-fast"
-#       fork: true
 #   kimi:
 #     - name: "kimi-k2.5"
 #       alias: "k2.5"
+#   xai:
+#     - name: "grok-4.3"
+#       alias: "grok-latest"
+#   sample-provider:                  # plugin provider keys are supported for OAuth plugins
+#     - name: "sample-model-latest"
+#       alias: "sample-latest"
 
 # OAuth provider excluded models
 # oauth-excluded-models:
-#   gemini-cli:
-#     - "gemini-2.5-pro"     # exclude specific models (exact match)
-#     - "gemini-2.5-*"       # wildcard matching prefix (e.g. gemini-2.5-flash, gemini-2.5-pro)
-#     - "*-preview"          # wildcard matching suffix (e.g. gemini-3-pro-preview)
-#     - "*flash*"            # wildcard matching substring (e.g. gemini-2.5-flash-lite)
 #   vertex:
 #     - "gemini-3-pro-preview"
 #   aistudio:
@@ -391,6 +394,8 @@ nonstream-keepalive-interval: 0
 #     - "gpt-5-codex-mini"
 #   kimi:
 #     - "kimi-k2-thinking"
+#   xai:
+#     - "grok-3-mini"
 
 # Optional payload configuration
 # payload:
@@ -398,6 +403,17 @@ nonstream-keepalive-interval: 0
 #     - models:
 #         - name: "gemini-2.5-pro" # Supports wildcards (e.g., "gemini-*")
 #           protocol: "gemini" # restricts the rule to a specific protocol, options: openai, gemini, claude, codex, antigravity
+#           from-protocol: "responses" # restricts the rule to the source protocol, options: openai, responses, gemini, claude
+#           headers: # all configured request headers must match; values support "*" wildcards
+#             X-Client-Tier: "tenant-*-region-*"
+#           match: # all payload JSON paths must equal the configured values
+#             - "metadata.client": "codex"
+#           not-match: # payload JSON paths must not equal the configured values
+#             - "metadata.mode": "dev"
+#           exist: # all payload JSON paths must exist and not be null
+#             - "tools.#(type==\"web_search\").type"
+#           not-exist: # all payload JSON paths must be missing or null
+#             - "metadata.disable_payload"
 #       params: # JSON path (gjson/sjson syntax) -> value
 #         "generationConfig.thinkingConfig.thinkingBudget": 32768
 #   default-raw: # Default raw rules set parameters using raw JSON when missing (must be valid JSON).

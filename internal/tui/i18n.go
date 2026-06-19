@@ -50,8 +50,8 @@ var locales = map[string]map[string]string{
 // ──────────────────────────────────────────
 // Tab names
 // ──────────────────────────────────────────
-var zhTabNames = []string{"仪表盘", "配置", "认证文件", "API 密钥", "OAuth", "使用统计", "日志"}
-var enTabNames = []string{"Dashboard", "Config", "Auth Files", "API Keys", "OAuth", "Usage", "Logs"}
+var zhTabNames = []string{"仪表盘", "配置", "认证文件", "API 密钥", "OAuth", "日志"}
+var enTabNames = []string{"Dashboard", "Config", "Auth Files", "API Keys", "OAuth", "Logs"}
 
 // TabNames returns tab names in the current locale.
 func TabNames() []string {
@@ -131,7 +131,6 @@ var zhStrings = map[string]string{
 	"section_quota":     "配额超限处理",
 	"section_routing":   "路由",
 	"section_websocket": "WebSocket",
-	"section_ampcode":   "AMP Code",
 	"section_other":     "其他",
 
 	// ── Auth Files ──
@@ -193,11 +192,6 @@ var zhStrings = map[string]string{
 	"usage_total_token_l": "总Token",
 	"usage_rpm":           "RPM",
 	"usage_tpm":           "TPM",
-	"usage_tps":           "TPS",
-	"usage_cache_hit":     "缓存命中率",
-	"usage_first_byte":    "首字响应",
-	"usage_avg_latency":   "平均耗时",
-	"usage_avg_recorded":  "记录区间平均",
 	"usage_req_by_hour":   "请求趋势 (按小时)",
 	"usage_tok_by_hour":   "Token 使用趋势 (按小时)",
 	"usage_req_by_day":    "请求趋势 (按天)",
@@ -288,7 +282,6 @@ var enStrings = map[string]string{
 	"section_quota":     "Quota Exceeded Handling",
 	"section_routing":   "Routing",
 	"section_websocket": "WebSocket",
-	"section_ampcode":   "AMP Code",
 	"section_other":     "Other",
 
 	// ── Auth Files ──
@@ -350,11 +343,6 @@ var enStrings = map[string]string{
 	"usage_total_token_l": "Total Tokens",
 	"usage_rpm":           "RPM",
 	"usage_tpm":           "TPM",
-	"usage_tps":           "TPS",
-	"usage_cache_hit":     "Cache Hit",
-	"usage_first_byte":    "First Byte",
-	"usage_avg_latency":   "Avg Latency",
-	"usage_avg_recorded":  "Recorded average",
 	"usage_req_by_hour":   "Requests by Hour",
 	"usage_tok_by_hour":   "Token Usage by Hour",
 	"usage_req_by_day":    "Requests by Day",

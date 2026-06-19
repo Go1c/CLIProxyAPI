@@ -3,8 +3,8 @@ package auth
 import (
 	"strings"
 
-	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 )
 
 type modelAliasEntry interface {
@@ -80,24 +80,19 @@ func (m *Manager) applyOAuthModelAlias(auth *Auth, requestedModel string) string
 	return upstreamModel
 }
 
-type modelAliasLookupCandidate struct {
-	value          string
-	preserveSuffix bool
-}
-
-func modelAliasLookupCandidates(requestedModel string) (thinking.SuffixResult, []modelAliasLookupCandidate) {
+func modelAliasLookupCandidates(requestedModel string) (thinking.SuffixResult, []string) {
 	requestedModel = strings.TrimSpace(requestedModel)
 	if requestedModel == "" {
 		return thinking.SuffixResult{}, nil
 	}
-	requestResult := thinking.ParseSuffixAllowHyphen(requestedModel)
+	requestResult := thinking.ParseSuffix(requestedModel)
 	base := requestResult.ModelName
 	if base == "" {
 		base = requestedModel
 	}
-	candidates := []modelAliasLookupCandidate{{value: requestedModel, preserveSuffix: false}}
+	candidates := []string{base}
 	if base != requestedModel {
-		candidates = append(candidates, modelAliasLookupCandidate{value: base, preserveSuffix: true})
+		candidates = append(candidates, requestedModel)
 	}
 	return requestResult, candidates
 }
@@ -107,11 +102,11 @@ func preserveResolvedModelSuffix(resolved string, requestResult thinking.SuffixR
 	if resolved == "" {
 		return ""
 	}
-	if thinking.ParseSuffixAllowHyphen(resolved).HasSuffix {
+	if thinking.ParseSuffix(resolved).HasSuffix {
 		return resolved
 	}
 	if requestResult.HasSuffix && requestResult.RawSuffix != "" {
-		return thinking.FormatSuffix(resolved, requestResult)
+		return resolved + "(" + requestResult.RawSuffix + ")"
 	}
 	return resolved
 }
@@ -136,16 +131,14 @@ func resolveModelAliasPoolFromConfigModels(requestedModel string, models []model
 		name := strings.TrimSpace(models[i].GetName())
 		alias := strings.TrimSpace(models[i].GetAlias())
 		for _, candidate := range candidates {
-			if candidate.value == "" || alias == "" || !strings.EqualFold(alias, candidate.value) {
+			if candidate == "" || alias == "" || !strings.EqualFold(alias, candidate) {
 				continue
 			}
-			resolved := candidate.value
+			resolved := candidate
 			if name != "" {
 				resolved = name
 			}
-			if candidate.preserveSuffix {
-				resolved = preserveResolvedModelSuffix(resolved, requestResult)
-			}
+			resolved = preserveResolvedModelSuffix(resolved, requestResult)
 			key := strings.ToLower(strings.TrimSpace(resolved))
 			if key == "" {
 				break
@@ -165,13 +158,10 @@ func resolveModelAliasPoolFromConfigModels(requestedModel string, models []model
 	for i := range models {
 		name := strings.TrimSpace(models[i].GetName())
 		for _, candidate := range candidates {
-			if candidate.value == "" || name == "" || !strings.EqualFold(name, candidate.value) {
+			if candidate == "" || name == "" || !strings.EqualFold(name, candidate) {
 				continue
 			}
-			if candidate.preserveSuffix {
-				return []string{preserveResolvedModelSuffix(name, requestResult)}
-			}
-			return []string{name}
+			return []string{preserveResolvedModelSuffix(name, requestResult)}
 		}
 	}
 	return nil
@@ -204,12 +194,14 @@ func resolveUpstreamModelFromAliasTable(m *Manager, auth *Auth, requestedModel, 
 		return ""
 	}
 
-	// Extract thinking suffix from requested model. Exact aliases are tried first,
-	// then the suffix-stripped base model is tried with suffix preservation.
-	requestResult, candidates := modelAliasLookupCandidates(requestedModel)
+	// Extract thinking suffix from requested model using ParseSuffix
+	requestResult := thinking.ParseSuffix(requestedModel)
 	baseModel := requestResult.ModelName
-	if baseModel == "" {
-		baseModel = strings.TrimSpace(requestedModel)
+
+	// Candidate keys to match: base model and raw input (handles suffix-parsing edge cases).
+	candidates := []string{baseModel}
+	if baseModel != requestedModel {
+		candidates = append(candidates, requestedModel)
 	}
 
 	raw := m.oauthModelAlias.Load()
@@ -223,7 +215,7 @@ func resolveUpstreamModelFromAliasTable(m *Manager, auth *Auth, requestedModel, 
 	}
 
 	for _, candidate := range candidates {
-		key := strings.ToLower(strings.TrimSpace(candidate.value))
+		key := strings.ToLower(strings.TrimSpace(candidate))
 		if key == "" {
 			continue
 		}
@@ -236,12 +228,12 @@ func resolveUpstreamModelFromAliasTable(m *Manager, auth *Auth, requestedModel, 
 		}
 
 		// If config already has suffix, it takes priority.
-		if thinking.ParseSuffixAllowHyphen(original).HasSuffix {
+		if thinking.ParseSuffix(original).HasSuffix {
 			return original
 		}
 		// Preserve user's thinking suffix on the resolved model.
-		if candidate.preserveSuffix && requestResult.HasSuffix && requestResult.RawSuffix != "" {
-			return thinking.FormatSuffix(original, requestResult)
+		if requestResult.HasSuffix && requestResult.RawSuffix != "" {
+			return original + "(" + requestResult.RawSuffix + ")"
 		}
 		return original
 	}
@@ -273,33 +265,36 @@ func modelAliasChannel(auth *Auth) string {
 // and auth kind. Returns empty string if the provider/authKind combination doesn't support
 // OAuth model alias (e.g., API key authentication).
 //
-// Supported channels: gemini-cli, vertex, aistudio, antigravity, claude, codex, kimi.
+// Built-in channels: vertex, aistudio, antigravity, claude, codex, kimi.
+// Plugin OAuth providers use their normalized provider key as the channel.
 func OAuthModelAliasChannel(provider, authKind string) string {
 	provider = strings.ToLower(strings.TrimSpace(provider))
-	authKind = strings.ToLower(strings.TrimSpace(authKind))
+	authKind = normalizeOAuthModelAliasAuthKind(authKind)
+	if authKind == "apikey" {
+		return ""
+	}
 	switch provider {
 	case "gemini":
-		// gemini provider uses gemini-api-key config, not oauth-model-alias.
-		// OAuth-based gemini auth is converted to "gemini-cli" by the synthesizer.
 		return ""
 	case "vertex":
-		if authKind == "apikey" {
-			return ""
-		}
 		return "vertex"
 	case "claude":
-		if authKind == "apikey" {
-			return ""
-		}
 		return "claude"
 	case "codex":
-		if authKind == "apikey" {
-			return ""
-		}
 		return "codex"
-	case "gemini-cli", "aistudio", "antigravity", "kimi":
+	case "aistudio", "antigravity", "kimi":
 		return provider
 	default:
-		return ""
+		return provider
+	}
+}
+
+func normalizeOAuthModelAliasAuthKind(authKind string) string {
+	authKind = strings.ToLower(strings.TrimSpace(authKind))
+	switch authKind {
+	case "api_key", "api-key":
+		return "apikey"
+	default:
+		return authKind
 	}
 }

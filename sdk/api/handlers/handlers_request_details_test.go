@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
-	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 )
 
 func TestGetRequestDetails_PreservesSuffix(t *testing.T) {
@@ -21,7 +21,7 @@ func TestGetRequestDetails_PreservesSuffix(t *testing.T) {
 		{ID: "gemini-2.5-flash", Created: now + 25},
 	})
 	modelRegistry.RegisterClient("test-request-details-openai", "openai", []*registry.ModelInfo{
-		{ID: "gpt-5.2", Created: now + 20, Thinking: &registry.ThinkingSupport{Levels: []string{"low", "medium", "high", "xhigh"}}},
+		{ID: "gpt-5.2", Created: now + 20},
 	})
 	modelRegistry.RegisterClient("test-request-details-claude", "claude", []*registry.ModelInfo{
 		{ID: "claude-sonnet-4-5", Created: now + 5},
@@ -61,13 +61,6 @@ func TestGetRequestDetails_PreservesSuffix(t *testing.T) {
 			inputModel:    "gpt-5.2(high)",
 			wantProviders: []string{"openai"},
 			wantModel:     "gpt-5.2(high)",
-			wantErr:       false,
-		},
-		{
-			name:          "hyphen level suffix preserved",
-			inputModel:    "gpt-5.2-high",
-			wantProviders: []string{"openai"},
-			wantModel:     "gpt-5.2-high",
 			wantErr:       false,
 		},
 		{
