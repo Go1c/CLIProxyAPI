@@ -11,11 +11,7 @@ import (
 	"time"
 )
 
-type roundTripFunc func(*http.Request) (*http.Response, error)
-
-func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
-	return f(req)
-}
+// roundTripFunc is declared in usage_helpers_test.go (same package).
 
 func TestNewCodexRustlsHTTPClientUsesHTTP1Transport(t *testing.T) {
 	t.Parallel()

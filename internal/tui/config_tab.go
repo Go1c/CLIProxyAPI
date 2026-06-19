@@ -339,8 +339,7 @@ func (m configTabModel) parseConfig(cfg map[string]any) []configField {
 	fields = append(fields, configField{"Logging to File", "logging-to-file", "bool", fmt.Sprintf("%v", getBool(cfg, "logging-to-file")), nil})
 	fields = append(fields, configField{"Logs Max Total Size (MB)", "logs-max-total-size-mb", "int", fmt.Sprintf("%.0f", getFloat(cfg, "logs-max-total-size-mb")), nil})
 	fields = append(fields, configField{"Error Logs Max Files", "error-logs-max-files", "int", fmt.Sprintf("%.0f", getFloat(cfg, "error-logs-max-files")), nil})
-	fields = append(fields, configField{"Usage Publishing Enabled", "usage-statistics-enabled", "bool", fmt.Sprintf("%v", getBool(cfg, "usage-statistics-enabled")), nil})
-	fields = append(fields, configField{"Legacy Usage Aggregation", "usage-statistics-aggregation-enabled", "bool", fmt.Sprintf("%v", getBool(cfg, "usage-statistics-aggregation-enabled")), nil})
+	fields = append(fields, configField{"Usage Stats Enabled", "usage-statistics-enabled", "bool", fmt.Sprintf("%v", getBool(cfg, "usage-statistics-enabled")), nil})
 	fields = append(fields, configField{"Request Log", "request-log", "bool", fmt.Sprintf("%v", getBool(cfg, "request-log")), nil})
 
 	// Quota exceeded
@@ -357,22 +356,10 @@ func (m configTabModel) parseConfig(cfg map[string]any) []configField {
 	// WebSocket auth
 	fields = append(fields, configField{"WebSocket Auth", "ws-auth", "bool", fmt.Sprintf("%v", getBool(cfg, "ws-auth")), nil})
 
-	// AMP settings
-	if amp, ok := cfg["ampcode"].(map[string]any); ok {
-		upstreamURL := getString(amp, "upstream-url")
-		upstreamAPIKey := getString(amp, "upstream-api-key")
-		fields = append(fields, configField{"AMP Upstream URL", "ampcode/upstream-url", "string", upstreamURL, upstreamURL})
-		fields = append(fields, configField{"AMP Upstream API Key", "ampcode/upstream-api-key", "string", maskIfNotEmpty(upstreamAPIKey), upstreamAPIKey})
-		fields = append(fields, configField{"AMP Restrict Mgmt Localhost", "ampcode/restrict-management-to-localhost", "bool", fmt.Sprintf("%v", getBool(amp, "restrict-management-to-localhost")), nil})
-	}
-
 	return fields
 }
 
 func fieldSection(apiPath string) string {
-	if strings.HasPrefix(apiPath, "ampcode/") {
-		return T("section_ampcode")
-	}
 	if strings.HasPrefix(apiPath, "quota-exceeded/") {
 		return T("section_quota")
 	}
@@ -382,7 +369,7 @@ func fieldSection(apiPath string) string {
 	switch apiPath {
 	case "port", "host", "debug", "proxy-url", "request-retry", "max-retry-interval", "force-model-prefix":
 		return T("section_server")
-	case "logging-to-file", "logs-max-total-size-mb", "error-logs-max-files", "usage-statistics-enabled", "usage-statistics-aggregation-enabled", "request-log":
+	case "logging-to-file", "logs-max-total-size-mb", "error-logs-max-files", "usage-statistics-enabled", "request-log":
 		return T("section_logging")
 	case "ws-auth":
 		return T("section_websocket")
@@ -404,11 +391,4 @@ func getBoolNested(m map[string]any, keys ...string) bool {
 		}
 	}
 	return false
-}
-
-func maskIfNotEmpty(s string) string {
-	if s == "" {
-		return T("not_set")
-	}
-	return maskKey(s)
 }
