@@ -3,7 +3,7 @@ name: Deploy CLIProxyAPI Production
 on:
   push:
     branches:
-      - main
+      - publish
   workflow_dispatch:
     inputs:
       deploy:
