@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
@@ -699,7 +698,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 }
 
 func (e *CodexWebsocketsExecutor) dialCodexWebsocket(ctx context.Context, auth *cliproxyauth.Auth, wsURL string, headers http.Header) (*websocket.Conn, *http.Response, error) {
-	dialer := newProxyAwareWebsocketDialer(e.cfg, auth)
+	dialer := newCodexWebsocketDialer(e.cfg, auth, wsURL)
 	dialer.HandshakeTimeout = codexResponsesWebsocketHandshakeTO
 	dialer.EnableCompression = true
 	if ctx == nil {
@@ -838,6 +837,31 @@ func newProxyAwareWebsocketDialer(cfg *config.Config, auth *cliproxyauth.Auth) *
 	return dialer
 }
 
+func newCodexWebsocketDialer(cfg *config.Config, auth *cliproxyauth.Auth, wsURL string) *websocket.Dialer {
+	if codexAuthUsesAPIKey(auth) || !codexWebsocketUsesOfficialHost(wsURL) {
+		return newProxyAwareWebsocketDialer(cfg, auth)
+	}
+	return newCodexProxyAwareWebsocketDialer(cfg, auth)
+}
+
+func codexWebsocketUsesOfficialHost(wsURL string) bool {
+	parsed, err := url.Parse(strings.TrimSpace(wsURL))
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(parsed.Hostname(), "chatgpt.com")
+}
+
+func newCodexProxyAwareWebsocketDialer(cfg *config.Config, auth *cliproxyauth.Auth) *websocket.Dialer {
+	return &websocket.Dialer{
+		Proxy:             nil,
+		HandshakeTimeout:  codexResponsesWebsocketHandshakeTO,
+		EnableCompression: true,
+		NetDialContext:    helps.NewProxyAwareNetDialContext(cfg, auth),
+		NetDialTLSContext: helps.NewCodexUtlsNetDialTLSContext(cfg, auth),
+	}
+}
+
 func buildCodexResponsesWebsocketURL(httpURL string) (string, error) {
 	parsed, err := url.Parse(strings.TrimSpace(httpURL))
 	if err != nil {
@@ -906,17 +930,19 @@ func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *
 	}
 
 	isAPIKey := codexAuthUsesAPIKey(auth)
-	cfgUserAgent, cfgBetaFeatures := codexHeaderDefaults(cfg, auth)
+	cfgUserAgent, cfgBetaFeatures, cfgOriginator, cfgVersion := codexHeaderDefaults(cfg, auth)
 	ensureHeaderWithPriority(headers, ginHeaders, "x-codex-beta-features", cfgBetaFeatures, "")
 	misc.EnsureHeader(headers, ginHeaders, "x-codex-turn-state", "")
-	misc.EnsureHeader(headers, ginHeaders, "x-codex-turn-metadata", "")
-	misc.EnsureHeader(headers, ginHeaders, "x-client-request-id", "")
 	misc.EnsureHeader(headers, ginHeaders, "x-responsesapi-include-timing-metrics", "")
-	misc.EnsureHeader(headers, ginHeaders, "Version", "")
 	if isAPIKey {
+		misc.EnsureHeader(headers, ginHeaders, "Version", "")
+		misc.EnsureHeader(headers, ginHeaders, "x-codex-turn-metadata", "")
+		misc.EnsureHeader(headers, ginHeaders, "x-client-request-id", "")
 		ensureHeaderWithPriority(headers, ginHeaders, "User-Agent", "", "")
 	} else {
-		ensureHeaderWithConfigPrecedence(headers, ginHeaders, "User-Agent", cfgUserAgent, codexUserAgent)
+		ensureHeaderWithPriority(headers, ginHeaders, "Version", cfgVersion, "")
+		ensureHeaderWithConfigPrecedence(headers, ginHeaders, "User-Agent", codexConfiguredUserAgent(cfg, auth), cfgUserAgent)
+		ensureCodexTUIIdentityHeaders(headers, ginHeaders)
 	}
 
 	betaHeader := strings.TrimSpace(headers.Get("OpenAI-Beta"))
@@ -927,15 +953,13 @@ func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *
 		betaHeader = codexResponsesWebsocketBetaHeaderValue
 	}
 	headers.Set("OpenAI-Beta", betaHeader)
-	sessionFallback := ""
-	if strings.Contains(headers.Get("User-Agent"), "Mac OS") {
-		sessionFallback = uuid.NewString()
-	}
-	ensureCodexWebsocketSessionHeader(headers, ginHeaders, sessionFallback)
 	if originator := strings.TrimSpace(ginHeaders.Get("Originator")); originator != "" {
 		headers.Set("Originator", originator)
 	} else if !isAPIKey {
-		headers.Set("Originator", codexOriginator)
+		if cfgOriginator == "" {
+			cfgOriginator = codexOriginator
+		}
+		headers.Set("Originator", cfgOriginator)
 	}
 	if !isAPIKey {
 		if auth != nil && auth.Metadata != nil {
@@ -956,30 +980,51 @@ func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *
 	return headers
 }
 
-func ensureCodexWebsocketSessionHeader(target http.Header, source http.Header, fallbackValue string) {
+func ensureCodexSessionHeader(target http.Header, source http.Header, fallbackKey string, fallbackValue string) {
 	if target == nil {
 		return
 	}
-	sessionID := codexSessionHeaderValue(target)
-	if sessionID == "" {
-		sessionID = codexSessionHeaderValue(source)
+	if key, sessionID := codexSessionHeader(target); sessionID != "" {
+		setCodexSessionHeaderCasePreserved(target, key, sessionID)
+		return
 	}
-	if sessionID == "" {
-		sessionID = strings.TrimSpace(fallbackValue)
+	if key, sessionID := codexSessionHeader(source); sessionID != "" {
+		setCodexSessionHeaderCasePreserved(target, key, sessionID)
+		return
 	}
-	if sessionID != "" {
-		setHeaderCasePreserved(target, "session_id", sessionID)
+	if sessionID := strings.TrimSpace(fallbackValue); sessionID != "" {
+		if strings.TrimSpace(fallbackKey) == "" {
+			fallbackKey = "Session-Id"
+		}
+		setCodexSessionHeaderCasePreserved(target, fallbackKey, sessionID)
 	}
-	deleteHeaderCaseInsensitive(target, "Session-Id")
 }
 
 func codexSessionHeaderValue(headers http.Header) string {
-	for _, key := range []string{"Session-Id", "Session_id", "session_id"} {
+	_, value := codexSessionHeader(headers)
+	return value
+}
+
+func codexSessionHeader(headers http.Header) (string, string) {
+	if headers == nil {
+		return "", ""
+	}
+	for _, key := range []string{"Session-Id", "Session_id", "session_id", "session-id"} {
 		if value := strings.TrimSpace(headerValueCaseInsensitive(headers, key)); value != "" {
-			return value
+			return key, value
 		}
 	}
-	return ""
+	for existingKey, values := range headers {
+		if !codexSessionHeaderKey(existingKey) {
+			continue
+		}
+		for _, value := range values {
+			if trimmed := strings.TrimSpace(value); trimmed != "" {
+				return existingKey, trimmed
+			}
+		}
+	}
+	return "", ""
 }
 
 func codexAuthUsesAPIKey(auth *cliproxyauth.Auth) bool {
@@ -1046,7 +1091,11 @@ func setCodexSessionHeaderCasePreserved(headers http.Header, fallbackKey string,
 		}
 	}
 	if selectedKey == "" {
-		selectedKey = fallbackKey
+		if codexSessionHeaderKeyUsesUnderscore(fallbackKey) {
+			selectedKey = "session_id"
+		} else {
+			selectedKey = fallbackKey
+		}
 	}
 	for existingKey := range headers {
 		if codexSessionHeaderKey(existingKey) && existingKey != selectedKey {
@@ -1094,16 +1143,37 @@ func deleteHeaderCaseInsensitive(headers http.Header, key string) {
 	}
 }
 
-func codexHeaderDefaults(cfg *config.Config, auth *cliproxyauth.Auth) (string, string) {
-	if cfg == nil || auth == nil {
-		return "", ""
+func codexHeaderDefaults(cfg *config.Config, auth *cliproxyauth.Auth) (string, string, string, string) {
+	if codexAuthUsesAPIKey(auth) {
+		return "", "", "", ""
 	}
-	if auth.Attributes != nil {
-		if v := strings.TrimSpace(auth.Attributes["api_key"]); v != "" {
-			return "", ""
+	defaults := config.DefaultCodexHeaderDefaults()
+	if cfg != nil {
+		if userAgent := strings.TrimSpace(cfg.CodexHeaderDefaults.UserAgent); userAgent != "" {
+			defaults.UserAgent = userAgent
+		}
+		if betaFeatures := strings.TrimSpace(cfg.CodexHeaderDefaults.BetaFeatures); betaFeatures != "" {
+			defaults.BetaFeatures = betaFeatures
+		}
+		if originator := strings.TrimSpace(cfg.CodexHeaderDefaults.Originator); originator != "" {
+			defaults.Originator = originator
+		}
+		if version := strings.TrimSpace(cfg.CodexHeaderDefaults.Version); version != "" {
+			defaults.Version = version
 		}
 	}
-	return strings.TrimSpace(cfg.CodexHeaderDefaults.UserAgent), strings.TrimSpace(cfg.CodexHeaderDefaults.BetaFeatures)
+	return defaults.UserAgent, defaults.BetaFeatures, defaults.Originator, defaults.Version
+}
+
+func codexConfiguredUserAgent(cfg *config.Config, auth *cliproxyauth.Auth) string {
+	if codexAuthUsesAPIKey(auth) || cfg == nil {
+		return ""
+	}
+	userAgent := strings.TrimSpace(cfg.CodexHeaderDefaults.UserAgent)
+	if userAgent == "" || userAgent == config.DefaultCodexHeaderUserAgent {
+		return ""
+	}
+	return userAgent
 }
 
 func ensureHeaderWithPriority(target http.Header, source http.Header, key, configValue, fallbackValue string) {
