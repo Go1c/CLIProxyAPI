@@ -29,6 +29,7 @@ import (
 	xaiauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/xai"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher/synthesizer"
@@ -63,6 +64,7 @@ var (
 	callbackForwarders    = make(map[int]*callbackForwarder)
 	errAuthFileMustBeJSON = errors.New("auth file must be .json")
 	errAuthFileNotFound   = errors.New("auth file not found")
+	errPluginVirtualAuth  = errors.New("plugin virtual auth cannot be modified directly; edit or delete the source auth file")
 	newCodexOAuthService  = func(cfg *config.Config) codexOAuthService { return codex.NewCodexAuth(cfg) }
 )
 
@@ -1031,6 +1033,9 @@ func (h *Handler) deleteAuthFileByName(ctx context.Context, name string) (string
 	targetPath := filepath.Join(h.cfg.AuthDir, filepath.Base(name))
 	targetID := ""
 	if targetAuth := h.findAuthForDelete(name); targetAuth != nil {
+		if !isPluginVirtualSourceDelete(name, targetAuth) {
+			return filepath.Base(name), http.StatusConflict, errPluginVirtualAuth
+		}
 		targetID = strings.TrimSpace(targetAuth.ID)
 		if path := strings.TrimSpace(authAttribute(targetAuth, "path")); path != "" {
 			targetPath = path
@@ -1050,12 +1055,22 @@ func (h *Handler) deleteAuthFileByName(ctx context.Context, name string) (string
 	if errDeleteRecord := h.deleteTokenRecord(ctx, targetPath); errDeleteRecord != nil {
 		return filepath.Base(name), http.StatusInternalServerError, errDeleteRecord
 	}
-	if targetID != "" {
-		h.removeAuth(ctx, targetID)
-	} else {
-		h.removeAuth(ctx, targetPath)
-	}
+	h.removeAuthsForPath(ctx, targetPath, targetID)
 	return filepath.Base(name), http.StatusOK, nil
+}
+
+func isPluginVirtualSourceDelete(name string, auth *coreauth.Auth) bool {
+	if !coreauth.IsPluginVirtualAuth(auth) {
+		return true
+	}
+	sourcePath := strings.TrimSpace(authAttribute(auth, coreauth.AttributeVirtualSource))
+	if sourcePath == "" {
+		sourcePath = strings.TrimSpace(authAttribute(auth, "path"))
+	}
+	if sourcePath == "" {
+		return false
+	}
+	return strings.EqualFold(filepath.Base(strings.TrimSpace(name)), filepath.Base(sourcePath))
 }
 
 func (h *Handler) findAuthForDelete(name string) *coreauth.Auth {
@@ -1265,6 +1280,24 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "auth file not found"})
 		return
 	}
+	if coreauth.IsPluginVirtualAuth(targetAuth) {
+		// Allow status changes only when targeting the source auth file name, matching delete semantics.
+		// Expanded virtual project auths still cannot be modified independently.
+		if !isPluginVirtualSourceDelete(name, targetAuth) {
+			c.JSON(http.StatusConflict, gin.H{"error": errPluginVirtualAuth.Error()})
+			return
+		}
+		if errPatch := h.patchPluginVirtualSourceStatus(ctx, targetAuth, *req.Disabled); errPatch != nil {
+			status := http.StatusInternalServerError
+			if errors.Is(errPatch, errAuthFileNotFound) || os.IsNotExist(errPatch) {
+				status = http.StatusNotFound
+			}
+			c.JSON(status, gin.H{"error": errPatch.Error()})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"status": "ok", "disabled": *req.Disabled})
+		return
+	}
 
 	if coreauth.IsConfigAPIKeyAuth(targetAuth) {
 		h.mu.Lock()
@@ -1297,23 +1330,98 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 		return
 	}
 
-	// Update disabled state
-	targetAuth.Disabled = *req.Disabled
-	if *req.Disabled {
-		targetAuth.Status = coreauth.StatusDisabled
-		targetAuth.StatusMessage = "disabled via management API"
-	} else {
-		targetAuth.Status = coreauth.StatusActive
-		targetAuth.StatusMessage = ""
-	}
-	targetAuth.UpdatedAt = time.Now()
-
+	applyAuthDisabledState(targetAuth, *req.Disabled)
 	if _, err := h.authManager.Update(ctx, targetAuth); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to update auth: %v", err)})
 		return
 	}
 
 	c.JSON(http.StatusOK, gin.H{"status": "ok", "disabled": *req.Disabled})
+}
+
+// patchPluginVirtualSourceStatus toggles disabled on a plugin multi-auth source file and all
+// runtime auths expanded from it. Virtual project children cannot be toggled independently.
+func (h *Handler) patchPluginVirtualSourceStatus(ctx context.Context, targetAuth *coreauth.Auth, disabled bool) error {
+	if h == nil || h.authManager == nil || targetAuth == nil {
+		return fmt.Errorf("core auth manager unavailable")
+	}
+	sourcePath := strings.TrimSpace(authAttribute(targetAuth, coreauth.AttributeVirtualSource))
+	if sourcePath == "" {
+		sourcePath = strings.TrimSpace(authAttribute(targetAuth, "path"))
+	}
+	if sourcePath == "" {
+		return errPluginVirtualAuth
+	}
+	if errWrite := setSourceAuthFileDisabled(sourcePath, disabled); errWrite != nil {
+		if os.IsNotExist(errWrite) {
+			return errAuthFileNotFound
+		}
+		return fmt.Errorf("failed to update source auth file: %w", errWrite)
+	}
+	now := time.Now()
+	for _, auth := range h.authManager.List() {
+		if auth == nil {
+			continue
+		}
+		if !sameAuthFilePath(authAttribute(auth, "path"), sourcePath) &&
+			!sameAuthFilePath(authAttribute(auth, coreauth.AttributeVirtualSource), sourcePath) {
+			continue
+		}
+		applyAuthDisabledState(auth, disabled)
+		auth.UpdatedAt = now
+		if _, errUpdate := h.authManager.Update(ctx, auth); errUpdate != nil {
+			return fmt.Errorf("failed to update auth %s: %w", auth.ID, errUpdate)
+		}
+	}
+	return nil
+}
+
+func setSourceAuthFileDisabled(path string, disabled bool) error {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return fmt.Errorf("source auth path is empty")
+	}
+	data, errRead := os.ReadFile(path)
+	if errRead != nil {
+		return errRead
+	}
+	metadata := make(map[string]any)
+	if len(bytes.TrimSpace(data)) > 0 {
+		if errUnmarshal := json.Unmarshal(data, &metadata); errUnmarshal != nil {
+			return fmt.Errorf("invalid auth file: %w", errUnmarshal)
+		}
+	}
+	if metadata == nil {
+		metadata = make(map[string]any)
+	}
+	metadata["disabled"] = disabled
+	raw, errMarshal := json.Marshal(metadata)
+	if errMarshal != nil {
+		return fmt.Errorf("marshal auth file: %w", errMarshal)
+	}
+	if errWrite := os.WriteFile(path, raw, 0o600); errWrite != nil {
+		return errWrite
+	}
+	return nil
+}
+
+func applyAuthDisabledState(auth *coreauth.Auth, disabled bool) {
+	if auth == nil {
+		return
+	}
+	auth.Disabled = disabled
+	if disabled {
+		auth.Status = coreauth.StatusDisabled
+		auth.StatusMessage = "disabled via management API"
+	} else {
+		auth.Status = coreauth.StatusActive
+		auth.StatusMessage = ""
+	}
+	auth.UpdatedAt = time.Now()
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	auth.Metadata["disabled"] = disabled
 }
 
 // PatchAuthFileFields updates arbitrary metadata fields of an auth file.
@@ -1366,6 +1474,10 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 
 	if targetAuth == nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "auth file not found"})
+		return
+	}
+	if coreauth.IsPluginVirtualAuth(targetAuth) {
+		c.JSON(http.StatusConflict, gin.H{"error": errPluginVirtualAuth.Error()})
 		return
 	}
 
@@ -1697,6 +1809,53 @@ func (h *Handler) removeAuth(ctx context.Context, id string) {
 	h.authManager.Remove(ctx, authID)
 }
 
+func (h *Handler) removeAuthsForPath(ctx context.Context, path string, fallbackID string) {
+	if h == nil || h.authManager == nil {
+		return
+	}
+	removed := false
+	for _, auth := range h.authManager.List() {
+		if auth == nil {
+			continue
+		}
+		if sameAuthFilePath(authAttribute(auth, "path"), path) || sameAuthFilePath(authAttribute(auth, coreauth.AttributeVirtualSource), path) {
+			h.removeAuth(ctx, auth.ID)
+			removed = true
+		}
+	}
+	if removed {
+		return
+	}
+	if strings.TrimSpace(fallbackID) != "" {
+		h.removeAuth(ctx, fallbackID)
+		return
+	}
+	h.removeAuth(ctx, path)
+}
+
+func sameAuthFilePath(left, right string) bool {
+	left = cleanAuthFilePath(left)
+	right = cleanAuthFilePath(right)
+	if left == "" || right == "" {
+		return false
+	}
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(left, right)
+	}
+	return left == right
+}
+
+func cleanAuthFilePath(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return ""
+	}
+	if abs, errAbs := filepath.Abs(path); errAbs == nil && strings.TrimSpace(abs) != "" {
+		path = abs
+	}
+	return filepath.Clean(path)
+}
+
 func (h *Handler) deleteTokenRecord(ctx context.Context, path string) error {
 	if strings.TrimSpace(path) == "" {
 		return fmt.Errorf("auth path is empty")
@@ -1740,7 +1899,7 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 	}
 	savedPath, errSave := store.Save(ctx, record)
 	if errSave != nil {
-		return "", errSave
+		return savedPath, errSave
 	}
 	if h.postAuthPersistHook != nil {
 		if errHook := h.postAuthPersistHook(ctx, record); errHook != nil {
@@ -2506,13 +2665,13 @@ func (h *Handler) GetAuthStatus(c *gin.Context) {
 				c.JSON(http.StatusOK, gin.H{"status": "error", "error": message})
 				return
 			case pluginapi.AuthLoginStatusSuccess:
-				record := host.AuthDataToCoreAuth(resp.Auth, "", "")
-				if record == nil {
+				records := pluginLoginPollAuths(host, resp)
+				if len(records) == 0 {
 					SetOAuthSessionError(state, "Authentication failed")
 					c.JSON(http.StatusOK, gin.H{"status": "error", "error": "Authentication failed"})
 					return
 				}
-				if _, errSave := h.saveTokenRecord(ctx, record); errSave != nil {
+				if errSave := h.savePluginLoginRecords(ctx, records); errSave != nil {
 					log.WithError(errSave).WithField("provider", provider).Error("failed to save plugin auth tokens")
 					SetOAuthSessionError(state, "Failed to save authentication tokens")
 					c.JSON(http.StatusOK, gin.H{"status": "error", "error": "Failed to save authentication tokens"})
@@ -2528,6 +2687,53 @@ func (h *Handler) GetAuthStatus(c *gin.Context) {
 		}
 	}
 	c.JSON(http.StatusOK, gin.H{"status": "wait"})
+}
+
+func pluginLoginPollAuths(host *pluginhost.Host, resp pluginapi.AuthLoginPollResponse) []*coreauth.Auth {
+	if host == nil {
+		return nil
+	}
+	authDatas := resp.Auths
+	if len(authDatas) == 0 {
+		authDatas = []pluginapi.AuthData{resp.Auth}
+	}
+	records := make([]*coreauth.Auth, 0, len(authDatas))
+	for _, authData := range authDatas {
+		record := host.AuthDataToCoreAuth(authData, "", "")
+		if record == nil {
+			return nil
+		}
+		records = append(records, record)
+	}
+	return records
+}
+
+func (h *Handler) savePluginLoginRecords(ctx context.Context, records []*coreauth.Auth) error {
+	savedPaths := make([]string, 0, len(records))
+	for _, record := range records {
+		savedPath, errSave := h.saveTokenRecord(ctx, record)
+		if strings.TrimSpace(savedPath) != "" {
+			savedPaths = append(savedPaths, savedPath)
+		}
+		if errSave != nil {
+			h.rollbackSavedTokenRecords(ctx, savedPaths)
+			return errSave
+		}
+	}
+	return nil
+}
+
+func (h *Handler) rollbackSavedTokenRecords(ctx context.Context, savedPaths []string) {
+	for i := len(savedPaths) - 1; i >= 0; i-- {
+		path := strings.TrimSpace(savedPaths[i])
+		if path == "" {
+			continue
+		}
+		if errDelete := h.deleteTokenRecord(ctx, path); errDelete != nil {
+			log.WithError(errDelete).WithField("path", path).Warn("failed to roll back plugin auth token")
+		}
+		h.removeAuthsForPath(ctx, path, path)
+	}
 }
 
 // PopulateAuthContext extracts request info and adds it to the context

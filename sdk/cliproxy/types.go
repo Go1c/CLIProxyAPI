@@ -52,7 +52,8 @@ type APIKeyClientProvider interface {
 
 // APIKeyClientResult is returned by APIKeyClientProvider.Load()
 type APIKeyClientResult struct {
-	// GeminiKeyCount is the number of Gemini API keys loaded
+	// GeminiKeyCount is the number of Gemini-family API keys loaded.
+	// It includes native Interactions API keys.
 	GeminiKeyCount int
 
 	// VertexCompatKeyCount is the number of Vertex-compatible API keys loaded
@@ -84,6 +85,12 @@ type WatcherFactory func(configPath, authDir string, reload func(*config.Config)
 // PluginAuthParser parses auth JSON owned by plugin providers.
 type PluginAuthParser interface {
 	ParseAuth(context.Context, pluginapi.AuthParseRequest) (*coreauth.Auth, bool, error)
+}
+
+// PluginMultiAuthParser expands one auth JSON payload into multiple plugin auth records.
+// Returning handled=true with an empty slice means the plugin intentionally suppresses built-in parsing.
+type PluginMultiAuthParser interface {
+	ParseAuths(context.Context, pluginapi.AuthParseRequest) ([]*coreauth.Auth, bool, error)
 }
 
 // WatcherWrapper exposes the subset of watcher methods required by the SDK.
