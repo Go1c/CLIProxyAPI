@@ -703,7 +703,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 }
 
 func (e *CodexWebsocketsExecutor) dialCodexWebsocket(ctx context.Context, auth *cliproxyauth.Auth, wsURL string, headers http.Header) (*websocket.Conn, *http.Response, error) {
-	dialer := newProxyAwareWebsocketDialer(e.cfg, auth)
+	dialer := newCodexWebsocketDialer(e.cfg, auth, wsURL)
 	dialer.HandshakeTimeout = codexResponsesWebsocketHandshakeTO
 	dialer.EnableCompression = true
 	if ctx == nil {
@@ -851,6 +851,27 @@ func newProxyAwareWebsocketDialer(cfg *config.Config, auth *cliproxyauth.Auth) *
 	}
 
 	return dialer
+}
+
+func newCodexWebsocketDialer(cfg *config.Config, auth *cliproxyauth.Auth, wsURL string) *websocket.Dialer {
+	dialer := newProxyAwareWebsocketDialer(cfg, auth)
+	if codexAuthUsesAPIKey(auth) || !codexWebsocketUsesOfficialHost(wsURL) {
+		return dialer
+	}
+
+	// The custom TLS dialer handles configured and environment proxies itself.
+	dialer.Proxy = nil
+	dialer.NetDialTLSContext = helps.NewCodexRustlsNetDialTLSContext(cfg, auth)
+	return dialer
+}
+
+func codexWebsocketUsesOfficialHost(wsURL string) bool {
+	parsed, err := url.Parse(strings.TrimSpace(wsURL))
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(parsed.Hostname())
+	return host == "chatgpt.com" || strings.HasSuffix(host, ".chatgpt.com")
 }
 
 func buildCodexResponsesWebsocketURL(httpURL string) (string, error) {
