@@ -320,9 +320,9 @@ nonstream-keepalive-interval: 0
 # These are used only for file-backed/OAuth Codex requests when the client
 # does not send the header. They do not apply to codex-api-key entries.
 # codex-header-defaults:
-#   user-agent: "codex-tui/0.142.3 (Mac OS 26.4.1; arm64) Orca/1.4.91 (codex-tui; 0.142.3)"
+#   user-agent: "codex-tui/0.144.1 (Mac OS 26.4.1; arm64) Orca/1.4.103 (codex-tui; 0.144.1)"
 #   originator: "codex-tui"
-#   version: "0.142.3"
+#   version: "0.144.1"
 #   beta-features: "remote_compaction_v2"
 
 # OpenAI compatibility providers

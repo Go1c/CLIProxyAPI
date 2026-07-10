@@ -1222,7 +1222,7 @@ func TestNewProxyAwareWebsocketDialerDirectDisablesProxy(t *testing.T) {
 	}
 }
 
-func TestNewCodexWebsocketDialerUsesCustomTLSForOAuth(t *testing.T) {
+func TestNewCodexWebsocketDialerUsesCustomTLSForOfficialOAuth(t *testing.T) {
 	t.Parallel()
 
 	dialer := newCodexWebsocketDialer(
@@ -1232,17 +1232,14 @@ func TestNewCodexWebsocketDialerUsesCustomTLSForOAuth(t *testing.T) {
 	)
 
 	if dialer.Proxy != nil {
-		t.Fatal("expected Codex websocket dialer to leave gorilla proxy handling disabled")
-	}
-	if dialer.NetDialContext == nil {
-		t.Fatal("expected Codex websocket dialer to use proxy-aware net dialer")
+		t.Fatal("expected custom TLS dialer to handle proxy selection")
 	}
 	if dialer.NetDialTLSContext == nil {
-		t.Fatal("expected Codex websocket dialer to use uTLS TLS dialer")
+		t.Fatal("expected official OAuth websocket to use Codex TLS dialer")
 	}
 }
 
-func TestNewCodexWebsocketDialerUsesPublishDefaultDialerForAPIKeyAuth(t *testing.T) {
+func TestNewCodexWebsocketDialerUsesDefaultTLSForAPIKey(t *testing.T) {
 	t.Parallel()
 
 	dialer := newCodexWebsocketDialer(
@@ -1251,15 +1248,12 @@ func TestNewCodexWebsocketDialerUsesPublishDefaultDialerForAPIKeyAuth(t *testing
 		"wss://chatgpt.com/backend-api/codex/responses",
 	)
 
-	if dialer.Proxy != nil {
-		t.Fatal("expected direct API-key websocket dialer to disable proxy")
-	}
-	if dialer.NetDialTLSContext == nil {
-		t.Fatal("expected API-key websocket dialer to use publish default TLS dialer")
+	if dialer.NetDialTLSContext != nil {
+		t.Fatal("expected API-key websocket to use the default TLS stack")
 	}
 }
 
-func TestNewCodexWebsocketDialerUsesPublishDefaultDialerForCustomHost(t *testing.T) {
+func TestNewCodexWebsocketDialerUsesDefaultTLSForCustomHost(t *testing.T) {
 	t.Parallel()
 
 	dialer := newCodexWebsocketDialer(
@@ -1268,10 +1262,7 @@ func TestNewCodexWebsocketDialerUsesPublishDefaultDialerForCustomHost(t *testing
 		"wss://example.test/v1/responses",
 	)
 
-	if dialer.Proxy != nil {
-		t.Fatal("expected direct custom-host websocket dialer to disable proxy")
-	}
-	if dialer.NetDialTLSContext == nil {
-		t.Fatal("expected custom-host websocket dialer to use publish default TLS dialer")
+	if dialer.NetDialTLSContext != nil {
+		t.Fatal("expected custom-host websocket to use the default TLS stack")
 	}
 }

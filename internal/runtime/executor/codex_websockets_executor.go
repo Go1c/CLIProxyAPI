@@ -801,13 +801,6 @@ func newProxyAwareWebsocketDialer(cfg *config.Config, auth *cliproxyauth.Auth) *
 		}).DialContext,
 	}
 
-	// Force the VSCode-aligned TLS fingerprint for the Codex websocket handshake.
-	// NewCodexRustlsNetDialTLSContext performs proxy handling internally, so gorilla's
-	// Proxy hook must stay nil while it is in use; gorilla uses NetDialTLSContext for
-	// wss:// and bypasses NetDialContext/Proxy.
-	dialer.NetDialTLSContext = helps.NewCodexRustlsNetDialTLSContext(cfg, auth)
-	dialer.Proxy = nil
-
 	proxyURL := ""
 	if auth != nil {
 		proxyURL = strings.TrimSpace(auth.ProxyURL)
@@ -861,10 +854,15 @@ func newProxyAwareWebsocketDialer(cfg *config.Config, auth *cliproxyauth.Auth) *
 }
 
 func newCodexWebsocketDialer(cfg *config.Config, auth *cliproxyauth.Auth, wsURL string) *websocket.Dialer {
+	dialer := newProxyAwareWebsocketDialer(cfg, auth)
 	if codexAuthUsesAPIKey(auth) || !codexWebsocketUsesOfficialHost(wsURL) {
-		return newProxyAwareWebsocketDialer(cfg, auth)
+		return dialer
 	}
-	return newCodexProxyAwareWebsocketDialer(cfg, auth)
+
+	// The custom TLS dialer handles configured and environment proxies itself.
+	dialer.Proxy = nil
+	dialer.NetDialTLSContext = helps.NewCodexRustlsNetDialTLSContext(cfg, auth)
+	return dialer
 }
 
 func codexWebsocketUsesOfficialHost(wsURL string) bool {
@@ -872,17 +870,8 @@ func codexWebsocketUsesOfficialHost(wsURL string) bool {
 	if err != nil {
 		return false
 	}
-	return strings.EqualFold(parsed.Hostname(), "chatgpt.com")
-}
-
-func newCodexProxyAwareWebsocketDialer(cfg *config.Config, auth *cliproxyauth.Auth) *websocket.Dialer {
-	return &websocket.Dialer{
-		Proxy:             nil,
-		HandshakeTimeout:  codexResponsesWebsocketHandshakeTO,
-		EnableCompression: true,
-		NetDialContext:    helps.NewProxyAwareNetDialContext(cfg, auth),
-		NetDialTLSContext: helps.NewCodexUtlsNetDialTLSContext(cfg, auth),
-	}
+	host := strings.ToLower(parsed.Hostname())
+	return host == "chatgpt.com" || strings.HasSuffix(host, ".chatgpt.com")
 }
 
 func buildCodexResponsesWebsocketURL(httpURL string) (string, error) {

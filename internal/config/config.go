@@ -24,9 +24,9 @@ const (
 	DefaultPanelGitHubRepository   = "https://github.com/router-for-me/Cli-Proxy-API-Management-Center"
 	DefaultPprofAddr               = "127.0.0.1:8316"
 	DefaultAuthDir                 = "~/.cli-proxy-api"
-	DefaultCodexHeaderUserAgent    = "codex-tui/0.142.3 (Mac OS 26.4.1; arm64) Orca/1.4.91 (codex-tui; 0.142.3)"
+	DefaultCodexHeaderUserAgent    = "codex-tui/0.144.1 (Mac OS 26.4.1; arm64) Orca/1.4.103 (codex-tui; 0.144.1)"
 	DefaultCodexHeaderOriginator   = "codex-tui"
-	DefaultCodexHeaderVersion      = "0.142.3"
+	DefaultCodexHeaderVersion      = "0.144.1"
 	DefaultCodexHeaderBetaFeatures = "remote_compaction_v2"
 )
 
