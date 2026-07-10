@@ -228,10 +228,8 @@ func (s *authScheduler) pickSingleWithStrategy(ctx context.Context, provider, mo
 		if pinnedAuthID != "" && entry.auth.ID != pinnedAuthID {
 			return false
 		}
-		if len(tried) > 0 {
-			if _, ok := tried[entry.auth.ID]; ok {
-				return false
-			}
+		if authAttempted(tried, entry.auth) {
+			return false
 		}
 		return true
 	}
@@ -298,11 +296,7 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 			if entry == nil || entry.auth == nil || entry.auth.ID != pinnedAuthID {
 				return false
 			}
-			if len(tried) == 0 {
-				return true
-			}
-			_, ok := tried[pinnedAuthID]
-			return !ok
+			return !authAttempted(tried, entry.auth)
 		}
 		if picked := shard.pickReadyLocked(false, strategy, predicate); picked != nil {
 			return picked, providerKey, nil
@@ -452,8 +446,7 @@ func triedPredicate(tried map[string]struct{}) func(*scheduledAuth) bool {
 		if entry == nil || entry.auth == nil {
 			return false
 		}
-		_, ok := tried[entry.auth.ID]
-		return !ok
+		return !authAttempted(tried, entry.auth)
 	}
 }
 

@@ -5,7 +5,9 @@ import (
 	"context"
 	stdtls "crypto/tls"
 	"encoding/base64"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -19,66 +21,124 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/proxyutil"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/net/http2"
-	"golang.org/x/net/proxy"
 )
 
 const codexOfficialHost = "chatgpt.com"
 
+// CodexProxyTimings captures pre-header network stages for management probes.
+type CodexProxyTimings struct {
+	mu           sync.Mutex
+	ProxyConnect time.Duration
+	TLSHandshake time.Duration
+}
+
+func (t *CodexProxyTimings) recordProxyConnect(duration time.Duration) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	t.ProxyConnect = duration
+	t.mu.Unlock()
+}
+
+func (t *CodexProxyTimings) recordTLSHandshake(duration time.Duration) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	t.TLSHandshake = duration
+	t.mu.Unlock()
+}
+
+func (t *CodexProxyTimings) Snapshot() (time.Duration, time.Duration) {
+	if t == nil {
+		return 0, 0
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.ProxyConnect, t.TLSHandshake
+}
+
+type codexHTTP2Transport struct {
+	roundTripper http.RoundTripper
+	connected    <-chan struct{}
+	proxyHash    string
+}
+
 // codexRustlsRoundTripper applies the Codex CLI TLS profile only to official
 // ChatGPT HTTPS traffic. API-key and custom-host requests use the fallback.
 type codexRustlsRoundTripper struct {
-	httpsHTTP2         http.RoundTripper
+	httpsHTTP2         codexHTTP2Transport
 	fallback           http.RoundTripper
 	enabled            bool
 	inheritEnvProxy    bool
+	timeouts           config.CodexProxyTimeouts
+	proxyHash          string
 	envProxyTransportM sync.Mutex
-	envProxyTransports map[string]http.RoundTripper
+	envProxyTransports map[string]codexHTTP2Transport
 }
 
 type codexRustlsDialer struct {
-	proxyDialer  proxy.Dialer
-	httpProxyURL *url.URL
-	direct       bool
+	proxyDialer    proxyutil.ContextDialer
+	httpProxyURL   *url.URL
+	direct         bool
+	proxyHash      string
+	connectTimeout time.Duration
+	tlsTimeout     time.Duration
+	connected      chan struct{}
+	connectedOnce  sync.Once
+	timings        *CodexProxyTimings
 }
 
-func newCodexRustlsRoundTripper(proxyURL string, fallback http.RoundTripper, enabled bool) *codexRustlsRoundTripper {
+func newCodexRustlsRoundTripper(proxyURL string, fallback http.RoundTripper, enabled bool, timeouts config.CodexProxyTimeouts, timings *CodexProxyTimings) (*codexRustlsRoundTripper, error) {
 	if fallback == nil {
 		fallback = http.DefaultTransport
 	}
+	httpsHTTP2, errTransport := newCodexRustlsHTTP2Transport(proxyURL, timeouts, timings)
+	if errTransport != nil {
+		return nil, errTransport
+	}
 	return &codexRustlsRoundTripper{
-		httpsHTTP2:         newCodexRustlsHTTP2Transport(proxyURL),
+		httpsHTTP2:         httpsHTTP2,
 		fallback:           fallback,
 		enabled:            enabled,
 		inheritEnvProxy:    strings.TrimSpace(proxyURL) == "",
-		envProxyTransports: make(map[string]http.RoundTripper),
-	}
+		timeouts:           timeouts,
+		proxyHash:          proxyutil.Hash(proxyURL),
+		envProxyTransports: make(map[string]codexHTTP2Transport),
+	}, nil
 }
 
-func newCodexRustlsDialer(proxyURL string) *codexRustlsDialer {
-	dialer := &codexRustlsDialer{direct: true}
+func newCodexRustlsDialer(proxyURL string, timeouts config.CodexProxyTimeouts, timings *CodexProxyTimings) (*codexRustlsDialer, error) {
+	dialer := &codexRustlsDialer{
+		direct:         true,
+		proxyHash:      proxyutil.Hash(proxyURL),
+		connectTimeout: timeouts.ProxyConnect,
+		tlsTimeout:     timeouts.TLSHandshake,
+		connected:      make(chan struct{}),
+		timings:        timings,
+	}
 	proxyURL = strings.TrimSpace(proxyURL)
 	if proxyURL == "" {
-		return dialer
+		return dialer, nil
 	}
 
 	setting, errParse := proxyutil.Parse(proxyURL)
 	if errParse != nil {
-		log.Errorf("codex rustls: failed to parse proxy config %q: %v", proxyutil.Redact(proxyURL), errParse)
-		return dialer
+		return nil, errParse
 	}
 	switch setting.Mode {
 	case proxyutil.ModeDirect, proxyutil.ModeInherit:
-		return dialer
+		return dialer, nil
 	case proxyutil.ModeProxy:
 		switch strings.ToLower(setting.URL.Scheme) {
 		case "http", "https":
 			dialer.httpProxyURL = setting.URL
 			dialer.direct = false
 		default:
-			proxyDialer, _, errBuild := proxyutil.BuildDialer(proxyURL)
+			proxyDialer, _, errBuild := proxyutil.BuildContextDialer(proxyURL, timeouts.ProxyConnect)
 			if errBuild != nil {
-				log.Errorf("codex rustls: failed to configure proxy dialer: %v", errBuild)
-				return dialer
+				return nil, errBuild
 			}
 			if proxyDialer != nil {
 				dialer.proxyDialer = proxyDialer
@@ -86,7 +146,7 @@ func newCodexRustlsDialer(proxyURL string) *codexRustlsDialer {
 			}
 		}
 	}
-	return dialer
+	return dialer, nil
 }
 
 func defaultProxyPort(proxyURL *url.URL) string {
@@ -188,24 +248,30 @@ func (d *codexRustlsDialer) dialHTTPProxyTunnel(ctx context.Context, network, ta
 	if resp.StatusCode != http.StatusOK {
 		_ = resp.Body.Close()
 		_ = conn.Close()
-		return nil, fmt.Errorf("codex rustls: HTTP proxy CONNECT failed with status %s", resp.Status)
+		if resp.StatusCode == http.StatusProxyAuthRequired {
+			return nil, proxyutil.NewError(proxyutil.CodeAuthFailed, proxyutil.StageProxyConnect, true, d.proxyHash, "proxy authentication failed", nil)
+		}
+		return nil, proxyutil.NewError(proxyutil.CodeConnectFailed, proxyutil.StageProxyConnect, true, d.proxyHash, "proxy CONNECT request failed", nil)
 	}
 	return conn, nil
 }
 
-func (t *codexRustlsRoundTripper) roundTripperForEnvProxy(proxyURL *url.URL) http.RoundTripper {
+func (t *codexRustlsRoundTripper) roundTripperForEnvProxy(proxyURL *url.URL) (codexHTTP2Transport, error) {
 	if proxyURL == nil {
-		return t.httpsHTTP2
+		return t.httpsHTTP2, nil
 	}
 	key := proxyURL.String()
 	t.envProxyTransportM.Lock()
 	defer t.envProxyTransportM.Unlock()
-	if roundTripper := t.envProxyTransports[key]; roundTripper != nil {
-		return roundTripper
+	if roundTripper := t.envProxyTransports[key]; roundTripper.roundTripper != nil {
+		return roundTripper, nil
 	}
-	roundTripper := newCodexRustlsHTTP2Transport(key)
+	roundTripper, errBuild := newCodexRustlsHTTP2Transport(key, t.timeouts, nil)
+	if errBuild != nil {
+		return codexHTTP2Transport{}, errBuild
+	}
 	t.envProxyTransports[key] = roundTripper
-	return roundTripper
+	return roundTripper, nil
 }
 
 func (t *codexRustlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -218,10 +284,98 @@ func (t *codexRustlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, 
 			return nil, errProxy
 		}
 		if proxyURL != nil {
-			return t.roundTripperForEnvProxy(proxyURL).RoundTrip(req)
+			transport, errTransport := t.roundTripperForEnvProxy(proxyURL)
+			if errTransport != nil {
+				return nil, errTransport
+			}
+			return roundTripBeforeHeaders(req, transport, t.timeouts)
 		}
 	}
-	return t.httpsHTTP2.RoundTrip(req)
+	return roundTripBeforeHeaders(req, t.httpsHTTP2, t.timeouts)
+}
+
+type roundTripResult struct {
+	response *http.Response
+	err      error
+}
+
+type cancelOnCloseBody struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+	once   sync.Once
+}
+
+func (b *cancelOnCloseBody) Close() error {
+	if b == nil {
+		return nil
+	}
+	errClose := b.ReadCloser.Close()
+	b.once.Do(b.cancel)
+	return errClose
+}
+
+func roundTripBeforeHeaders(req *http.Request, transport codexHTTP2Transport, timeouts config.CodexProxyTimeouts) (*http.Response, error) {
+	if req == nil || transport.roundTripper == nil {
+		return nil, fmt.Errorf("codex rustls: transport is not configured")
+	}
+	requestCtx, cancelRequest := context.WithCancel(req.Context())
+	requestWithCancel := req.Clone(requestCtx)
+	resultCh := make(chan roundTripResult, 1)
+	go func() {
+		response, errRoundTrip := transport.roundTripper.RoundTrip(requestWithCancel)
+		resultCh <- roundTripResult{response: response, err: errRoundTrip}
+	}()
+
+	var totalTimer *time.Timer
+	var totalC <-chan time.Time
+	if timeouts.FirstByte > 0 {
+		totalTimer = time.NewTimer(timeouts.FirstByte)
+		totalC = totalTimer.C
+		defer totalTimer.Stop()
+	}
+
+	connected := transport.connected
+	var headerTimer *time.Timer
+	var headerC <-chan time.Time
+	startHeaderTimer := func() {
+		if headerTimer != nil || timeouts.ResponseHeader <= 0 {
+			return
+		}
+		headerTimer = time.NewTimer(timeouts.ResponseHeader)
+		headerC = headerTimer.C
+	}
+	if connected == nil {
+		startHeaderTimer()
+	}
+	defer func() {
+		if headerTimer != nil {
+			headerTimer.Stop()
+		}
+	}()
+
+	for {
+		select {
+		case result := <-resultCh:
+			if result.err != nil || result.response == nil {
+				cancelRequest()
+				return result.response, result.err
+			}
+			result.response.Body = &cancelOnCloseBody{ReadCloser: result.response.Body, cancel: cancelRequest}
+			return result.response, nil
+		case <-connected:
+			connected = nil
+			startHeaderTimer()
+		case <-headerC:
+			cancelRequest()
+			return nil, proxyutil.NewError(proxyutil.CodeUpstreamHeaderTimeout, proxyutil.StageUpstreamHeader, true, transport.proxyHash, "upstream response headers timed out", context.DeadlineExceeded)
+		case <-totalC:
+			cancelRequest()
+			return nil, proxyutil.NewError(proxyutil.CodeUpstreamHeaderTimeout, proxyutil.StageUpstreamHeader, true, transport.proxyHash, "first-byte budget exceeded before response headers", context.DeadlineExceeded)
+		case <-req.Context().Done():
+			cancelRequest()
+			return nil, req.Context().Err()
+		}
+	}
 }
 
 func isCodexOfficialHost(host string) bool {
@@ -230,16 +384,42 @@ func isCodexOfficialHost(host string) bool {
 }
 
 func (d *codexRustlsDialer) dialTCP(ctx context.Context, network, addr string) (net.Conn, error) {
-	if d == nil || d.direct {
-		return (&net.Dialer{KeepAlive: 30 * time.Second}).DialContext(ctx, network, addr)
+	if d == nil {
+		return nil, proxyutil.NewError(proxyutil.CodeConfigInvalid, proxyutil.StageConfig, false, "", "Codex network dialer is not configured", nil)
 	}
-	if d.httpProxyURL != nil {
-		return d.dialHTTPProxyTunnel(ctx, network, addr)
+	stageCtx, cancelStage := context.WithTimeout(ctx, d.connectTimeout)
+	defer cancelStage()
+	startedAt := time.Now()
+	var conn net.Conn
+	var errDial error
+	if d.direct {
+		conn, errDial = (&net.Dialer{Timeout: d.connectTimeout, KeepAlive: 30 * time.Second}).DialContext(stageCtx, network, addr)
+	} else if d.httpProxyURL != nil {
+		conn, errDial = d.dialHTTPProxyTunnel(stageCtx, network, addr)
+	} else if d.proxyDialer != nil {
+		conn, errDial = d.proxyDialer.DialContext(stageCtx, network, addr)
+	} else {
+		errDial = errors.New("proxy dialer is not configured")
 	}
-	if d.proxyDialer != nil {
-		return d.proxyDialer.Dial(network, addr)
+	d.timings.recordProxyConnect(time.Since(startedAt))
+	if errDial == nil {
+		return conn, nil
 	}
-	return (&net.Dialer{KeepAlive: 30 * time.Second}).DialContext(ctx, network, addr)
+	if proxyErr, ok := proxyutil.AsError(errDial); ok {
+		return nil, proxyErr
+	}
+	if errors.Is(stageCtx.Err(), context.DeadlineExceeded) || isTimeoutError(errDial) {
+		return nil, proxyutil.NewError(proxyutil.CodeConnectTimeout, proxyutil.StageProxyConnect, true, d.proxyHash, "proxy connection timed out", errDial)
+	}
+	if strings.Contains(strings.ToLower(errDial.Error()), "authentication") {
+		return nil, proxyutil.NewError(proxyutil.CodeAuthFailed, proxyutil.StageProxyConnect, true, d.proxyHash, "proxy authentication failed", errDial)
+	}
+	return nil, proxyutil.NewError(proxyutil.CodeConnectFailed, proxyutil.StageProxyConnect, true, d.proxyHash, "proxy connection failed", errDial)
+}
+
+func isTimeoutError(err error) bool {
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
 }
 
 func (d *codexRustlsDialer) dialTLS(ctx context.Context, network, addr, serverName string, nextProtos []string) (net.Conn, error) {
@@ -262,9 +442,11 @@ func (d *codexRustlsDialer) dialTLS(ctx context.Context, network, addr, serverNa
 	tlsConn := tls.UClient(rawConn, &tls.Config{ServerName: serverName}, tls.HelloCustom)
 	if errPreset := tlsConn.ApplyPreset(codexRustlsLikeClientHelloSpec(nextProtos)); errPreset != nil {
 		_ = rawConn.Close()
-		return nil, errPreset
+		return nil, proxyutil.NewError(proxyutil.CodeTLSFailed, proxyutil.StageTLSHandshake, true, d.proxyHash, "TLS client profile setup failed", errPreset)
 	}
-	if deadline, ok := ctx.Deadline(); ok {
+	handshakeCtx, cancelHandshake := context.WithTimeout(ctx, d.tlsTimeout)
+	defer cancelHandshake()
+	if deadline, ok := handshakeCtx.Deadline(); ok {
 		if errDeadline := tlsConn.SetDeadline(deadline); errDeadline != nil {
 			_ = rawConn.Close()
 			return nil, errDeadline
@@ -275,16 +457,26 @@ func (d *codexRustlsDialer) dialTLS(ctx context.Context, network, addr, serverNa
 			}
 		}()
 	}
-	if errHandshake := tlsConn.Handshake(); errHandshake != nil {
+	startedAt := time.Now()
+	if errHandshake := tlsConn.HandshakeContext(handshakeCtx); errHandshake != nil {
+		d.timings.recordTLSHandshake(time.Since(startedAt))
 		_ = tlsConn.Close()
-		return nil, errHandshake
+		if errors.Is(handshakeCtx.Err(), context.DeadlineExceeded) || isTimeoutError(errHandshake) {
+			return nil, proxyutil.NewError(proxyutil.CodeTLSTimeout, proxyutil.StageTLSHandshake, true, d.proxyHash, "TLS handshake timed out", errHandshake)
+		}
+		return nil, proxyutil.NewError(proxyutil.CodeTLSFailed, proxyutil.StageTLSHandshake, true, d.proxyHash, "TLS handshake failed", errHandshake)
 	}
+	d.timings.recordTLSHandshake(time.Since(startedAt))
+	d.connectedOnce.Do(func() { close(d.connected) })
 	return tlsConn, nil
 }
 
-func newCodexRustlsHTTP2Transport(proxyURL string) *http2.Transport {
-	dialer := newCodexRustlsDialer(proxyURL)
-	return &http2.Transport{
+func newCodexRustlsHTTP2Transport(proxyURL string, timeouts config.CodexProxyTimeouts, timings *CodexProxyTimings) (codexHTTP2Transport, error) {
+	dialer, errDialer := newCodexRustlsDialer(proxyURL, timeouts, timings)
+	if errDialer != nil {
+		return codexHTTP2Transport{}, errDialer
+	}
+	transport := &http2.Transport{
 		DialTLSContext: func(ctx context.Context, network, addr string, cfg *stdtls.Config) (net.Conn, error) {
 			serverName := ""
 			if cfg != nil {
@@ -293,6 +485,7 @@ func newCodexRustlsHTTP2Transport(proxyURL string) *http2.Transport {
 			return dialer.dialTLS(ctx, network, addr, serverName, []string{http2.NextProtoTLS, "http/1.1"})
 		},
 	}
+	return codexHTTP2Transport{roundTripper: transport, connected: dialer.connected, proxyHash: dialer.proxyHash}, nil
 }
 
 func codexRustlsLikeClientHelloSpec(nextProtos []string) *tls.ClientHelloSpec {
@@ -372,29 +565,74 @@ func codexAuthUsesAPIKey(auth *cliproxyauth.Auth) bool {
 
 // NewCodexRustlsHTTPClient creates a proxy-aware HTTP/2 client matching the
 // ClientHello captured from Codex CLI 0.144.1 for official OAuth traffic.
-func NewCodexRustlsHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth) *http.Client {
+func NewCodexRustlsHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth) (*http.Client, error) {
+	return newCodexRustlsHTTPClient(ctx, cfg, auth, nil)
+}
+
+func newCodexRustlsHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, timings *CodexProxyTimings) (*http.Client, error) {
 	proxyURL := codexProxyURL(cfg, auth)
-	fallback := http.RoundTripper(http.DefaultTransport)
+	setting, errProxy := validateCodexProxySetting(proxyURL, cfg != nil && cfg.CodexProxyRequired)
+	if errProxy != nil {
+		return nil, errProxy
+	}
+	timeouts := cfg.CodexProxyTimeouts()
+	fallback, errFallback := buildCodexFallbackTransport(proxyURL, timeouts)
+	if errFallback != nil {
+		return nil, errFallback
+	}
 	enabled := !codexAuthUsesAPIKey(auth)
-	if proxyURL != "" {
-		if transport := buildProxyTransport(proxyURL); transport != nil {
-			fallback = transport
-		}
-	} else if ctx != nil {
+	if setting.Mode == proxyutil.ModeInherit && ctx != nil {
 		if roundTripper, ok := ctx.Value("cliproxy.roundtripper").(http.RoundTripper); ok && roundTripper != nil {
 			fallback = roundTripper
 			enabled = false
 		}
 	}
+	roundTripper, errRoundTripper := newCodexRustlsRoundTripper(proxyURL, fallback, enabled, timeouts, timings)
+	if errRoundTripper != nil {
+		return nil, errRoundTripper
+	}
+	return &http.Client{Transport: roundTripper}, nil
+}
 
-	return &http.Client{Transport: newCodexRustlsRoundTripper(proxyURL, fallback, enabled)}
+func validateCodexProxySetting(proxyURL string, required bool) (proxyutil.Setting, error) {
+	setting, errParse := proxyutil.Parse(proxyURL)
+	if errParse != nil {
+		return setting, errParse
+	}
+	if required && setting.Mode != proxyutil.ModeProxy {
+		return setting, proxyutil.NewError(proxyutil.CodeRequired, proxyutil.StageConfig, false, "", "Codex proxy is required; direct or empty proxy settings are not allowed", nil)
+	}
+	return setting, nil
+}
+
+func buildCodexFallbackTransport(proxyURL string, timeouts config.CodexProxyTimeouts) (http.RoundTripper, error) {
+	transport, _, errBuild := proxyutil.BuildHTTPTransportWithConnectTimeout(proxyURL, timeouts.ProxyConnect)
+	if errBuild != nil {
+		return nil, errBuild
+	}
+	if transport == nil {
+		if defaultTransport, ok := http.DefaultTransport.(*http.Transport); ok && defaultTransport != nil {
+			transport = defaultTransport.Clone()
+		} else {
+			transport = &http.Transport{}
+		}
+		transport.DialContext = (&net.Dialer{Timeout: timeouts.ProxyConnect, KeepAlive: 30 * time.Second}).DialContext
+	}
+	transport.TLSHandshakeTimeout = timeouts.TLSHandshake
+	transport.ResponseHeaderTimeout = timeouts.ResponseHeader
+	return transport, nil
 }
 
 // NewCodexRustlsNetDialTLSContext returns a TLS dialer for the official Codex
 // websocket. The websocket caller must leave gorilla's Proxy hook disabled.
 func NewCodexRustlsNetDialTLSContext(cfg *config.Config, auth *cliproxyauth.Auth) func(context.Context, string, string) (net.Conn, error) {
 	proxyURL := codexProxyURL(cfg, auth)
+	timeouts := cfg.CodexProxyTimeouts()
+	_, configErr := validateCodexProxySetting(proxyURL, cfg != nil && cfg.CodexProxyRequired)
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if configErr != nil {
+			return nil, configErr
+		}
 		resolvedProxyURL := proxyURL
 		if strings.TrimSpace(resolvedProxyURL) == "" {
 			proxyRequest := &http.Request{URL: &url.URL{Scheme: "https", Host: addr}}
@@ -406,7 +644,10 @@ func NewCodexRustlsNetDialTLSContext(cfg *config.Config, auth *cliproxyauth.Auth
 				resolvedProxyURL = envProxyURL.String()
 			}
 		}
-		dialer := newCodexRustlsDialer(resolvedProxyURL)
+		dialer, errDialer := newCodexRustlsDialer(resolvedProxyURL, timeouts, nil)
+		if errDialer != nil {
+			return nil, errDialer
+		}
 		return dialer.dialTLS(ctx, network, addr, "", nil)
 	}
 }

@@ -27,6 +27,7 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/proxyutil"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/sjson"
@@ -218,6 +219,7 @@ func (NoopHook) OnResult(context.Context, Result) {}
 // Manager orchestrates auth lifecycle, selection, execution, and persistence.
 type Manager struct {
 	store         Store
+	persistMu     sync.Mutex
 	cooldownStore CooldownStateStore
 	executors     map[string]ProviderExecutor
 	selector      Selector
@@ -512,6 +514,20 @@ func (m *Manager) SetConfig(cfg *internalconfig.Config) {
 		cfg = &internalconfig.Config{}
 	}
 	m.runtimeConfig.Store(cfg)
+	proxySnapshots := make([]*Auth, 0)
+	m.mu.Lock()
+	for _, auth := range m.auths {
+		m.normalizeCodexProxyRuntime(auth, cfg)
+		if auth != nil && strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+			proxySnapshots = append(proxySnapshots, auth.Clone())
+		}
+	}
+	m.mu.Unlock()
+	if m.scheduler != nil {
+		for _, auth := range proxySnapshots {
+			m.scheduler.upsertAuth(auth)
+		}
+	}
 	clearedCooldowns := m.clearDisabledCooldownStates(cfg)
 	if !cfg.Home.Enabled {
 		m.clearHomeRuntimeAuths()
@@ -1859,10 +1875,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			}
 		}
 		if errStream != nil {
-			rerr := &Error{Message: errStream.Error()}
-			if se, ok := errors.AsType[cliproxyexecutor.StatusError](errStream); ok && se != nil {
-				rerr.HTTPStatus = se.StatusCode()
-			}
+			rerr := resultErrorFromExecution(errStream)
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
 			result.RetryAfter = retryAfterFromError(errStream)
 			m.MarkResult(ctx, result)
@@ -1898,10 +1911,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		}
 		if bootstrapErr != nil {
 			if isRequestInvalidError(bootstrapErr) {
-				rerr := &Error{Message: bootstrapErr.Error()}
-				if se, ok := errors.AsType[cliproxyexecutor.StatusError](bootstrapErr); ok && se != nil {
-					rerr.HTTPStatus = se.StatusCode()
-				}
+				rerr := resultErrorFromExecution(bootstrapErr)
 				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
 				result.RetryAfter = retryAfterFromError(bootstrapErr)
 				m.MarkResult(ctx, result)
@@ -1909,10 +1919,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				return nil, bootstrapErr
 			}
 			if idx < len(execModels)-1 {
-				rerr := &Error{Message: bootstrapErr.Error()}
-				if se, ok := errors.AsType[cliproxyexecutor.StatusError](bootstrapErr); ok && se != nil {
-					rerr.HTTPStatus = se.StatusCode()
-				}
+				rerr := resultErrorFromExecution(bootstrapErr)
 				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
 				result.RetryAfter = retryAfterFromError(bootstrapErr)
 				m.MarkResult(ctx, result)
@@ -1920,10 +1927,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				lastErr = bootstrapErr
 				continue
 			}
-			rerr := &Error{Message: bootstrapErr.Error()}
-			if se, ok := errors.AsType[cliproxyexecutor.StatusError](bootstrapErr); ok && se != nil {
-				rerr.HTTPStatus = se.StatusCode()
-			}
+			rerr := resultErrorFromExecution(bootstrapErr)
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
 			result.RetryAfter = retryAfterFromError(bootstrapErr)
 			m.MarkResult(ctx, result)
@@ -2154,10 +2158,18 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 		clearedCooldown = clearCooldownStateForAuth(auth, now)
 	}
 	auth.EnsureIndex()
+	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+	m.normalizeCodexProxyRuntime(auth, cfg)
+	m.persistMu.Lock()
+	if errPersist := m.persist(ctx, auth); errPersist != nil {
+		m.persistMu.Unlock()
+		return nil, errPersist
+	}
 	authClone := auth.Clone()
 	m.mu.Lock()
 	m.auths[auth.ID] = authClone
 	m.mu.Unlock()
+	m.persistMu.Unlock()
 	if !shouldDeferAPIKeyModelAliasRebuild(ctx) {
 		m.rebuildAPIKeyModelAliasFromRuntimeConfig()
 	}
@@ -2165,7 +2177,6 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 		m.scheduler.upsertAuth(authClone)
 	}
 	m.queueRefreshReschedule(auth.ID)
-	_ = m.persist(ctx, auth)
 	m.hook.OnAuthRegistered(ctx, auth.Clone())
 	if clearedCooldown {
 		m.persistCooldownStates(ctx)
@@ -2178,6 +2189,8 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	if auth == nil || auth.ID == "" {
 		return nil, nil
 	}
+	m.persistMu.Lock()
+	defer m.persistMu.Unlock()
 	m.mu.Lock()
 	existing, ok := m.auths[auth.ID]
 	if !ok || existing == nil {
@@ -2202,6 +2215,21 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 		clearedCooldown = clearCooldownStateForAuth(auth, now)
 	}
 	auth.EnsureIndex()
+	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+	m.normalizeCodexProxyRuntime(auth, cfg)
+	m.mu.Unlock()
+	if errPersist := m.persist(ctx, auth); errPersist != nil {
+		return nil, errPersist
+	}
+	m.mu.Lock()
+	if latest := m.auths[auth.ID]; latest != nil {
+		auth.Success = latest.Success
+		auth.Failed = latest.Failed
+		auth.recentRequests = latest.recentRequests
+		if !latest.Disabled && latest.Status != StatusDisabled && !auth.Disabled && auth.Status != StatusDisabled && len(auth.ModelStates) == 0 && len(latest.ModelStates) > 0 {
+			auth.ModelStates = latest.ModelStates
+		}
+	}
 	authClone := auth.Clone()
 	m.auths[auth.ID] = authClone
 	m.mu.Unlock()
@@ -2212,7 +2240,6 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 		m.scheduler.upsertAuth(authClone)
 	}
 	m.queueRefreshReschedule(auth.ID)
-	_ = m.persist(ctx, auth)
 	m.hook.OnAuthUpdated(ctx, auth.Clone())
 	if clearedCooldown {
 		m.persistCooldownStates(ctx)
@@ -2294,15 +2321,16 @@ func (m *Manager) Load(ctx context.Context) error {
 		m.mu.Unlock()
 		return err
 	}
+	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
 	m.auths = make(map[string]*Auth, len(items))
 	for _, auth := range items {
 		if auth == nil || auth.ID == "" {
 			continue
 		}
 		auth.EnsureIndex()
+		m.normalizeCodexProxyRuntime(auth, cfg)
 		m.auths[auth.ID] = auth.Clone()
 	}
-	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
 	if cfg == nil {
 		cfg = &internalconfig.Config{}
 	}
@@ -2528,6 +2556,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 	tried := make(map[string]struct{})
 	attempted := make(map[string]struct{})
 	var lastErr error
+	proxyFailures := 0
 	for {
 		if !homeMode && maxRetryCredentials > 0 && len(attempted) >= maxRetryCredentials {
 			if lastErr != nil {
@@ -2541,6 +2570,9 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		}
 		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, pickOpts, tried)
 		if errPick != nil {
+			if _, isProxyFailure := proxyutil.AsError(lastErr); isProxyFailure {
+				return cliproxyexecutor.Response{}, lastErr
+			}
 			if shouldReturnLastErrorOnPickFailure(homeMode, lastErr, errPick) {
 				return cliproxyexecutor.Response{}, lastErr
 			}
@@ -2604,18 +2636,25 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			}
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil}
 			if errExec != nil {
-				result.Error = &Error{Message: errExec.Error()}
-				if se, ok := errors.AsType[cliproxyexecutor.StatusError](errExec); ok && se != nil {
-					result.Error.HTTPStatus = se.StatusCode()
-				}
+				result.Error = resultErrorFromExecution(errExec)
 				if ra := retryAfterFromError(errExec); ra != nil {
 					result.RetryAfter = ra
+				}
+				proxyFailure := markProxyAttempted(tried, auth, errExec)
+				if proxyFailure {
+					proxyFailures++
 				}
 				m.MarkResult(execCtx, result)
 				if isRequestInvalidError(errExec) {
 					return cliproxyexecutor.Response{}, errExec
 				}
 				authErr = errExec
+				if proxyFailure {
+					if proxyFailures >= 2 {
+						return cliproxyexecutor.Response{}, errExec
+					}
+					break
+				}
 				continue
 			}
 			m.MarkResult(execCtx, result)
@@ -2647,6 +2686,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 	tried := make(map[string]struct{})
 	attempted := make(map[string]struct{})
 	var lastErr error
+	proxyFailures := 0
 	for {
 		if !homeMode && maxRetryCredentials > 0 && len(attempted) >= maxRetryCredentials {
 			if lastErr != nil {
@@ -2660,6 +2700,9 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		}
 		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, pickOpts, tried)
 		if errPick != nil {
+			if _, isProxyFailure := proxyutil.AsError(lastErr); isProxyFailure {
+				return cliproxyexecutor.Response{}, lastErr
+			}
 			if shouldReturnLastErrorOnPickFailure(homeMode, lastErr, errPick) {
 				return cliproxyexecutor.Response{}, lastErr
 			}
@@ -2723,18 +2766,25 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			}
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil}
 			if errExec != nil {
-				result.Error = &Error{Message: errExec.Error()}
-				if se, ok := errors.AsType[cliproxyexecutor.StatusError](errExec); ok && se != nil {
-					result.Error.HTTPStatus = se.StatusCode()
-				}
+				result.Error = resultErrorFromExecution(errExec)
 				if ra := retryAfterFromError(errExec); ra != nil {
 					result.RetryAfter = ra
+				}
+				proxyFailure := markProxyAttempted(tried, auth, errExec)
+				if proxyFailure {
+					proxyFailures++
 				}
 				m.MarkResult(execCtx, result)
 				if isRequestInvalidError(errExec) {
 					return cliproxyexecutor.Response{}, errExec
 				}
 				authErr = errExec
+				if proxyFailure {
+					if proxyFailures >= 2 {
+						return cliproxyexecutor.Response{}, errExec
+					}
+					break
+				}
 				continue
 			}
 			m.MarkResult(execCtx, result)
@@ -2766,6 +2816,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 	tried := make(map[string]struct{})
 	attempted := make(map[string]struct{})
 	var lastErr error
+	proxyFailures := 0
 	for {
 		if !homeMode && maxRetryCredentials > 0 && len(attempted) >= maxRetryCredentials {
 			if lastErr != nil {
@@ -2779,6 +2830,9 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		}
 		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, pickOpts, tried)
 		if errPick != nil {
+			if _, isProxyFailure := proxyutil.AsError(lastErr); isProxyFailure {
+				return nil, lastErr
+			}
 			if shouldReturnLastErrorOnPickFailure(homeMode, lastErr, errPick) {
 				return nil, lastErr
 			}
@@ -2823,6 +2877,12 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			}
 			if isRequestInvalidError(errStream) {
 				return nil, errStream
+			}
+			if markProxyAttempted(tried, auth, errStream) {
+				proxyFailures++
+				if proxyFailures >= 2 {
+					return nil, errStream
+				}
 			}
 			lastErr = errStream
 			if homeMode {
@@ -3587,6 +3647,12 @@ func (m *Manager) shouldRetryAfterError(err error, attempt int, providers []stri
 	if err == nil {
 		return 0, false
 	}
+	// Proxy-aware execution already performs the single permitted cross-proxy
+	// failover inside execute*MixedOnce. Do not reset its tried set by entering
+	// the outer cooldown retry loop.
+	if _, proxyFailure := proxyutil.AsError(err); proxyFailure {
+		return 0, false
+	}
 	if maxWait <= 0 {
 		return 0, false
 	}
@@ -3670,10 +3736,18 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	setModelQuota := false
 	var authSnapshot *Auth
 	cooldownStateChanged := false
+	proxyTransition := proxyutil.HealthTransition{}
 
 	m.mu.Lock()
 	if auth, ok := m.auths[result.AuthID]; ok && auth != nil {
 		now := time.Now()
+		if strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+			if result.Success {
+				proxyutil.RecordSuccess(auth.ID, authProxyHash(auth), now)
+			} else if proxyErr := proxyErrorFromResult(auth, result.Error); proxyErr != nil {
+				proxyTransition = proxyutil.RecordFailure(auth.ID, proxyErr, now)
+			}
+		}
 		var cooldownRecordsBefore []CooldownStateRecord
 		trackCooldownState := m.cooldownStore != nil
 		if trackCooldownState {
@@ -3825,7 +3899,11 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	}
 	m.mu.Unlock()
 	if m.scheduler != nil && authSnapshot != nil {
-		m.scheduler.upsertAuth(authSnapshot)
+		if proxyTransition.ProxyOpened {
+			m.RefreshProxyHealth(proxyTransition.ProxyHash)
+		} else {
+			m.scheduler.upsertAuth(authSnapshot)
+		}
 	}
 	if authSnapshot != nil && cooldownStateChanged {
 		m.persistCooldownStates(context.Background())
@@ -4549,7 +4627,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		if disallowFreeAuth && isFreeCodexAuth(candidate) {
 			continue
 		}
-		if _, used := tried[candidate.ID]; used {
+		if authAttempted(tried, candidate) {
 			continue
 		}
 		if modelKey != "" && !m.authSupportsRouteModel(registryRef, candidate, model) {
@@ -4609,7 +4687,7 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 			if candidate == nil || executorKeyFromAuth(candidate) != provider || candidate.Disabled {
 				continue
 			}
-			if _, used := tried[candidate.ID]; used {
+			if authAttempted(tried, candidate) {
 				continue
 			}
 			if m.routeAwareSelectionRequired(candidate, model) {
@@ -4706,7 +4784,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		if _, ok := providerSet[providerKey]; !ok {
 			continue
 		}
-		if _, used := tried[candidate.ID]; used {
+		if authAttempted(tried, candidate) {
 			continue
 		}
 		if _, ok := m.executors[providerKey]; !ok {
@@ -4800,7 +4878,7 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 			if _, ok := providerSet[executorKeyFromAuth(candidate)]; !ok {
 				continue
 			}
-			if _, used := tried[candidate.ID]; used {
+			if authAttempted(tried, candidate) {
 				continue
 			}
 			if m.routeAwareSelectionRequired(candidate, model) {

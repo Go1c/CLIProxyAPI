@@ -106,6 +106,10 @@ redis-usage-queue-retention-seconds: 60
 # Per-entry proxy-url also supports "direct" or "none" to bypass both the global proxy-url and environment proxies explicitly.
 proxy-url: ""
 
+# Require every Codex OAuth credential to resolve to a valid non-direct proxy.
+# Default: false for backward compatibility.
+codex-proxy-required: false
+
 # When true, unprefixed model requests only use credentials without a prefix (except when prefix == model name).
 force-model-prefix: false
 
@@ -184,6 +188,12 @@ codex:
   # Some superstitious users believe request tracking identifiers can be used
   # as evidence for TOS enforcement bans; this option only satisfies those odd concerns.
   identity-confuse: false
+  # Timeouts apply only before upstream response headers arrive. They do not
+  # limit the duration of a streaming response body.
+  proxy-connect-timeout-seconds: 10
+  tls-handshake-timeout-seconds: 15
+  response-header-timeout-seconds: 90
+  first-byte-timeout-seconds: 120
 
 # When true, enable authentication for the WebSocket API (/v1/ws).
 ws-auth: true

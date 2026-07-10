@@ -276,3 +276,51 @@ func TestPatchAuthFileFields_ArbitraryFieldsPersistToFile(t *testing.T) {
 		t.Fatalf("fgh.ijk = %#v, want true", got)
 	}
 }
+
+func TestPatchAuthFileFieldsInvalidProxyLeavesFileUnchanged(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	authDir := t.TempDir()
+	path := filepath.Join(authDir, "codex.json")
+	store := fileauth.NewFileTokenStore()
+	store.SetBaseDir(authDir)
+	manager := coreauth.NewManager(store, nil, nil)
+	record := &coreauth.Auth{
+		ID:       "codex.json",
+		FileName: "codex.json",
+		Provider: "codex",
+		ProxyURL: "socks5://proxy.example.com:443",
+		Attributes: map[string]string{
+			"path": path,
+		},
+		Metadata: map[string]any{
+			"type":      "codex",
+			"proxy_url": "socks5://proxy.example.com:443",
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+	before, errRead := os.ReadFile(path)
+	if errRead != nil {
+		t.Fatalf("read auth before patch: %v", errRead)
+	}
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	request := httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/fields", strings.NewReader(`{"name":"codex.json","proxy_url":"socks5:user:pass@host:443"}`))
+	request.Header.Set("Content-Type", "application/json")
+	ctx.Request = request
+
+	h.PatchAuthFileFields(ctx)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusBadRequest, recorder.Body.String())
+	}
+	after, errReadAfter := os.ReadFile(path)
+	if errReadAfter != nil {
+		t.Fatalf("read auth after patch: %v", errReadAfter)
+	}
+	if string(after) != string(before) {
+		t.Fatal("auth file changed after failed proxy validation")
+	}
+}

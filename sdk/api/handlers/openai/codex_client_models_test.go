@@ -160,3 +160,27 @@ func TestCodexClientModelsResponse_PreservesUltraReasoningEffort(t *testing.T) {
 
 	t.Fatalf("supported_reasoning_levels = %#v, want ultra", levels)
 }
+
+func TestApplyCodexClientNonTemplatePrioritiesUsesCurrentTemplateMaximum(t *testing.T) {
+	templates := map[string]map[string]any{
+		"template-a": {"slug": "template-a", "priority": 29},
+		"template-b": {"slug": "template-b", "priority": 43},
+	}
+	result := []map[string]any{
+		{"slug": "custom-z", "display_name": "Zulu"},
+		{"slug": "template-a", "display_name": "Template A", "priority": 29},
+		{"slug": "custom-a", "display_name": "Alpha"},
+	}
+
+	applyCodexClientNonTemplatePriorities(result, templates)
+
+	if got := codexClientModelPriority(result[2]); got != 143 {
+		t.Fatalf("first non-template priority = %d, want 143", got)
+	}
+	if got := codexClientModelPriority(result[0]); got != 243 {
+		t.Fatalf("second non-template priority = %d, want 243", got)
+	}
+	if got := codexClientModelPriority(result[1]); got != 29 {
+		t.Fatalf("template priority = %d, want unchanged 29", got)
+	}
+}

@@ -6,6 +6,9 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -65,5 +68,37 @@ func TestUploadAuthFile_PreservesPriorityAttributes(t *testing.T) {
 	}
 	if got := auth.Metadata["priority"]; got != float64(98) {
 		t.Fatalf("priority metadata = %#v, want 98", got)
+	}
+}
+
+func TestUploadAuthFileRejectsInvalidSOCKS5BeforeWriting(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	manager := coreauth.NewManager(nil, nil, nil)
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+	content := `{"type":"codex","proxy_url":"socks5:user:pass@host:443"}`
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	part, _ := writer.CreateFormFile("file", "invalid-codex.json")
+	_, _ = part.Write([]byte(content))
+	_ = writer.Close()
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	request := httptest.NewRequest(http.MethodPost, "/v0/management/auth-files", &body)
+	request.Header.Set("Content-Type", writer.FormDataContentType())
+	ctx.Request = request
+
+	h.UploadAuthFile(ctx)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusBadRequest, recorder.Body.String())
+	}
+	if _, errStat := os.Stat(filepath.Join(authDir, "invalid-codex.json")); !os.IsNotExist(errStat) {
+		t.Fatalf("invalid auth file was written: %v", errStat)
+	}
+	if strings.Contains(recorder.Body.String(), "user") || strings.Contains(recorder.Body.String(), "pass") {
+		t.Fatalf("response exposed proxy credentials: %s", recorder.Body.String())
 	}
 }

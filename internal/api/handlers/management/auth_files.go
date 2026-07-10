@@ -31,11 +31,13 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher/synthesizer"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/proxyutil"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 )
@@ -567,6 +569,26 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 	if websockets, ok := authWebsocketsValue(auth); ok {
 		entry["websockets"] = websockets
 	}
+	if strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") && h.authManager != nil {
+		proxyStatus := h.authManager.ProxyRuntimeStatus(auth.ID)
+		entry["proxy_mode"] = proxyStatus.Mode
+		entry["proxy_valid"] = proxyStatus.Valid
+		entry["proxy_verified"] = proxyStatus.Verified
+		entry["proxy_endpoint"] = proxyStatus.Endpoint
+		entry["proxy_hash"] = proxyStatus.Hash
+		entry["circuit_state"] = proxyStatus.CircuitState
+		entry["auth_circuit_state"] = proxyStatus.AuthCircuitState
+		if proxyStatus.CloudflarePOP != "" {
+			entry["cloudflare_pop"] = proxyStatus.CloudflarePOP
+		}
+		if !proxyStatus.LastProbeAt.IsZero() {
+			entry["last_probe_at"] = proxyStatus.LastProbeAt
+			entry["last_probe_latency_ms"] = proxyStatus.LastProbeLatencyMS
+		}
+		if proxyStatus.LastErrorCode != "" {
+			entry["last_error_code"] = proxyStatus.LastErrorCode
+		}
+	}
 	return entry
 }
 
@@ -751,6 +773,10 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 				c.JSON(http.StatusBadRequest, gin.H{"error": "file must be .json"})
 				return
 			}
+			if _, okProxy := proxyutil.AsError(errUpload); okProxy {
+				writeProxyValidationError(c, errUpload)
+				return
+			}
 			c.JSON(http.StatusInternalServerError, gin.H{"error": errUpload.Error()})
 			return
 		}
@@ -807,6 +833,10 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 		return
 	}
 	if err = h.writeAuthFile(ctx, filepath.Base(name), data); err != nil {
+		if _, okProxy := proxyutil.AsError(err); okProxy {
+			writeProxyValidationError(c, err)
+			return
+		}
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
 	}
@@ -954,13 +984,59 @@ func (h *Handler) writeAuthFile(ctx context.Context, name string, data []byte) e
 	if err != nil {
 		return err
 	}
-	if errWrite := os.WriteFile(dst, data, 0o600); errWrite != nil {
+	if strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+		h.mu.Lock()
+		cfg := h.cfg
+		h.mu.Unlock()
+		if errValidate := validateCodexProxyCandidate(cfg, auth.ProxyURL, true); errValidate != nil {
+			return errValidate
+		}
+	}
+	original, errOriginal := os.ReadFile(dst)
+	hadOriginal := errOriginal == nil
+	if errOriginal != nil && !os.IsNotExist(errOriginal) {
+		return fmt.Errorf("failed to read existing auth file: %w", errOriginal)
+	}
+	if errWrite := atomicWriteManagementFile(dst, data); errWrite != nil {
 		return fmt.Errorf("failed to write file: %w", errWrite)
 	}
 	if err := h.upsertAuthRecord(ctx, auth); err != nil {
+		if hadOriginal {
+			_ = atomicWriteManagementFile(dst, original)
+		} else {
+			_ = os.Remove(dst)
+		}
 		return err
 	}
 	return nil
+}
+
+func atomicWriteManagementFile(path string, data []byte) error {
+	if errMkdir := os.MkdirAll(filepath.Dir(path), 0o700); errMkdir != nil {
+		return errMkdir
+	}
+	tempFile, errCreate := os.CreateTemp(filepath.Dir(path), ".auth-upload-*.tmp")
+	if errCreate != nil {
+		return errCreate
+	}
+	tempPath := tempFile.Name()
+	defer func() { _ = os.Remove(tempPath) }()
+	if errChmod := tempFile.Chmod(0o600); errChmod != nil {
+		_ = tempFile.Close()
+		return errChmod
+	}
+	if _, errWrite := tempFile.Write(data); errWrite != nil {
+		_ = tempFile.Close()
+		return errWrite
+	}
+	if errSync := tempFile.Sync(); errSync != nil {
+		_ = tempFile.Close()
+		return errSync
+	}
+	if errClose := tempFile.Close(); errClose != nil {
+		return errClose
+	}
+	return os.Rename(tempPath, path)
 }
 
 func requestedAuthFileNamesForDelete(c *gin.Context) ([]string, error) {
@@ -1298,6 +1374,16 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"status": "ok", "disabled": *req.Disabled})
 		return
 	}
+	if !*req.Disabled && strings.EqualFold(strings.TrimSpace(targetAuth.Provider), "codex") {
+		h.mu.Lock()
+		cfg := h.cfg
+		h.mu.Unlock()
+		proxyResult := helps.RunCodexProxyTest(ctx, cfg, targetAuth.ProxyURL)
+		if !proxyResult.OK {
+			c.JSON(proxyTestHTTPStatus(proxyResult.Code, false), proxyResult)
+			return
+		}
+	}
 
 	if coreauth.IsConfigAPIKeyAuth(targetAuth) {
 		h.mu.Lock()
@@ -1479,6 +1565,22 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 	if coreauth.IsPluginVirtualAuth(targetAuth) {
 		c.JSON(http.StatusConflict, gin.H{"error": errPluginVirtualAuth.Error()})
 		return
+	}
+	if strings.EqualFold(strings.TrimSpace(targetAuth.Provider), "codex") {
+		if rawProxyURL, okProxyURL := req["proxy_url"]; okProxyURL {
+			var proxyURL string
+			if errProxyURL := json.Unmarshal(rawProxyURL, &proxyURL); errProxyURL != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"ok": false, "code": proxyutil.CodeConfigInvalid, "stage": proxyutil.StageConfig, "message": "proxy_url must be a string"})
+				return
+			}
+			h.mu.Lock()
+			cfg := h.cfg
+			h.mu.Unlock()
+			if errValidate := validateCodexProxyCandidate(cfg, proxyURL, true); errValidate != nil {
+				writeProxyValidationError(c, errValidate)
+				return
+			}
+		}
 	}
 
 	changed := false

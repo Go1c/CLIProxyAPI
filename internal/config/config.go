@@ -295,6 +295,15 @@ func DefaultCodexHeaderDefaults() CodexHeaderDefaults {
 // CodexConfig configures provider-wide Codex request behavior.
 type CodexConfig struct {
 	IdentityConfuse bool `yaml:"identity-confuse" json:"identity-confuse"`
+
+	// ProxyConnectTimeoutSeconds limits TCP and proxy handshake establishment.
+	ProxyConnectTimeoutSeconds int `yaml:"proxy-connect-timeout-seconds,omitempty" json:"proxy-connect-timeout-seconds,omitempty"`
+	// TLSHandshakeTimeoutSeconds limits only the upstream TLS handshake.
+	TLSHandshakeTimeoutSeconds int `yaml:"tls-handshake-timeout-seconds,omitempty" json:"tls-handshake-timeout-seconds,omitempty"`
+	// ResponseHeaderTimeoutSeconds limits the wait for upstream response headers.
+	ResponseHeaderTimeoutSeconds int `yaml:"response-header-timeout-seconds,omitempty" json:"response-header-timeout-seconds,omitempty"`
+	// FirstByteTimeoutSeconds caps all work before response headers arrive.
+	FirstByteTimeoutSeconds int `yaml:"first-byte-timeout-seconds,omitempty" json:"first-byte-timeout-seconds,omitempty"`
 }
 
 // TLSConfig holds HTTPS server settings.

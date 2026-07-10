@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"sync/atomic"
 	"testing"
 )
@@ -9,6 +10,21 @@ import (
 type countingStore struct {
 	saveCount atomic.Int32
 }
+
+type failingUpdateStore struct {
+	fail atomic.Bool
+}
+
+func (s *failingUpdateStore) List(context.Context) ([]*Auth, error) { return nil, nil }
+
+func (s *failingUpdateStore) Save(context.Context, *Auth) (string, error) {
+	if s.fail.Load() {
+		return "", errors.New("save failed")
+	}
+	return "", nil
+}
+
+func (s *failingUpdateStore) Delete(context.Context, string) error { return nil }
 
 func (s *countingStore) List(context.Context) ([]*Auth, error) { return nil, nil }
 
@@ -89,5 +105,25 @@ func TestPersist_SkipsConfigAPIKeyAuth(t *testing.T) {
 	mgr.MarkResult(context.Background(), Result{AuthID: auth.ID, Provider: "codex", Model: "gpt-5", Success: true})
 	if got := store.saveCount.Load(); got != 0 {
 		t.Fatalf("expected MarkResult to skip persist for config api key, got %d Save calls", got)
+	}
+}
+
+func TestUpdatePersistenceFailureLeavesRuntimeAuthUnchanged(t *testing.T) {
+	store := &failingUpdateStore{}
+	manager := NewManager(store, nil, nil)
+	auth := &Auth{ID: "auth-1", Provider: "codex", ProxyURL: "socks5://proxy-a.example.com:443", Metadata: map[string]any{"type": "codex", "proxy_url": "socks5://proxy-a.example.com:443"}}
+	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("Register returned error: %v", errRegister)
+	}
+	store.fail.Store(true)
+	updated := auth.Clone()
+	updated.ProxyURL = "socks5://proxy-b.example.com:443"
+	updated.Metadata["proxy_url"] = updated.ProxyURL
+	if _, errUpdate := manager.Update(context.Background(), updated); errUpdate == nil {
+		t.Fatal("Update error = nil, want persistence failure")
+	}
+	current, ok := manager.GetByID(auth.ID)
+	if !ok || current.ProxyURL != "socks5://proxy-a.example.com:443" {
+		t.Fatalf("runtime auth changed after failed save: %#v", current)
 	}
 }

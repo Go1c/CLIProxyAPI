@@ -21,6 +21,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher/diff"
@@ -31,6 +32,7 @@ import (
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/proxyutil"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	log "github.com/sirupsen/logrus"
 )
@@ -765,6 +767,60 @@ func (s *Service) applyRetryConfig(cfg *config.Config) {
 	maxInterval := time.Duration(cfg.MaxRetryInterval) * time.Second
 	s.coreManager.SetRetryConfig(cfg.RequestRetry, maxInterval, cfg.MaxRetryCredentials)
 	coreauth.SetTransientErrorCooldownSeconds(cfg.TransientErrorCooldownSeconds)
+}
+
+func (s *Service) startCodexProxyProbeLoop(ctx context.Context) {
+	if s == nil || s.coreManager == nil || ctx == nil {
+		return
+	}
+	go func() {
+		ticker := time.NewTicker(time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case now := <-ticker.C:
+				s.probeOpenCodexProxies(ctx, now)
+			}
+		}
+	}()
+}
+
+func (s *Service) probeOpenCodexProxies(ctx context.Context, now time.Time) {
+	if s == nil || s.coreManager == nil {
+		return
+	}
+	for _, proxyHash := range proxyutil.OpenProxyHashes(now) {
+		if !proxyutil.TryBeginProbe(proxyHash, now) {
+			continue
+		}
+		var candidate *coreauth.Auth
+		for _, auth := range s.coreManager.List() {
+			if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+				continue
+			}
+			if status := s.coreManager.ProxyRuntimeStatus(auth.ID); status.Hash == proxyHash {
+				candidate = auth
+				break
+			}
+		}
+		if candidate == nil {
+			proxyutil.RecordProbe(proxyHash, false, "", 0, "proxy_probe_no_credential", now)
+			continue
+		}
+		s.cfgMu.RLock()
+		cfg := s.cfg
+		s.cfgMu.RUnlock()
+		go func(hash string, auth *coreauth.Auth, runtimeCfg *config.Config) {
+			startedAt := time.Now()
+			result := helps.RunCodexProxyTest(ctx, runtimeCfg, auth.ProxyURL)
+			closed := proxyutil.RecordProbe(hash, result.OK, result.CloudflarePOP, time.Since(startedAt), result.Code, time.Now())
+			if closed {
+				s.coreManager.RefreshProxyHealth(hash)
+			}
+		}(proxyHash, candidate, cfg)
+	}
 }
 
 func (s *Service) configureCooldownStateStore(cfg *config.Config) {
@@ -1763,6 +1819,7 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 
 	s.registerModelRefreshCallback()
+	s.startCodexProxyProbeLoop(ctx)
 
 	// Prefer core auth manager auto refresh if available.
 	if s.coreManager != nil && !homeEnabled {

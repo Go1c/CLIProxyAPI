@@ -38,6 +38,8 @@ func TestParse(t *testing.T) {
 		{name: "https", input: "https://proxy.example.com:8443", want: ModeProxy},
 		{name: "socks5", input: "socks5://proxy.example.com:1080", want: ModeProxy},
 		{name: "socks5h", input: "socks5h://proxy.example.com:1080", want: ModeProxy},
+		{name: "missing separator", input: "socks5:user:pass@host:443", want: ModeInvalid, wantErr: true},
+		{name: "socks missing port", input: "socks5://proxy.example.com", want: ModeInvalid, wantErr: true},
 		{name: "invalid", input: "bad-value", want: ModeInvalid, wantErr: true},
 	}
 
@@ -57,6 +59,37 @@ func TestParse(t *testing.T) {
 				t.Fatalf("mode = %d, want %d", setting.Mode, tt.want)
 			}
 		})
+	}
+}
+
+func TestParseEncodedSOCKS5Credentials(t *testing.T) {
+	t.Parallel()
+
+	setting, errParse := Parse("socks5://user%40name:p%3Aa%23s%25s%2Fword@proxy.example.com:443")
+	if errParse != nil {
+		t.Fatalf("Parse returned error: %v", errParse)
+	}
+	if setting.Mode != ModeProxy || setting.URL == nil || setting.URL.Host != "proxy.example.com:443" {
+		t.Fatalf("setting = %#v", setting)
+	}
+	if got := setting.URL.User.Username(); got != "user@name" {
+		t.Fatalf("username = %q", got)
+	}
+	if password, ok := setting.URL.User.Password(); !ok || password != "p:a#s%s/word" {
+		t.Fatalf("password = %q, ok=%v", password, ok)
+	}
+}
+
+func TestHashExcludesCredentials(t *testing.T) {
+	t.Parallel()
+
+	left := Hash("socks5://user-a:pass-a@proxy.example.com:443")
+	right := Hash("socks5://user-b:pass-b@proxy.example.com:443")
+	if left == "" || left != right {
+		t.Fatalf("credential-free hashes differ: %q vs %q", left, right)
+	}
+	if other := Hash("socks5://user-a:pass-a@other.example.com:443"); other == left {
+		t.Fatalf("different endpoints share hash %q", left)
 	}
 }
 

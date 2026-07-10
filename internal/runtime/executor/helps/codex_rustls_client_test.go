@@ -13,7 +13,9 @@ import (
 	"time"
 
 	tls "github.com/refraction-networking/utls"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/proxyutil"
 	"golang.org/x/net/http2"
 )
 
@@ -22,14 +24,17 @@ import (
 func TestNewCodexRustlsHTTPClientUsesHTTP2Transport(t *testing.T) {
 	t.Parallel()
 
-	client := NewCodexRustlsHTTPClient(context.Background(), nil, nil)
+	client, errClient := NewCodexRustlsHTTPClient(context.Background(), nil, nil)
+	if errClient != nil {
+		t.Fatalf("NewCodexRustlsHTTPClient returned error: %v", errClient)
+	}
 	roundTripper, ok := client.Transport.(*codexRustlsRoundTripper)
 	if !ok {
 		t.Fatalf("transport type = %T, want *codexRustlsRoundTripper", client.Transport)
 	}
-	transport, ok := roundTripper.httpsHTTP2.(*http2.Transport)
+	transport, ok := roundTripper.httpsHTTP2.roundTripper.(*http2.Transport)
 	if !ok {
-		t.Fatalf("HTTPS transport type = %T, want *http2.Transport", roundTripper.httpsHTTP2)
+		t.Fatalf("HTTPS transport type = %T, want *http2.Transport", roundTripper.httpsHTTP2.roundTripper)
 	}
 	if transport.DialTLSContext == nil {
 		t.Fatal("expected custom rustls-like DialTLSContext")
@@ -44,7 +49,10 @@ func TestCodexRustlsRoundTripperFallsBackForPlainHTTP(t *testing.T) {
 		called = true
 		return emptyTestResponse(req), nil
 	})
-	client := NewCodexRustlsHTTPClient(context.WithValue(context.Background(), "cliproxy.roundtripper", fallback), nil, nil)
+	client, errClient := NewCodexRustlsHTTPClient(context.WithValue(context.Background(), "cliproxy.roundtripper", fallback), nil, nil)
+	if errClient != nil {
+		t.Fatalf("NewCodexRustlsHTTPClient returned error: %v", errClient)
+	}
 
 	req, err := http.NewRequest(http.MethodPost, "http://127.0.0.1:18092/v1/responses", nil)
 	if err != nil {
@@ -71,10 +79,13 @@ func TestCodexRustlsRoundTripperUsesContextFallbackForHTTPS(t *testing.T) {
 		return emptyTestResponse(req), nil
 	})
 	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", fallback)
-	client := NewCodexRustlsHTTPClient(ctx, nil, nil)
+	client, errClient := NewCodexRustlsHTTPClient(ctx, nil, nil)
+	if errClient != nil {
+		t.Fatalf("NewCodexRustlsHTTPClient returned error: %v", errClient)
+	}
 
 	roundTripper := client.Transport.(*codexRustlsRoundTripper)
-	roundTripper.httpsHTTP2 = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+	roundTripper.httpsHTTP2.roundTripper = roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		t.Fatalf("HTTPS request bypassed context fallback for %s", req.URL.String())
 		return nil, nil
 	})
@@ -103,8 +114,11 @@ func TestCodexRustlsRoundTripperFallsBackForCustomHost(t *testing.T) {
 		called = true
 		return emptyTestResponse(req), nil
 	})
-	roundTripper := newCodexRustlsRoundTripper("", fallback, true)
-	roundTripper.httpsHTTP2 = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+	roundTripper, errRoundTripper := newCodexRustlsRoundTripper("", fallback, true, (&config.Config{}).CodexProxyTimeouts(), nil)
+	if errRoundTripper != nil {
+		t.Fatalf("newCodexRustlsRoundTripper returned error: %v", errRoundTripper)
+	}
+	roundTripper.httpsHTTP2.roundTripper = roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		t.Fatalf("custom host used Codex TLS transport for %s", req.URL.String())
 		return nil, nil
 	})
@@ -129,11 +143,14 @@ func TestCodexRustlsRoundTripperUsesFingerprintForOfficialHost(t *testing.T) {
 	t.Parallel()
 
 	called := false
-	roundTripper := newCodexRustlsRoundTripper("direct", roundTripFunc(func(req *http.Request) (*http.Response, error) {
+	roundTripper, errRoundTripper := newCodexRustlsRoundTripper("direct", roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		t.Fatalf("official host used fallback transport for %s", req.URL.String())
 		return nil, nil
-	}), true)
-	roundTripper.httpsHTTP2 = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+	}), true, (&config.Config{}).CodexProxyTimeouts(), nil)
+	if errRoundTripper != nil {
+		t.Fatalf("newCodexRustlsRoundTripper returned error: %v", errRoundTripper)
+	}
+	roundTripper.httpsHTTP2.roundTripper = roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		called = true
 		return emptyTestResponse(req), nil
 	})
@@ -157,14 +174,234 @@ func TestCodexRustlsRoundTripperUsesFingerprintForOfficialHost(t *testing.T) {
 func TestNewCodexRustlsHTTPClientDisablesFingerprintForAPIKey(t *testing.T) {
 	t.Parallel()
 
-	client := NewCodexRustlsHTTPClient(context.Background(), nil, &cliproxyauth.Auth{
+	client, errClient := NewCodexRustlsHTTPClient(context.Background(), nil, &cliproxyauth.Auth{
 		Attributes: map[string]string{"api_key": "sk-test"},
 	})
+	if errClient != nil {
+		t.Fatalf("NewCodexRustlsHTTPClient returned error: %v", errClient)
+	}
 	roundTripper := client.Transport.(*codexRustlsRoundTripper)
 	if roundTripper.enabled {
 		t.Fatal("Codex TLS fingerprint should be disabled for API-key auth")
 	}
 }
+
+func TestNewCodexRustlsHTTPClientInvalidProxyFailsClosed(t *testing.T) {
+	t.Parallel()
+
+	calledFallback := false
+	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calledFallback = true
+		return emptyTestResponse(req), nil
+	}))
+	client, errClient := NewCodexRustlsHTTPClient(ctx, nil, &cliproxyauth.Auth{ProxyURL: "socks5:user:pass@host:443"})
+	if errClient == nil || client != nil {
+		t.Fatalf("client=%v error=%v, want fail-closed construction error", client, errClient)
+	}
+	proxyErr, ok := proxyutil.AsError(errClient)
+	if !ok || proxyErr.Code != proxyutil.CodeConfigInvalid {
+		t.Fatalf("error = %v, want %s", errClient, proxyutil.CodeConfigInvalid)
+	}
+	if calledFallback {
+		t.Fatal("invalid proxy configuration called fallback/direct transport")
+	}
+}
+
+func TestNewCodexRustlsHTTPClientRequiredProxyRejectsDirect(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.Config{SDKConfig: config.SDKConfig{CodexProxyRequired: true}}
+	client, errClient := NewCodexRustlsHTTPClient(context.Background(), cfg, &cliproxyauth.Auth{ProxyURL: "direct"})
+	if errClient == nil || client != nil {
+		t.Fatalf("client=%v error=%v, want required proxy error", client, errClient)
+	}
+	proxyErr, ok := proxyutil.AsError(errClient)
+	if !ok || proxyErr.Code != proxyutil.CodeRequired {
+		t.Fatalf("error = %v, want %s", errClient, proxyutil.CodeRequired)
+	}
+}
+
+func TestCodexRustlsSOCKS5AuthenticationFailureIsTyped(t *testing.T) {
+	t.Parallel()
+
+	listener, errListen := net.Listen("tcp", "127.0.0.1:0")
+	if errListen != nil {
+		t.Fatalf("listen: %v", errListen)
+	}
+	defer listener.Close()
+	go func() {
+		conn, errAccept := listener.Accept()
+		if errAccept != nil {
+			return
+		}
+		defer conn.Close()
+		header := make([]byte, 2)
+		if _, errRead := io.ReadFull(conn, header); errRead != nil {
+			return
+		}
+		methods := make([]byte, int(header[1]))
+		if _, errRead := io.ReadFull(conn, methods); errRead != nil {
+			return
+		}
+		_, _ = conn.Write([]byte{0x05, 0x02})
+		authHeader := make([]byte, 2)
+		if _, errRead := io.ReadFull(conn, authHeader); errRead != nil {
+			return
+		}
+		username := make([]byte, int(authHeader[1]))
+		_, _ = io.ReadFull(conn, username)
+		passwordLength := make([]byte, 1)
+		_, _ = io.ReadFull(conn, passwordLength)
+		password := make([]byte, int(passwordLength[0]))
+		_, _ = io.ReadFull(conn, password)
+		_, _ = conn.Write([]byte{0x01, 0x01})
+	}()
+
+	timeouts := (&config.Config{}).CodexProxyTimeouts()
+	timeouts.ProxyConnect = time.Second
+	dialer, errDialer := newCodexRustlsDialer("socks5://user:pass@"+listener.Addr().String(), timeouts, nil)
+	if errDialer != nil {
+		t.Fatalf("new dialer: %v", errDialer)
+	}
+	_, errDial := dialer.dialTCP(context.Background(), "tcp", "example.com:443")
+	proxyErr, ok := proxyutil.AsError(errDial)
+	if !ok || proxyErr.Code != proxyutil.CodeAuthFailed {
+		t.Fatalf("error = %v, want %s", errDial, proxyutil.CodeAuthFailed)
+	}
+}
+
+func TestCodexRustlsSOCKS5BlackholeTimesOut(t *testing.T) {
+	t.Parallel()
+
+	listener, errListen := net.Listen("tcp", "127.0.0.1:0")
+	if errListen != nil {
+		t.Fatalf("listen: %v", errListen)
+	}
+	defer listener.Close()
+	go func() {
+		conn, errAccept := listener.Accept()
+		if errAccept != nil {
+			return
+		}
+		defer conn.Close()
+		_, _ = io.Copy(io.Discard, conn)
+	}()
+
+	timeouts := (&config.Config{}).CodexProxyTimeouts()
+	timeouts.ProxyConnect = 80 * time.Millisecond
+	dialer, errDialer := newCodexRustlsDialer("socks5://user:pass@"+listener.Addr().String(), timeouts, nil)
+	if errDialer != nil {
+		t.Fatalf("new dialer: %v", errDialer)
+	}
+	startedAt := time.Now()
+	_, errDial := dialer.dialTCP(context.Background(), "tcp", "example.com:443")
+	proxyErr, ok := proxyutil.AsError(errDial)
+	if !ok || proxyErr.Code != proxyutil.CodeConnectTimeout {
+		t.Fatalf("error = %v, want %s", errDial, proxyutil.CodeConnectTimeout)
+	}
+	if elapsed := time.Since(startedAt); elapsed > time.Second {
+		t.Fatalf("blackhole timeout took %v", elapsed)
+	}
+}
+
+func TestCodexRustlsTLSBlackholeTimesOut(t *testing.T) {
+	t.Parallel()
+
+	listener, errListen := net.Listen("tcp", "127.0.0.1:0")
+	if errListen != nil {
+		t.Fatalf("listen: %v", errListen)
+	}
+	defer listener.Close()
+	go func() {
+		conn, errAccept := listener.Accept()
+		if errAccept != nil {
+			return
+		}
+		defer conn.Close()
+		_, _ = io.Copy(io.Discard, conn)
+	}()
+
+	timeouts := (&config.Config{}).CodexProxyTimeouts()
+	timeouts.ProxyConnect = time.Second
+	timeouts.TLSHandshake = 80 * time.Millisecond
+	dialer, errDialer := newCodexRustlsDialer("direct", timeouts, nil)
+	if errDialer != nil {
+		t.Fatalf("new dialer: %v", errDialer)
+	}
+	_, errDial := dialer.dialTLS(context.Background(), "tcp", listener.Addr().String(), "example.com", []string{"h2"})
+	proxyErr, ok := proxyutil.AsError(errDial)
+	if !ok || proxyErr.Code != proxyutil.CodeTLSTimeout {
+		t.Fatalf("error = %v, want %s", errDial, proxyutil.CodeTLSTimeout)
+	}
+}
+
+func TestRoundTripBeforeHeadersTimesOutWithoutLimitingBody(t *testing.T) {
+	t.Parallel()
+
+	t.Run("header timeout", func(t *testing.T) {
+		connected := make(chan struct{})
+		close(connected)
+		transport := codexHTTP2Transport{
+			connected: connected,
+			proxyHash: "proxy-a",
+			roundTripper: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				<-req.Context().Done()
+				return nil, req.Context().Err()
+			}),
+		}
+		timeouts := config.CodexProxyTimeouts{ResponseHeader: 40 * time.Millisecond, FirstByte: time.Second}
+		req, _ := http.NewRequest(http.MethodGet, "https://chatgpt.com/test", nil)
+		_, errRoundTrip := roundTripBeforeHeaders(req, transport, timeouts)
+		proxyErr, ok := proxyutil.AsError(errRoundTrip)
+		if !ok || proxyErr.Code != proxyutil.CodeUpstreamHeaderTimeout {
+			t.Fatalf("error = %v, want %s", errRoundTrip, proxyutil.CodeUpstreamHeaderTimeout)
+		}
+	})
+
+	t.Run("body remains readable", func(t *testing.T) {
+		connected := make(chan struct{})
+		close(connected)
+		transport := codexHTTP2Transport{
+			connected: connected,
+			roundTripper: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: &contextCheckingBody{ctx: req.Context(), data: []byte("ok")}, Request: req}, nil
+			}),
+		}
+		timeouts := config.CodexProxyTimeouts{ResponseHeader: 30 * time.Millisecond, FirstByte: 50 * time.Millisecond}
+		req, _ := http.NewRequest(http.MethodGet, "https://chatgpt.com/test", nil)
+		response, errRoundTrip := roundTripBeforeHeaders(req, transport, timeouts)
+		if errRoundTrip != nil {
+			t.Fatalf("RoundTrip returned error: %v", errRoundTrip)
+		}
+		time.Sleep(100 * time.Millisecond)
+		body, errRead := io.ReadAll(response.Body)
+		if errRead != nil || string(body) != "ok" {
+			t.Fatalf("body=%q error=%v", body, errRead)
+		}
+		_ = response.Body.Close()
+	})
+}
+
+type contextCheckingBody struct {
+	ctx  context.Context
+	data []byte
+}
+
+func (b *contextCheckingBody) Read(p []byte) (int, error) {
+	select {
+	case <-b.ctx.Done():
+		return 0, b.ctx.Err()
+	default:
+	}
+	if len(b.data) == 0 {
+		return 0, io.EOF
+	}
+	n := copy(p, b.data)
+	b.data = b.data[n:]
+	return n, nil
+}
+
+func (b *contextCheckingBody) Close() error { return nil }
 
 func TestCodexRustlsClientHelloMatchesCLI01441(t *testing.T) {
 	t.Parallel()
@@ -306,7 +543,10 @@ func TestCodexRustlsDialerUsesHTTPProxyConnect(t *testing.T) {
 		_, _ = reader.Peek(1)
 	}()
 
-	dialer := newCodexRustlsDialer("http://" + listener.Addr().String())
+	dialer, errDialer := newCodexRustlsDialer("http://"+listener.Addr().String(), (&config.Config{}).CodexProxyTimeouts(), nil)
+	if errDialer != nil {
+		t.Fatalf("newCodexRustlsDialer returned error: %v", errDialer)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 

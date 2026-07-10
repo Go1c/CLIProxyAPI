@@ -741,7 +741,10 @@ func (e *CodexExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth
 	if err := e.PrepareRequest(httpReq, auth); err != nil {
 		return nil, err
 	}
-	httpClient := helps.NewCodexRustlsHTTPClient(ctx, e.cfg, auth)
+	httpClient, errClient := helps.NewCodexRustlsHTTPClient(ctx, e.cfg, auth)
+	if errClient != nil {
+		return nil, errClient
+	}
 	return httpClient.Do(httpReq)
 }
 
@@ -827,7 +830,10 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		AuthType:  authType,
 		AuthValue: authValue,
 	})
-	httpClient := helps.NewCodexRustlsHTTPClient(ctx, e.cfg, auth)
+	httpClient, errClient := helps.NewCodexRustlsHTTPClient(ctx, e.cfg, auth)
+	if errClient != nil {
+		return resp, errClient
+	}
 	httpClient = reporter.TrackHTTPClient(httpClient)
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
@@ -1003,7 +1009,10 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 		AuthType:  authType,
 		AuthValue: authValue,
 	})
-	httpClient := helps.NewCodexRustlsHTTPClient(ctx, e.cfg, auth)
+	httpClient, errClient := helps.NewCodexRustlsHTTPClient(ctx, e.cfg, auth)
+	if errClient != nil {
+		return resp, errClient
+	}
 	httpClient = reporter.TrackHTTPClient(httpClient)
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
@@ -1122,7 +1131,10 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		AuthValue: authValue,
 	})
 
-	httpClient := helps.NewCodexRustlsHTTPClient(ctx, e.cfg, auth)
+	httpClient, errClient := helps.NewCodexRustlsHTTPClient(ctx, e.cfg, auth)
+	if errClient != nil {
+		return nil, errClient
+	}
 	httpClient = reporter.TrackHTTPClient(httpClient)
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {

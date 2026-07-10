@@ -87,6 +87,43 @@ func TestExtractAccessToken(t *testing.T) {
 	}
 }
 
+func TestAtomicReplaceAuthFilePublishesOnlyCompletedContent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "codex.json")
+	if errWrite := os.WriteFile(path, []byte(`{"version":"old"}`), 0o600); errWrite != nil {
+		t.Fatalf("write original auth file: %v", errWrite)
+	}
+
+	errReplace := atomicReplaceAuthFile(path, func(tempPath string) error {
+		if errWrite := os.WriteFile(tempPath, []byte(`{"version":"partial"}`), 0o600); errWrite != nil {
+			return errWrite
+		}
+		return context.Canceled
+	})
+	if errReplace == nil {
+		t.Fatal("atomicReplaceAuthFile error = nil, want failed validation/write")
+	}
+	raw, errRead := os.ReadFile(path)
+	if errRead != nil {
+		t.Fatalf("read original auth file: %v", errRead)
+	}
+	if got := string(raw); got != `{"version":"old"}` {
+		t.Fatalf("failed replacement exposed %q, want original content", got)
+	}
+
+	if errReplace = atomicReplaceAuthFile(path, func(tempPath string) error {
+		return os.WriteFile(tempPath, []byte(`{"version":"new"}`), 0o600)
+	}); errReplace != nil {
+		t.Fatalf("atomicReplaceAuthFile successful replacement: %v", errReplace)
+	}
+	raw, errRead = os.ReadFile(path)
+	if errRead != nil {
+		t.Fatalf("read replaced auth file: %v", errRead)
+	}
+	if got := string(raw); got != `{"version":"new"}` {
+		t.Fatalf("replacement content = %q, want completed content", got)
+	}
+}
+
 func TestFileTokenStoreListExpandsPluginMultiAuths(t *testing.T) {
 	baseDir := t.TempDir()
 	path := filepath.Join(baseDir, "geminicli.json")
