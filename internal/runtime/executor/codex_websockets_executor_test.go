@@ -1221,3 +1221,48 @@ func TestNewProxyAwareWebsocketDialerDirectDisablesProxy(t *testing.T) {
 		t.Fatal("expected websocket proxy function to be nil for direct mode")
 	}
 }
+
+func TestNewCodexWebsocketDialerUsesCustomTLSForOfficialOAuth(t *testing.T) {
+	t.Parallel()
+
+	dialer := newCodexWebsocketDialer(
+		&config.Config{SDKConfig: sdkconfig.SDKConfig{ProxyURL: "direct"}},
+		nil,
+		"wss://chatgpt.com/backend-api/codex/responses",
+	)
+
+	if dialer.Proxy != nil {
+		t.Fatal("expected custom TLS dialer to handle proxy selection")
+	}
+	if dialer.NetDialTLSContext == nil {
+		t.Fatal("expected official OAuth websocket to use Codex TLS dialer")
+	}
+}
+
+func TestNewCodexWebsocketDialerUsesDefaultTLSForAPIKey(t *testing.T) {
+	t.Parallel()
+
+	dialer := newCodexWebsocketDialer(
+		&config.Config{SDKConfig: sdkconfig.SDKConfig{ProxyURL: "direct"}},
+		&cliproxyauth.Auth{Attributes: map[string]string{"api_key": "sk-test"}},
+		"wss://chatgpt.com/backend-api/codex/responses",
+	)
+
+	if dialer.NetDialTLSContext != nil {
+		t.Fatal("expected API-key websocket to use the default TLS stack")
+	}
+}
+
+func TestNewCodexWebsocketDialerUsesDefaultTLSForCustomHost(t *testing.T) {
+	t.Parallel()
+
+	dialer := newCodexWebsocketDialer(
+		&config.Config{SDKConfig: sdkconfig.SDKConfig{ProxyURL: "direct"}},
+		nil,
+		"wss://example.test/v1/responses",
+	)
+
+	if dialer.NetDialTLSContext != nil {
+		t.Fatal("expected custom-host websocket to use the default TLS stack")
+	}
+}
