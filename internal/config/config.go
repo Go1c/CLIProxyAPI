@@ -21,9 +21,13 @@ import (
 )
 
 const (
-	DefaultPanelGitHubRepository = "https://github.com/router-for-me/Cli-Proxy-API-Management-Center"
-	DefaultPprofAddr             = "127.0.0.1:8316"
-	DefaultAuthDir               = "~/.cli-proxy-api"
+	DefaultPanelGitHubRepository   = "https://github.com/router-for-me/Cli-Proxy-API-Management-Center"
+	DefaultPprofAddr               = "127.0.0.1:8316"
+	DefaultAuthDir                 = "~/.cli-proxy-api"
+	DefaultCodexHeaderUserAgent    = "codex-tui/0.144.1 (Mac OS 26.4.1; arm64) Orca/1.4.103 (codex-tui; 0.144.1)"
+	DefaultCodexHeaderOriginator   = "codex-tui"
+	DefaultCodexHeaderVersion      = "0.144.1"
+	DefaultCodexHeaderBetaFeatures = "remote_compaction_v2"
 )
 
 // Config represents the application's configuration, loaded from a YAML file.
@@ -271,10 +275,21 @@ type ClaudeHeaderDefaults struct {
 
 // CodexHeaderDefaults configures fallback header values injected into Codex
 // model requests for OAuth/file-backed auth when the client omits them.
-// UserAgent applies to HTTP and websocket requests; BetaFeatures only applies to websockets.
+// UserAgent, Originator, Version, and BetaFeatures apply to HTTP and websocket requests.
 type CodexHeaderDefaults struct {
 	UserAgent    string `yaml:"user-agent" json:"user-agent"`
+	Originator   string `yaml:"originator" json:"originator"`
+	Version      string `yaml:"version" json:"version"`
 	BetaFeatures string `yaml:"beta-features" json:"beta-features"`
+}
+
+func DefaultCodexHeaderDefaults() CodexHeaderDefaults {
+	return CodexHeaderDefaults{
+		UserAgent:    DefaultCodexHeaderUserAgent,
+		Originator:   DefaultCodexHeaderOriginator,
+		Version:      DefaultCodexHeaderVersion,
+		BetaFeatures: DefaultCodexHeaderBetaFeatures,
+	}
 }
 
 // CodexConfig configures provider-wide Codex request behavior.
@@ -700,7 +715,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 		if optional {
 			if os.IsNotExist(err) || errors.Is(err, syscall.EISDIR) {
 				// Missing and optional: return empty config (cloud deploy standby).
-				cfg := &Config{}
+				cfg := &Config{CodexHeaderDefaults: DefaultCodexHeaderDefaults()}
 				cfg.NormalizePluginsConfig()
 				return cfg, nil
 			}
@@ -710,7 +725,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 
 	// In cloud deploy mode (optional=true), if file is empty or contains only whitespace, return empty config.
 	if optional && len(data) == 0 {
-		cfg := &Config{}
+		cfg := &Config{CodexHeaderDefaults: DefaultCodexHeaderDefaults()}
 		cfg.NormalizePluginsConfig()
 		return cfg, nil
 	}
@@ -732,10 +747,11 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.Pprof.Enable = false
 	cfg.Pprof.Addr = DefaultPprofAddr
 	cfg.RemoteManagement.PanelGitHubRepository = DefaultPanelGitHubRepository
+	cfg.CodexHeaderDefaults = DefaultCodexHeaderDefaults()
 	if err = yaml.Unmarshal(data, &cfg); err != nil {
 		if optional {
 			// In cloud deploy mode, if YAML parsing fails, return empty config instead of error.
-			cfgOptional := &Config{}
+			cfgOptional := &Config{CodexHeaderDefaults: DefaultCodexHeaderDefaults()}
 			cfgOptional.NormalizePluginsConfig()
 			return cfgOptional, nil
 		}
@@ -912,6 +928,8 @@ func (cfg *Config) SanitizeCodexHeaderDefaults() {
 		return
 	}
 	cfg.CodexHeaderDefaults.UserAgent = strings.TrimSpace(cfg.CodexHeaderDefaults.UserAgent)
+	cfg.CodexHeaderDefaults.Originator = strings.TrimSpace(cfg.CodexHeaderDefaults.Originator)
+	cfg.CodexHeaderDefaults.Version = strings.TrimSpace(cfg.CodexHeaderDefaults.Version)
 	cfg.CodexHeaderDefaults.BetaFeatures = strings.TrimSpace(cfg.CodexHeaderDefaults.BetaFeatures)
 }
 

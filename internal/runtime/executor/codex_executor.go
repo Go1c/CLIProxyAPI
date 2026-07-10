@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -13,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/klauspost/compress/zstd"
 	codexauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codex"
 	internalcache "github.com/router-for-me/CLIProxyAPI/v7/internal/cache"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
@@ -35,14 +37,16 @@ import (
 )
 
 const (
-	codexUserAgent             = "codex-tui/0.135.0 (Mac OS 26.5.0; arm64) iTerm.app/3.6.10 (codex-tui; 0.135.0)"
-	codexOriginator            = "codex-tui"
+	codexUserAgent             = config.DefaultCodexHeaderUserAgent
+	codexOriginator            = config.DefaultCodexHeaderOriginator
 	codexDefaultImageToolModel = "gpt-image-2"
 	codexResponsesLiteHeader   = "X-OpenAI-Internal-Codex-Responses-Lite"
 	codexResponsesLiteMetadata = "client_metadata.ws_request_header_x_openai_internal_codex_responses_lite"
 )
 
 var dataTag = []byte("data:")
+
+var codexDefaultInstallationID = newCodexUUID()
 
 // Streamed Codex responses may emit response.output_item.done events while leaving
 // response.completed.response.output empty. Keep the stream path aligned with the
@@ -803,6 +807,9 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg)
 	applyModelHeaderOverrides(httpReq.Header, baseModel)
 	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
+	if errEncode := applyCodexRequestBodyEncoding(httpReq, auth); errEncode != nil {
+		return resp, errEncode
+	}
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
@@ -976,6 +983,9 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	applyCodexHeaders(httpReq, auth, apiKey, false, e.cfg)
 	applyModelHeaderOverrides(httpReq.Header, baseModel)
 	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
+	if errEncode := applyCodexRequestBodyEncoding(httpReq, auth); errEncode != nil {
+		return resp, errEncode
+	}
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
@@ -1091,6 +1101,9 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg)
 	applyModelHeaderOverrides(httpReq.Header, baseModel)
 	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
+	if errEncode := applyCodexRequestBodyEncoding(httpReq, auth); errEncode != nil {
+		return nil, errEncode
+	}
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
@@ -1591,6 +1604,57 @@ func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, s
 	applyCodexHeadersFromSources(r, auth, token, stream, cfg, ginHeaders)
 }
 
+func applyCodexRequestBodyEncoding(r *http.Request, auth *cliproxyauth.Auth) error {
+	if r == nil || r.Body == nil || r.Body == http.NoBody || r.Method != http.MethodPost {
+		return nil
+	}
+	if codexAuthUsesAPIKey(auth) {
+		return nil
+	}
+	if strings.TrimSpace(r.Header.Get("Content-Encoding")) != "" {
+		return nil
+	}
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		return fmt.Errorf("codex executor: read request body for zstd encoding: %w", err)
+	}
+	if errClose := r.Body.Close(); errClose != nil {
+		return fmt.Errorf("codex executor: close request body for zstd encoding: %w", errClose)
+	}
+
+	encoded, err := zstdEncodeCodexRequestBody(body)
+	if err != nil {
+		return err
+	}
+	bodyReader := bytes.NewReader(encoded)
+	r.Body = io.NopCloser(bodyReader)
+	r.GetBody = func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(encoded)), nil
+	}
+	r.ContentLength = int64(len(encoded))
+	r.Header.Set("Content-Encoding", "zstd")
+	return nil
+}
+
+func zstdEncodeCodexRequestBody(body []byte) ([]byte, error) {
+	var encoded bytes.Buffer
+	writer, err := zstd.NewWriter(&encoded)
+	if err != nil {
+		return nil, fmt.Errorf("codex executor: create zstd writer: %w", err)
+	}
+	if _, errWrite := writer.Write(body); errWrite != nil {
+		if errClose := writer.Close(); errClose != nil {
+			return nil, fmt.Errorf("codex executor: write zstd request body: %w; close zstd writer: %v", errWrite, errClose)
+		}
+		return nil, fmt.Errorf("codex executor: write zstd request body: %w", errWrite)
+	}
+	if errClose := writer.Close(); errClose != nil {
+		return nil, fmt.Errorf("codex executor: close zstd writer: %w", errClose)
+	}
+	return encoded.Bytes(), nil
+}
+
 // applyModelHeaderOverrides forces models.json config.override_header onto upstream headers.
 func applyModelHeaderOverrides(headers http.Header, modelName string) {
 	if headers == nil {
@@ -1617,23 +1681,27 @@ func applyCodexDirectImageHeaders(r *http.Request, auth *cliproxyauth.Auth, toke
 		ginHeaders.Del("User-Agent")
 	}
 	applyCodexHeadersFromSources(r, auth, token, stream, cfg, ginHeaders)
+	if strings.TrimSpace(r.Header.Get("User-Agent")) == "" {
+		r.Header.Set("User-Agent", codexUserAgent)
+	}
 }
 
 func applyCodexHeadersFromSources(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool, cfg *config.Config, ginHeaders http.Header) {
 	r.Header.Set("Content-Type", "application/json")
 	r.Header.Set("Authorization", "Bearer "+token)
 
-	if ginHeaders != nil && ginHeaders.Get("X-Codex-Beta-Features") != "" {
-		r.Header.Set("X-Codex-Beta-Features", ginHeaders.Get("X-Codex-Beta-Features"))
-	}
-	misc.EnsureHeader(r.Header, ginHeaders, "Version", "")
-	misc.EnsureHeader(r.Header, ginHeaders, "X-Codex-Turn-Metadata", "")
-	misc.EnsureHeader(r.Header, ginHeaders, "X-Client-Request-Id", "")
-	cfgUserAgent, _ := codexHeaderDefaults(cfg, auth)
-	ensureHeaderWithConfigPrecedence(r.Header, ginHeaders, "User-Agent", cfgUserAgent, codexUserAgent)
-
-	if strings.Contains(r.Header.Get("User-Agent"), "Mac OS") {
-		misc.EnsureHeader(r.Header, ginHeaders, "Session_id", uuid.NewString())
+	isAPIKey := codexAuthUsesAPIKey(auth)
+	cfgUserAgent, cfgBetaFeatures, cfgOriginator, cfgVersion := codexHeaderDefaults(cfg, auth)
+	ensureHeaderWithPriority(r.Header, ginHeaders, "X-Codex-Beta-Features", cfgBetaFeatures, "")
+	if isAPIKey {
+		misc.EnsureHeader(r.Header, ginHeaders, "Version", "")
+		misc.EnsureHeader(r.Header, ginHeaders, "X-Codex-Turn-Metadata", "")
+		misc.EnsureHeader(r.Header, ginHeaders, "X-Client-Request-Id", "")
+		ensureHeaderWithPriority(r.Header, ginHeaders, "User-Agent", "", "")
+	} else {
+		ensureHeaderWithPriority(r.Header, ginHeaders, "Version", cfgVersion, "")
+		ensureHeaderWithConfigPrecedence(r.Header, ginHeaders, "User-Agent", codexConfiguredUserAgent(cfg, auth), cfgUserAgent)
+		ensureCodexTUIIdentityHeaders(r.Header, ginHeaders)
 	}
 
 	if stream {
@@ -1643,21 +1711,20 @@ func applyCodexHeadersFromSources(r *http.Request, auth *cliproxyauth.Auth, toke
 	}
 	r.Header.Set("Connection", "Keep-Alive")
 
-	isAPIKey := false
-	if auth != nil && auth.Attributes != nil {
-		if v := strings.TrimSpace(auth.Attributes["api_key"]); v != "" {
-			isAPIKey = true
-		}
-	}
 	if originator := strings.TrimSpace(ginHeaders.Get("Originator")); originator != "" {
 		r.Header.Set("Originator", originator)
 	} else if !isAPIKey {
-		r.Header.Set("Originator", codexOriginator)
+		if cfgOriginator == "" {
+			cfgOriginator = codexOriginator
+		}
+		r.Header.Set("Originator", cfgOriginator)
 	}
 	if !isAPIKey {
 		if auth != nil && auth.Metadata != nil {
 			if accountID, ok := auth.Metadata["account_id"].(string); ok {
-				r.Header.Set("Chatgpt-Account-Id", accountID)
+				if trimmed := strings.TrimSpace(accountID); trimmed != "" {
+					r.Header.Set("Chatgpt-Account-Id", trimmed)
+				}
 			}
 		}
 	}
@@ -1666,6 +1733,101 @@ func applyCodexHeadersFromSources(r *http.Request, auth *cliproxyauth.Auth, toke
 		attrs = auth.Attributes
 	}
 	util.ApplyCustomHeadersFromAttrs(r, attrs)
+}
+
+type codexTurnMetadata struct {
+	InstallationID      string `json:"installation_id"`
+	SessionID           string `json:"session_id"`
+	ThreadID            string `json:"thread_id"`
+	TurnID              string `json:"turn_id"`
+	WindowID            string `json:"window_id"`
+	RequestKind         string `json:"request_kind"`
+	ThreadSource        string `json:"thread_source"`
+	Sandbox             string `json:"sandbox"`
+	TurnStartedAtUnixMS int64  `json:"turn_started_at_unix_ms"`
+}
+
+func ensureCodexTUIIdentityHeaders(target http.Header, source http.Header) {
+	if target == nil {
+		return
+	}
+
+	requestID := headerValueCaseInsensitive(target, "X-Client-Request-Id")
+	if requestID == "" {
+		requestID = headerValueCaseInsensitive(source, "X-Client-Request-Id")
+	}
+
+	sessionID := codexSessionHeaderValue(target)
+	if sessionID == "" {
+		sessionID = codexSessionHeaderValue(source)
+	}
+	if sessionID == "" {
+		sessionID = requestID
+	}
+	if sessionID == "" {
+		sessionID = newCodexUUID()
+	}
+	if requestID == "" {
+		requestID = sessionID
+	}
+
+	ensureHeaderCasePreserved(target, source, "X-Client-Request-Id", "", requestID)
+	ensureCodexSessionHeader(target, source, "Session-Id", sessionID)
+
+	sessionID = codexSessionHeaderValue(target)
+	if sessionID == "" {
+		sessionID = requestID
+	}
+	ensureHeaderCasePreserved(target, source, "Thread-Id", "", sessionID)
+	threadID := headerValueCaseInsensitive(target, "Thread-Id")
+	if threadID == "" {
+		threadID = sessionID
+	}
+
+	windowID := headerValueCaseInsensitive(target, "X-Codex-Window-Id")
+	if windowID == "" {
+		windowID = headerValueCaseInsensitive(source, "X-Codex-Window-Id")
+	}
+	if windowID == "" {
+		windowID = sessionID + ":0"
+	}
+	ensureHeaderCasePreserved(target, source, "X-Codex-Window-Id", "", windowID)
+
+	if headerValueCaseInsensitive(target, "X-Codex-Turn-Metadata") != "" {
+		return
+	}
+	if sourceMetadata := headerValueCaseInsensitive(source, "X-Codex-Turn-Metadata"); sourceMetadata != "" {
+		setHeaderCasePreserved(target, "X-Codex-Turn-Metadata", sourceMetadata)
+		return
+	}
+	setHeaderCasePreserved(target, "X-Codex-Turn-Metadata", buildCodexTurnMetadata(sessionID, threadID, windowID))
+}
+
+func buildCodexTurnMetadata(sessionID, threadID, windowID string) string {
+	metadata := codexTurnMetadata{
+		InstallationID:      codexDefaultInstallationID,
+		SessionID:           sessionID,
+		ThreadID:            threadID,
+		TurnID:              newCodexUUID(),
+		WindowID:            windowID,
+		RequestKind:         "turn",
+		ThreadSource:        "user",
+		Sandbox:             "seatbelt",
+		TurnStartedAtUnixMS: time.Now().UnixMilli(),
+	}
+	data, err := json.Marshal(metadata)
+	if err != nil {
+		return ""
+	}
+	return string(data)
+}
+
+func newCodexUUID() string {
+	id, err := uuid.NewV7()
+	if err == nil {
+		return id.String()
+	}
+	return uuid.NewString()
 }
 
 func newCodexStatusErr(statusCode int, body []byte) statusErr {
