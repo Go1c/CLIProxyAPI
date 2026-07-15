@@ -22,6 +22,7 @@
 - `usage/`：只演示 Usage 观察能力。
 - `cli/`：只演示命令行扩展能力。
 - `management-api/`：只演示 Management API 和资源扩展能力。
+- `codex-http2-keepalive/`：Codex OAuth 执行器/路由插件，带独立的 HTTP/2 keepalive 连接池和管理接口。
 - `host-callback/`：使用最小插件资源演示宿主回调。
 - `host-callback-auth-files/`：仅 Go 实现的插件资源，演示 host 凭证文件回调。
 - `host-model-callback/`：仅 Go 实现的插件资源，演示调用宿主模型执行回调。
