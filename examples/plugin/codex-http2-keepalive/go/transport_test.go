@@ -1,7 +1,7 @@
 package main
 
 import (
-	"strings"
+	"net"
 	"testing"
 	"time"
 )
@@ -90,12 +90,44 @@ func TestCodexPoolManagerShutdownClosesPools(t *testing.T) {
 	}
 }
 
-func TestMaskProxyURLRedactsCredentials(t *testing.T) {
-	got := maskProxyURL("socks5://user:secret@proxy.example:1080/path?token=abc")
-	if got == "" || got == "invalid-proxy" {
-		t.Fatalf("maskProxyURL() = %q, want masked URL", got)
+func TestCodexUpstreamPoolTracksConnectionLifecycle(t *testing.T) {
+	pool := &codexUpstreamPool{connections: make(map[*trackedConn]struct{})}
+	client, server := net.Pipe()
+	defer func() { _ = server.Close() }()
+	tracked := pool.markConnectionCreated(client)
+	if pool.connectionsNew.Load() != 1 || len(pool.connections) != 1 {
+		t.Fatalf("created=%d connections=%d, want 1/1", pool.connectionsNew.Load(), len(pool.connections))
 	}
-	if strings.Contains(got, "user:secret") || strings.Contains(got, "token=abc") {
-		t.Fatalf("maskProxyURL() = %q, want redacted output", got)
+	if errClose := tracked.Close(); errClose != nil {
+		t.Fatalf("tracked.Close() error = %v", errClose)
+	}
+	if pool.connectionsGone.Load() != 1 || len(pool.connections) != 0 {
+		t.Fatalf("removed=%d connections=%d, want 1/0", pool.connectionsGone.Load(), len(pool.connections))
+	}
+}
+
+func TestCodexPoolManagerDoesNotEvictActivePool(t *testing.T) {
+	manager := newCodexPoolManager()
+	cfg := defaultPluginConfig()
+	cfg.MaxIdleConnections = 1
+	active, errActive := manager.acquireForRequest("https://active.example/responses", "", cfg)
+	if errActive != nil {
+		t.Fatalf("acquire active pool: %v", errActive)
+	}
+	defer active.recordRequestDone()
+	other, errOther := manager.acquireForRequest("https://other.example/responses", "", cfg)
+	if errOther != nil {
+		t.Fatalf("acquire other pool: %v", errOther)
+	}
+	defer other.recordRequestDone()
+
+	manager.mu.Lock()
+	_, activePresent := manager.pools[active.key]
+	manager.mu.Unlock()
+	if !activePresent {
+		t.Fatal("active pool was evicted")
+	}
+	if active.activeStreams.Load() != 1 {
+		t.Fatalf("activeStreams = %d, want 1", active.activeStreams.Load())
 	}
 }

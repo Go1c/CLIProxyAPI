@@ -105,6 +105,29 @@ func TestManager_AvailableProvidersAndHasProviderAuth_ExcludeDisabled(t *testing
 	}
 }
 
+func TestManager_HasProviderAuthByKind(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	ctx := context.Background()
+	for _, auth := range []*Auth{
+		{ID: "api-key", Provider: "codex", Attributes: map[string]string{AttributeAPIKey: "key"}},
+		{ID: "oauth", Provider: "codex", Metadata: map[string]any{"access_token": "token"}},
+		{ID: "disabled-oauth", Provider: "claude", Disabled: true, Metadata: map[string]any{"access_token": "token"}},
+	} {
+		if _, errRegister := manager.Register(ctx, auth); errRegister != nil {
+			t.Fatalf("Register(%s) error = %v", auth.ID, errRegister)
+		}
+	}
+	if !manager.HasProviderAuthByKind("CODEX", AuthKindOAuth) {
+		t.Fatal("HasProviderAuthByKind(codex, oauth) = false, want true")
+	}
+	if !manager.HasProviderAuthByKind("codex", AuthKindAPIKey) {
+		t.Fatal("HasProviderAuthByKind(codex, apikey) = false, want true")
+	}
+	if manager.HasProviderAuthByKind("claude", AuthKindOAuth) {
+		t.Fatal("HasProviderAuthByKind(claude, oauth) = true for disabled auth")
+	}
+}
+
 func TestManager_ResetQuotaClearsRuntimeAndRegistryState(t *testing.T) {
 	manager := NewManager(nil, nil, nil)
 	ctx := context.Background()

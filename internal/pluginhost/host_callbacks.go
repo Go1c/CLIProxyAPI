@@ -61,6 +61,14 @@ type rpcHostLogRequest struct {
 	Fields         map[string]any `json:"fields,omitempty"`
 }
 
+type rpcHostContextWaitRequest struct {
+	HostCallbackID string `json:"host_callback_id"`
+}
+
+type rpcHostContextWaitResponse struct {
+	Canceled bool `json:"canceled"`
+}
+
 type rpcHostModelExecutionRequest struct {
 	pluginapi.HostModelExecutionRequest
 	HostCallbackID string `json:"host_callback_id,omitempty"`
@@ -117,6 +125,8 @@ func (h *Host) callFromPlugin(ctx context.Context, method string, request []byte
 		return h.callHostStreamEmit(ctx, request)
 	case pluginabi.MethodHostStreamClose:
 		return h.callHostStreamClose(request)
+	case pluginabi.MethodHostContextWait:
+		return h.callHostContextWait(request)
 	case pluginabi.MethodHostLog:
 		return h.callHostLog(ctx, request)
 	case pluginabi.MethodHostAuthList:
@@ -264,6 +274,18 @@ func (h *Host) callHostStreamClose(request []byte) ([]byte, error) {
 	}
 	h.streams.close(req.StreamID, req.Error)
 	return marshalRPCResult(rpcEmptyResponse{})
+}
+
+func (h *Host) callHostContextWait(request []byte) ([]byte, error) {
+	var req rpcHostContextWaitRequest
+	if errUnmarshal := json.Unmarshal(request, &req); errUnmarshal != nil {
+		return nil, fmt.Errorf("decode context wait request: %w", errUnmarshal)
+	}
+	canceled, errWait := h.waitCallbackContext(req.HostCallbackID)
+	if errWait != nil {
+		return nil, errWait
+	}
+	return marshalRPCResult(rpcHostContextWaitResponse{Canceled: canceled})
 }
 
 func (h *Host) callHostModelExecute(ctx context.Context, request []byte) ([]byte, error) {

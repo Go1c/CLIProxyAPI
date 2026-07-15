@@ -40,12 +40,13 @@ The plugin reads `access_token`, `account_id`, `proxy_url`, and `base_url` from 
 
 When `management_enabled` is true, the plugin exposes:
 
-- `GET /v0/management/api/status`
-- `POST /v0/management/api/close-idle`
-- `GET /v0/resource/plugins/codex-http2-keepalive/status`
+- `GET /v0/management/plugins/codex-http2-keepalive/status`
+- `POST /v0/management/plugins/codex-http2-keepalive/close-idle`
 
-The status JSON shows the pool key, upstream host, masked proxy, HTTP/2 state, `ReadIdleTimeout`, `PingTimeout`, request counters, active streams, and the last connection or PING error.
+Both routes use Management API authentication. The status JSON shows the pool key, upstream host, masked proxy, HTTP/2 state, `ReadIdleTimeout`, `PingTimeout`, request counters, active streams, and the last connection or PING error.
 
 ## Notes
 
 This plugin does not use `HostHTTPClient`. It owns the outbound network stack and logs its own request lifecycle with secrets redacted.
+
+The executor provider identifier is `codex`, so OAuth credentials are selected from the native Codex credential pool. An auth record may override the configured response path, but not the configured HTTPS origin.

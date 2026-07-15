@@ -3582,6 +3582,30 @@ func (m *Manager) HasProviderAuth(provider string) bool {
 	return false
 }
 
+// HasProviderAuthByKind reports whether the provider has a non-disabled credential
+// of the requested kind without advancing the credential scheduler.
+func (m *Manager) HasProviderAuthByKind(provider, kind string) bool {
+	if m == nil {
+		return false
+	}
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	kind = normalizeAuthKind(kind)
+	if provider == "" || kind == "" {
+		return false
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, auth := range m.auths {
+		if auth == nil || auth.Disabled || auth.Status == StatusDisabled {
+			continue
+		}
+		if strings.ToLower(strings.TrimSpace(auth.Provider)) == provider && auth.AuthKind() == kind {
+			return true
+		}
+	}
+	return false
+}
+
 func (m *Manager) retrySettings() (int, int, time.Duration) {
 	if m == nil {
 		return 0, 0, 0

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
@@ -48,6 +49,20 @@ func TestPluginRegistrationDeclaresCodexOAuthExecutor(t *testing.T) {
 	}
 	if len(wantFields) != 0 {
 		t.Fatalf("missing config fields: %#v", wantFields)
+	}
+}
+
+func TestExecutorIdentifierUsesCodexOAuthProvider(t *testing.T) {
+	raw, errHandle := handleMethod(pluginabi.MethodExecutorIdentifier, nil)
+	if errHandle != nil {
+		t.Fatalf("handleMethod() error = %v", errHandle)
+	}
+	identifier := decodeEnvelope[map[string]string](t, raw)["identifier"]
+	if identifier != executorProvider {
+		t.Fatalf("identifier = %q, want %q", identifier, executorProvider)
+	}
+	if identifier == pluginIdentifier {
+		t.Fatalf("executor provider must differ from plugin id %q", pluginIdentifier)
 	}
 }
 
@@ -110,7 +125,7 @@ func TestResolveCodexAuthSettingsUsesAuthValuesBeforeConfig(t *testing.T) {
 		},
 	}
 	cfg := defaultPluginConfig()
-	cfg.BaseURL = "https://config.example/backend-api/codex/responses"
+	cfg.BaseURL = "https://auth.example/backend-api/codex"
 
 	settings, err := resolveCodexAuthSettings(req, cfg)
 	if err != nil {
@@ -127,10 +142,20 @@ func TestResolveCodexAuthSettingsUsesAuthValuesBeforeConfig(t *testing.T) {
 	}
 }
 
+func TestResolveCodexAuthSettingsRejectsUnconfiguredOrigin(t *testing.T) {
+	req := rpcExecutorRequest{ExecutorRequest: pluginapi.ExecutorRequest{
+		StorageJSON: []byte(`{"access_token":"token","base_url":"https://attacker.example/responses"}`),
+	}}
+	_, err := resolveCodexAuthSettings(req, defaultPluginConfig())
+	if err == nil || pluginErrorCode(err) != "invalid_base_url" {
+		t.Fatalf("resolveCodexAuthSettings() error = %v, want invalid_base_url", err)
+	}
+}
+
 func TestResolveCodexAuthSettingsReturnsAuthNotFoundWithoutToken(t *testing.T) {
 	req := rpcExecutorRequest{
 		ExecutorRequest: pluginapi.ExecutorRequest{
-			StorageJSON: []byte(`{"base_url":"https://auth.example/backend-api/codex/responses"}`),
+			StorageJSON: []byte(`{}`),
 		},
 	}
 

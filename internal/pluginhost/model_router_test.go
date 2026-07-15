@@ -1,10 +1,11 @@
 package pluginhost
 
 import (
-	"encoding/json"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"testing"
 
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -218,8 +219,8 @@ func TestHostExecutePluginExecutorSelectsOAuthAuth(t *testing.T) {
 		Format:  sdktranslator.FormatCodex,
 		Payload: []byte(`{"model":"gpt-5.4"}`),
 	}, coreexecutor.Options{
-		SourceFormat:  sdktranslator.FormatCodex,
-		ResponseFormat: sdktranslator.FormatCodex,
+		SourceFormat:    sdktranslator.FormatCodex,
+		ResponseFormat:  sdktranslator.FormatCodex,
 		OriginalRequest: []byte(`{"model":"gpt-5.4"}`),
 	})
 	if errExecute != nil {
@@ -278,16 +279,119 @@ func TestHostExecutePluginExecutorReturnsAuthNotFoundWithoutOAuthAuth(t *testing
 		Format:  sdktranslator.FormatCodex,
 		Payload: []byte(`{"model":"gpt-5.4"}`),
 	}, coreexecutor.Options{
-		SourceFormat:  sdktranslator.FormatCodex,
-		ResponseFormat: sdktranslator.FormatCodex,
+		SourceFormat:    sdktranslator.FormatCodex,
+		ResponseFormat:  sdktranslator.FormatCodex,
 		OriginalRequest: []byte(`{"model":"gpt-5.4"}`),
 	})
 	if errExecute == nil {
 		t.Fatal("ExecutePluginExecutor() error = nil, want auth_not_found")
 	}
 	var authErr *coreauth.Error
-	if !errors.As(errExecute, &authErr) || authErr.Code != "auth_not_found" {
-		t.Fatalf("ExecutePluginExecutor() error = %#v, want auth_not_found", errExecute)
+	if !errors.As(errExecute, &authErr) || authErr.Code != "auth_not_found" || authErr.HTTPStatus != http.StatusServiceUnavailable {
+		t.Fatalf("ExecutePluginExecutor() error = %#v, want auth_not_found with 503", errExecute)
+	}
+}
+
+func TestHostExecutePluginExecutorUsesRegisteredModelProvider(t *testing.T) {
+	var gotReq pluginapi.ExecutorRequest
+	host := newRouteModelHostWithRecords(capabilityRecord{
+		id: "provider-mismatch",
+		plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
+			Executor: &fakeExecutor{
+				identifier: "wrong-provider",
+				execute: func(_ context.Context, req pluginapi.ExecutorRequest) (pluginapi.ExecutorResponse, error) {
+					gotReq = req
+					return pluginapi.ExecutorResponse{Payload: []byte("ok")}, nil
+				},
+			},
+			ExecutorModelScope: pluginapi.ExecutorModelScopeOAuth,
+		}},
+	})
+	host.modelProviders["provider-mismatch"] = "registered-provider"
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(&fakeProviderExecutor{provider: "registered-provider"})
+	if _, errRegister := manager.Register(context.Background(), &coreauth.Auth{
+		ID:       "oauth",
+		Provider: "registered-provider",
+		Metadata: map[string]any{"access_token": "token"},
+	}); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+	host.authManager = manager
+
+	if _, errExecute := host.ExecutePluginExecutor(context.Background(), "provider-mismatch", coreexecutor.Request{}, coreexecutor.Options{}); errExecute != nil {
+		t.Fatalf("ExecutePluginExecutor() error = %v", errExecute)
+	}
+	if gotReq.AuthProvider != "registered-provider" || gotReq.AuthID != "oauth" {
+		t.Fatalf("executor auth = %q/%q, want registered-provider/oauth", gotReq.AuthProvider, gotReq.AuthID)
+	}
+}
+
+func TestHostExecutePluginExecutorBothScopeUsesOAuthWhenAvailable(t *testing.T) {
+	var gotReq pluginapi.ExecutorRequest
+	host := newRouteModelHostWithRecords(capabilityRecord{
+		id: "both",
+		plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
+			Executor: &fakeExecutor{
+				identifier: "both-provider",
+				execute: func(_ context.Context, req pluginapi.ExecutorRequest) (pluginapi.ExecutorResponse, error) {
+					gotReq = req
+					return pluginapi.ExecutorResponse{}, nil
+				},
+			},
+			ExecutorModelScope: pluginapi.ExecutorModelScopeBoth,
+		}},
+	})
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(&fakeProviderExecutor{provider: "both-provider"})
+	if _, errRegister := manager.Register(context.Background(), &coreauth.Auth{
+		ID:       "both-oauth",
+		Provider: "both-provider",
+		Metadata: map[string]any{"access_token": "token"},
+	}); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+	host.authManager = manager
+
+	if _, errExecute := host.ExecutePluginExecutor(context.Background(), "both", coreexecutor.Request{}, coreexecutor.Options{}); errExecute != nil {
+		t.Fatalf("ExecutePluginExecutor() error = %v", errExecute)
+	}
+	if gotReq.AuthID != "both-oauth" {
+		t.Fatalf("AuthID = %q, want both-oauth", gotReq.AuthID)
+	}
+}
+
+func TestHostCountPluginExecutorDoesNotSelectOAuth(t *testing.T) {
+	var gotReq pluginapi.ExecutorRequest
+	host := newRouteModelHostWithRecords(capabilityRecord{
+		id: "count",
+		plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
+			Executor: &fakeExecutor{
+				identifier: "count-provider",
+				countTokens: func(_ context.Context, req pluginapi.ExecutorRequest) (pluginapi.ExecutorResponse, error) {
+					gotReq = req
+					return pluginapi.ExecutorResponse{}, nil
+				},
+			},
+			ExecutorModelScope: pluginapi.ExecutorModelScopeOAuth,
+		}},
+	})
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(&fakeProviderExecutor{provider: "count-provider"})
+	if _, errRegister := manager.Register(context.Background(), &coreauth.Auth{
+		ID:       "count-oauth",
+		Provider: "count-provider",
+		Metadata: map[string]any{"access_token": "token"},
+	}); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+	host.authManager = manager
+
+	if _, errCount := host.CountPluginExecutor(context.Background(), "count", coreexecutor.Request{}, coreexecutor.Options{}); errCount != nil {
+		t.Fatalf("CountPluginExecutor() error = %v", errCount)
+	}
+	if gotReq.AuthID != "" || gotReq.AuthProvider != "" {
+		t.Fatalf("count auth = %q/%q, want no selected auth", gotReq.AuthID, gotReq.AuthProvider)
 	}
 }
 
@@ -700,7 +804,7 @@ func TestHostRouteModelSkipsExecutorWithUnsupportedFormats(t *testing.T) {
 	}
 }
 
-func TestHostRouteModelAllowsOAuthOnlyExecutorTargets(t *testing.T) {
+func TestHostRouteModelSkipsOAuthOnlyExecutorWithoutOAuthAuth(t *testing.T) {
 	var fallbackCalled bool
 	host := newHostWithRecords(
 		capabilityRecord{
@@ -733,9 +837,39 @@ func TestHostRouteModelAllowsOAuthOnlyExecutorTargets(t *testing.T) {
 	)
 
 	resp, ok := host.RouteModel(context.Background(), pluginapi.ModelRouteRequest{RequestedModel: "original-model", SourceFormat: "openai"})
-	if fallbackCalled {
-		t.Fatal("fallback router was called after OAuth-only executor target was accepted")
+	if !fallbackCalled {
+		t.Fatal("fallback router was not called after OAuth-only executor target was skipped")
 	}
+	if !ok || !resp.Handled || resp.Target != "fallback" {
+		t.Fatalf("RouteModel() = %#v, %v; want fallback executor handled", resp, ok)
+	}
+}
+
+func TestHostRouteModelAllowsOAuthOnlyExecutorWithOAuthAuth(t *testing.T) {
+	host := newRouteModelHostWithRecords(capabilityRecord{
+		id: "oauth-only",
+		plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
+			Executor:              &fakeExecutor{identifier: "oauth-provider"},
+			ExecutorModelScope:    pluginapi.ExecutorModelScopeOAuth,
+			ExecutorInputFormats:  []string{"openai"},
+			ExecutorOutputFormats: []string{"openai"},
+			ModelRouter: modelRouterFunc(func(context.Context, pluginapi.ModelRouteRequest) (pluginapi.ModelRouteResponse, error) {
+				return pluginapi.ModelRouteResponse{Handled: true, TargetKind: pluginapi.ModelRouteTargetSelf}, nil
+			}),
+		}},
+	})
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(&fakeProviderExecutor{provider: "oauth-provider"})
+	if _, errRegister := manager.Register(context.Background(), &coreauth.Auth{
+		ID:       "oauth",
+		Provider: "oauth-provider",
+		Metadata: map[string]any{"access_token": "token"},
+	}); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+	host.authManager = manager
+
+	resp, ok := host.RouteModel(context.Background(), pluginapi.ModelRouteRequest{RequestedModel: "original-model", SourceFormat: "openai"})
 	if !ok || !resp.Handled || resp.Target != "oauth-only" {
 		t.Fatalf("RouteModel() = %#v, %v; want oauth-only executor handled", resp, ok)
 	}

@@ -750,3 +750,35 @@ func TestHostLogCallbackRestoresRegisteredRequestContext(t *testing.T) {
 		t.Fatalf("log output = %q, want message and request_id field", got)
 	}
 }
+
+func TestHostContextWaitReportsRequestCancellation(t *testing.T) {
+	host := New()
+	ctx, cancel := context.WithCancel(context.Background())
+	callbackID, closeCallback := host.openCallbackContext(ctx)
+	defer closeCallback()
+	rawReq, errMarshal := json.Marshal(rpcHostContextWaitRequest{HostCallbackID: callbackID})
+	if errMarshal != nil {
+		t.Fatalf("marshal context wait request: %v", errMarshal)
+	}
+	result := make(chan rpcHostContextWaitResponse, 1)
+	go func() {
+		rawResp, errCall := host.callFromPlugin(context.Background(), pluginabi.MethodHostContextWait, rawReq)
+		if errCall != nil {
+			return
+		}
+		resp, errDecode := decodeRPCEnvelope[rpcHostContextWaitResponse](rawResp)
+		if errDecode == nil {
+			result <- resp
+		}
+	}()
+
+	cancel()
+	select {
+	case resp := <-result:
+		if !resp.Canceled {
+			t.Fatal("Canceled = false, want true")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("context wait did not return after request cancellation")
+	}
+}

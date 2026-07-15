@@ -18,6 +18,7 @@ type callbackContextEntry struct {
 	ctx      context.Context
 	pluginID string
 	cleanup  []func()
+	done     chan struct{}
 }
 
 func newCallbackContextRegistry() *callbackContextRegistry {
@@ -35,7 +36,7 @@ func (r *callbackContextRegistry) open(ctx context.Context, pluginID string) (st
 	ctx = withHostCallbackPluginID(ctx, pluginID)
 	id := strconv.FormatUint(r.next.Add(1), 10)
 	r.mu.Lock()
-	r.contexts[id] = callbackContextEntry{ctx: ctx, pluginID: pluginID}
+	r.contexts[id] = callbackContextEntry{ctx: ctx, pluginID: pluginID, done: make(chan struct{})}
 	r.mu.Unlock()
 
 	var once sync.Once
@@ -46,6 +47,9 @@ func (r *callbackContextRegistry) open(ctx context.Context, pluginID string) (st
 			entry := r.contexts[id]
 			delete(r.contexts, id)
 			r.mu.Unlock()
+			if entry.done != nil {
+				close(entry.done)
+			}
 			cleanup = entry.cleanup
 			for _, fn := range cleanup {
 				if fn != nil {
@@ -53,6 +57,27 @@ func (r *callbackContextRegistry) open(ctx context.Context, pluginID string) (st
 				}
 			}
 		})
+	}
+}
+
+func (r *callbackContextRegistry) wait(id string) (bool, error) {
+	if r == nil || strings.TrimSpace(id) == "" {
+		return false, context.Canceled
+	}
+	r.mu.RLock()
+	entry, ok := r.contexts[id]
+	r.mu.RUnlock()
+	if !ok || entry.ctx == nil || entry.done == nil {
+		return false, context.Canceled
+	}
+	if entry.ctx.Err() != nil {
+		return true, nil
+	}
+	select {
+	case <-entry.ctx.Done():
+		return true, nil
+	case <-entry.done:
+		return entry.ctx.Err() != nil, nil
 	}
 }
 
@@ -129,6 +154,13 @@ func (h *Host) resolveCallbackContext(id string, fallback context.Context) conte
 		return fallback
 	}
 	return h.callbackContexts.resolve(id, fallback)
+}
+
+func (h *Host) waitCallbackContext(id string) (bool, error) {
+	if h == nil || h.callbackContexts == nil {
+		return false, context.Canceled
+	}
+	return h.callbackContexts.wait(id)
 }
 
 func (h *Host) callbackContextPluginID(id string) string {

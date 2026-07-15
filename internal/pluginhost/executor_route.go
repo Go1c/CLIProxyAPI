@@ -2,6 +2,7 @@ package pluginhost
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -37,6 +38,9 @@ func (h *Host) executorPluginReady(pluginID string, routeReq pluginapi.ModelRout
 		}
 		provider, okProvider := h.executorProvider(record, executor)
 		if !okProvider {
+			return false
+		}
+		if normalizedExecutorModelScope(record.plugin.Capabilities) == pluginapi.ExecutorModelScopeOAuth && !h.hasExecutorOAuth(provider) {
 			return false
 		}
 		adapter := newExecutorAdapterRegistration(h, record, provider, executor).adapter
@@ -107,15 +111,12 @@ func (h *Host) ExecutePluginExecutorStream(ctx context.Context, pluginID string,
 
 // CountPluginExecutor executes a count-tokens request with the named plugin executor without changing the requested model.
 func (h *Host) CountPluginExecutor(ctx context.Context, pluginID string, req coreexecutor.Request, opts coreexecutor.Options) (coreexecutor.Response, error) {
-	record, provider, adapter, errAdapter := h.executorAdapterRecordForPlugin(pluginID)
+	_, _, adapter, errAdapter := h.executorAdapterRecordForPlugin(pluginID)
 	if errAdapter != nil {
 		return coreexecutor.Response{}, errAdapter
 	}
-	auth, errAuth := h.executorAuthForRecord(ctx, record, provider, req, opts)
-	if errAuth != nil {
-		return coreexecutor.Response{}, errAuth
-	}
-	return adapter.CountTokens(ctx, auth, req, opts)
+	// Token estimation must not consume a credential scheduler turn.
+	return adapter.CountTokens(ctx, nil, req, opts)
 }
 
 func (h *Host) executorAdapterRecordForPlugin(pluginID string) (capabilityRecord, string, *executorAdapter, error) {
@@ -137,11 +138,10 @@ func (h *Host) executorAdapterRecordForPlugin(pluginID string) (capabilityRecord
 		if executor == nil {
 			return capabilityRecord{}, "", nil, fmt.Errorf("plugin %s does not declare an executor", pluginID)
 		}
-		provider, okProvider := h.callExecutorIdentifier(record.id, executor)
+		provider, okProvider := h.executorProvider(record, executor)
 		if !okProvider {
 			return capabilityRecord{}, "", nil, fmt.Errorf("plugin executor %s has no provider identifier", pluginID)
 		}
-		provider = strings.ToLower(strings.TrimSpace(provider))
 		registration := newExecutorAdapterRegistration(h, record, provider, executor)
 		return record, provider, registration.adapter, nil
 	}
@@ -156,7 +156,10 @@ func (h *Host) executorAuthForRecord(ctx context.Context, record capabilityRecor
 	if executor == nil {
 		return nil, fmt.Errorf("plugin %s does not declare an executor", record.id)
 	}
-	if normalizedExecutorModelScope(record.plugin.Capabilities) != pluginapi.ExecutorModelScopeOAuth {
+	if !executorScopeAllowsOAuthModels(record.plugin.Capabilities) {
+		return nil, nil
+	}
+	if normalizedExecutorModelScope(record.plugin.Capabilities) == pluginapi.ExecutorModelScopeBoth && !h.hasExecutorOAuth(provider) {
 		return nil, nil
 	}
 	if h.authManager == nil {
@@ -165,10 +168,24 @@ func (h *Host) executorAuthForRecord(ctx context.Context, record capabilityRecor
 	provider = strings.ToLower(strings.TrimSpace(provider))
 	selected, errSelect := h.authManager.SelectAuthByKind(ctx, provider, strings.TrimSpace(req.Model), coreauth.AuthKindOAuth, opts)
 	if errSelect != nil {
-		return nil, errSelect
+		return nil, normalizeExecutorAuthError(errSelect)
 	}
 	if selected == nil {
 		return nil, &coreauth.Error{Code: "auth_not_found", Message: "no oauth auth available", HTTPStatus: http.StatusServiceUnavailable}
 	}
 	return selected, nil
+}
+
+func (h *Host) hasExecutorOAuth(provider string) bool {
+	return h != nil && h.authManager != nil && h.authManager.HasProviderAuthByKind(provider, coreauth.AuthKindOAuth)
+}
+
+func normalizeExecutorAuthError(err error) error {
+	var authErr *coreauth.Error
+	if !errors.As(err, &authErr) || authErr == nil || authErr.Code != "auth_not_found" || authErr.HTTPStatus != 0 {
+		return err
+	}
+	clone := *authErr
+	clone.HTTPStatus = http.StatusServiceUnavailable
+	return &clone
 }

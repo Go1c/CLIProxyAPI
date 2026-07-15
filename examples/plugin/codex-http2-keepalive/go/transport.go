@@ -65,8 +65,6 @@ type codexTransportDialer struct {
 	connectTimeout time.Duration
 	tlsTimeout     time.Duration
 	tlsConfig      *tls.Config
-	connected      chan struct{}
-	connectedOnce  sync.Once
 }
 
 type poolSnapshot struct {
@@ -100,9 +98,9 @@ type poolStatusResponse struct {
 }
 
 type poolCloseResponse struct {
-	ClosedIdlePools int            `json:"closed_idle_pools"`
-	GeneratedAt     string         `json:"generated_at"`
-	Pools           []poolSnapshot `json:"pools"`
+	PoolsProcessed int            `json:"pools_processed"`
+	GeneratedAt    string         `json:"generated_at"`
+	Pools          []poolSnapshot `json:"pools"`
 }
 
 func newCodexPoolManager() *codexPoolManager {
@@ -110,11 +108,16 @@ func newCodexPoolManager() *codexPoolManager {
 }
 
 func (m *codexPoolManager) acquire(baseURL, proxyURL string, cfg pluginConfig) (*codexUpstreamPool, error) {
+	return m.acquirePool(baseURL, proxyURL, cfg, false)
+}
+
+func (m *codexPoolManager) acquireForRequest(baseURL, proxyURL string, cfg pluginConfig) (*codexUpstreamPool, error) {
+	return m.acquirePool(baseURL, proxyURL, cfg, true)
+}
+
+func (m *codexPoolManager) acquirePool(baseURL, proxyURL string, cfg pluginConfig, active bool) (*codexUpstreamPool, error) {
 	if m == nil {
 		return nil, fmt.Errorf("codex pool manager is unavailable")
-	}
-	if m.closed {
-		return nil, fmt.Errorf("codex pool manager is shut down")
 	}
 	normalizedBaseURL, errNormalize := normalizeResponsesEndpoint(baseURL)
 	if errNormalize != nil {
@@ -133,6 +136,9 @@ func (m *codexPoolManager) acquire(baseURL, proxyURL string, cfg pluginConfig) (
 	}
 	if pool := m.pools[key]; pool != nil && !pool.shutdown.Load() {
 		pool.touch()
+		if active {
+			pool.recordRequestStart()
+		}
 		return pool, nil
 	}
 	pool, errNew := newCodexUpstreamPool(key, normalizedBaseURL, proxyURL, cfg)
@@ -141,6 +147,9 @@ func (m *codexPoolManager) acquire(baseURL, proxyURL string, cfg pluginConfig) (
 	}
 	m.pools[key] = pool
 	pool.touch()
+	if active {
+		pool.recordRequestStart()
+	}
 	m.evictIdleLocked(cfg.MaxIdleConnections)
 	return pool, nil
 }
@@ -178,17 +187,20 @@ func (m *codexPoolManager) evictIdleLocked(maxIdle int) {
 	}
 }
 
-func (m *codexPoolManager) CloseIdleConnections() {
+func (m *codexPoolManager) CloseIdleConnections() int {
 	if m == nil {
-		return
+		return 0
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	processed := 0
 	for _, pool := range m.pools {
 		if pool != nil {
 			pool.CloseIdleConnections()
+			processed++
 		}
 	}
+	return processed
 }
 
 func (m *codexPoolManager) Shutdown() {
@@ -249,12 +261,15 @@ func newCodexUpstreamPool(key, baseURL, proxyURL string, cfg pluginConfig) (*cod
 		upstreamURL:  normalizedBaseURL,
 		upstreamHost: parsedURL.Host,
 		proxyRaw:     strings.TrimSpace(proxyURL),
-		proxyMasked:  maskProxyURL(proxyURL),
+		proxyMasked:  "direct",
 		readIdle:     cfg.ReadIdleTimeout,
 		pingTimeout:  cfg.PingTimeout,
 		dialer:       dialer,
 		connections:  make(map[*trackedConn]struct{}),
 		tlsConfig:    &tls.Config{ServerName: parsedURL.Hostname()},
+	}
+	if pool.proxyRaw != "" && !strings.EqualFold(pool.proxyRaw, "direct") && !strings.EqualFold(pool.proxyRaw, "none") {
+		pool.proxyMasked = proxyutil.Redact(pool.proxyRaw)
 	}
 	pool.dialer.tlsConfig = pool.tlsConfig
 	transport, errTransport := newCodexHTTP2Transport(pool)
@@ -271,7 +286,6 @@ func newCodexTransportDialer(proxyURL string) (*codexTransportDialer, error) {
 		proxyRaw:       strings.TrimSpace(proxyURL),
 		connectTimeout: codexTransportConnectTimeout,
 		tlsTimeout:     codexTransportHandshakeTimeout,
-		connected:      make(chan struct{}),
 		tlsConfig:      &tls.Config{},
 	}
 	if dialer.proxyRaw == "" || strings.EqualFold(dialer.proxyRaw, "direct") || strings.EqualFold(dialer.proxyRaw, "none") {
@@ -307,7 +321,11 @@ func newCodexHTTP2Transport(pool *codexUpstreamPool) (*http2.Transport, error) {
 					serverName = addr
 				}
 			}
-			return pool.dialer.dialTLS(ctx, network, addr, serverName)
+			conn, errDial := pool.dialer.dialTLS(ctx, network, addr, serverName)
+			if errDial != nil {
+				return nil, errDial
+			}
+			return pool.markConnectionCreated(conn), nil
 		},
 	}
 	return transport, nil
@@ -343,7 +361,7 @@ func (d *codexTransportDialer) dialTLS(ctx context.Context, network, addr, serve
 	}
 	cfg := cloneUTLSConfig(d.tlsConfig)
 	cfg.ServerName = serverName
-	cfg.NextProtos = []string{http2.NextProtoTLS, "http/1.1"}
+	cfg.NextProtos = []string{http2.NextProtoTLS}
 	tlsConn := tls.UClient(rawConn, cfg, tls.HelloCustom)
 	if errPreset := tlsConn.ApplyPreset(codexClientHelloSpec(cfg.NextProtos)); errPreset != nil {
 		_ = rawConn.Close()
@@ -364,11 +382,6 @@ func (d *codexTransportDialer) dialTLS(ctx context.Context, network, addr, serve
 		_ = tlsConn.Close()
 		return nil, errHandshake
 	}
-	d.connectedOnce.Do(func() {
-		if d.connected != nil {
-			close(d.connected)
-		}
-	})
 	return tlsConn, nil
 }
 
@@ -457,6 +470,10 @@ func normalizeResponsesEndpoint(raw string) (string, error) {
 	if parsed.Host == "" {
 		return "", fmt.Errorf("base_url must be absolute")
 	}
+	if !strings.EqualFold(parsed.Scheme, "https") {
+		return "", fmt.Errorf("base_url must use https")
+	}
+	parsed.Scheme = "https"
 	path := strings.TrimRight(parsed.Path, "/")
 	if path == "" || path == "/" {
 		path = "/backend-api/codex/responses"
@@ -473,19 +490,24 @@ func normalizeResponsesEndpoint(raw string) (string, error) {
 	return strings.TrimRight(parsed.String(), "/"), nil
 }
 
-func maskProxyURL(raw string) string {
-	raw = strings.TrimSpace(raw)
-	if raw == "" || strings.EqualFold(raw, "direct") || strings.EqualFold(raw, "none") {
-		return "direct"
+func sameCodexOrigin(candidate, configured string) (bool, error) {
+	candidateURL, errCandidate := normalizeResponsesEndpoint(candidate)
+	if errCandidate != nil {
+		return false, errCandidate
 	}
-	parsed, errParse := url.Parse(raw)
-	if errParse != nil {
-		return "invalid-proxy"
+	configuredURL, errConfigured := normalizeResponsesEndpoint(configured)
+	if errConfigured != nil {
+		return false, errConfigured
 	}
-	parsed.User = nil
-	parsed.RawQuery = ""
-	parsed.Fragment = ""
-	return strings.TrimRight(parsed.String(), "/")
+	candidateParsed, errCandidateParse := url.Parse(candidateURL)
+	if errCandidateParse != nil {
+		return false, errCandidateParse
+	}
+	configuredParsed, errConfiguredParse := url.Parse(configuredURL)
+	if errConfiguredParse != nil {
+		return false, errConfiguredParse
+	}
+	return strings.EqualFold(candidateParsed.Scheme, configuredParsed.Scheme) && strings.EqualFold(candidateParsed.Host, configuredParsed.Host), nil
 }
 
 func isTimeoutError(err error) bool {
@@ -535,6 +557,14 @@ func (p *codexUpstreamPool) recordRequestStart() {
 		return
 	}
 	p.requests.Add(1)
+	p.activeStreams.Add(1)
+}
+
+func (p *codexUpstreamPool) recordRequestDone() {
+	if p == nil {
+		return
+	}
+	p.activeStreams.Add(-1)
 }
 
 func (p *codexUpstreamPool) recordSuccess() {
@@ -587,15 +617,11 @@ func (p *codexUpstreamPool) snapshot() poolSnapshot {
 	return snap
 }
 
-func (p *codexUpstreamPool) closeIdleConnections() {
+func (p *codexUpstreamPool) CloseIdleConnections() {
 	if p == nil || p.transport == nil {
 		return
 	}
 	p.transport.CloseIdleConnections()
-}
-
-func (p *codexUpstreamPool) CloseIdleConnections() {
-	p.closeIdleConnections()
 }
 
 func (p *codexUpstreamPool) CloseAllConnections() {

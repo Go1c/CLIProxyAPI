@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/tidwall/gjson"
 )
 
 func TestProcessCodexResponseAggregatesCompletedBody(t *testing.T) {
@@ -37,6 +39,69 @@ func TestProcessCodexResponseAggregatesCompletedBody(t *testing.T) {
 	}
 	if !strings.Contains(string(result.finalBody), `"total_tokens":12`) {
 		t.Fatalf("final body = %s, want usage", result.finalBody)
+	}
+}
+
+func TestRequestContextFollowsHostCancellation(t *testing.T) {
+	release := make(chan struct{})
+	withHostCallStub(t, func(method string, payload any) (json.RawMessage, error) {
+		if method != pluginabi.MethodHostContextWait {
+			t.Fatalf("host method = %q, want context wait", method)
+		}
+		req := payload.(rpcHostContextWaitRequest)
+		if req.HostCallbackID != "callback-1" {
+			t.Fatalf("HostCallbackID = %q, want callback-1", req.HostCallbackID)
+		}
+		<-release
+		return json.RawMessage(`{"canceled":true}`), nil
+	})
+	ctx, cancel := requestContext("callback-1")
+	defer cancel()
+	close(release)
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("request context was not canceled by host callback")
+	}
+}
+
+func TestCountTokensReturnsNonZeroInputUsage(t *testing.T) {
+	rawReq, errMarshal := json.Marshal(rpcExecutorRequest{ExecutorRequest: pluginapi.ExecutorRequest{
+		Model:   "gpt-5.4",
+		Payload: []byte(`{"instructions":"Be concise","input":[{"type":"message","content":[{"type":"input_text","text":"hello world"}]}]}`),
+	}})
+	if errMarshal != nil {
+		t.Fatalf("marshal request: %v", errMarshal)
+	}
+	rawResp, errCount := countTokens(rawReq)
+	if errCount != nil {
+		t.Fatalf("countTokens() error = %v", errCount)
+	}
+	resp := decodeEnvelope[pluginapi.ExecutorResponse](t, rawResp)
+	if count := gjson.GetBytes(resp.Payload, "response.usage.input_tokens").Int(); count <= 0 {
+		t.Fatalf("input_tokens = %d, want > 0; payload=%s", count, resp.Payload)
+	}
+}
+
+func TestHeaderSanitizersDoNotForwardCredentialsOrCookies(t *testing.T) {
+	forwarded := sanitizeForwardHeaders(http.Header{
+		"User-Agent":    []string{"client"},
+		"Authorization": []string{"Bearer client-token"},
+		"Cookie":        []string{"session=secret"},
+		"X-Smuggled":    []string{"value"},
+	})
+	if forwarded.Get("User-Agent") != "client" || forwarded.Get("Authorization") != "" || forwarded.Get("Cookie") != "" || forwarded.Get("X-Smuggled") != "" {
+		t.Fatalf("forwarded headers = %#v", forwarded)
+	}
+	response := sanitizeResponseHeaders(http.Header{
+		"Content-Type":   []string{"text/event-stream"},
+		"Set-Cookie":     []string{"backend=secret"},
+		"Server":         []string{"internal"},
+		"X-Request-Id":   []string{"request-1"},
+		"X-Ratelimit-By": []string{"1"},
+	}, false)
+	if response.Get("Set-Cookie") != "" || response.Get("Server") != "" || response.Get("X-Request-Id") != "request-1" {
+		t.Fatalf("response headers = %#v", response)
 	}
 }
 

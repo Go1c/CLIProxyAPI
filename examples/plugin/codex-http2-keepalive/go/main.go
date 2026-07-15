@@ -71,9 +71,14 @@ import (
 
 const (
 	pluginIdentifier         = "codex-http2-keepalive"
+	executorProvider         = "codex"
 	defaultPluginVersion     = "0.1.0"
 	defaultCodexResponsesURL = "https://chatgpt.com/backend-api/codex/responses"
 	defaultPluginPrompt      = "Help me use Codex HTTP/2 keepalive."
+	defaultCodexUserAgent    = "codex-tui/0.144.1 (Mac OS 26.4.1; arm64) Orca/1.4.103 (codex-tui; 0.144.1)"
+	defaultCodexOriginator   = "codex-tui"
+	defaultCodexVersion      = "0.144.1"
+	defaultCodexBetaFeatures = "remote_compaction_v2"
 )
 
 type envelope struct {
@@ -109,15 +114,6 @@ type pluginConfig struct {
 	MaxIdleConnections int
 	RetryNetworkErrors bool
 	ManagementEnabled  bool
-}
-
-type pluginState struct {
-	mu                 sync.RWMutex
-	config             pluginConfig
-	managementBasePath string
-	resourceBasePath   string
-	shutdown           bool
-	pools              *codexPoolManager
 }
 
 type rpcLifecycleRequest struct {
@@ -191,12 +187,19 @@ type rpcStreamCloseRequest struct {
 	Error    string `json:"error,omitempty"`
 }
 
+type rpcHostContextWaitRequest struct {
+	HostCallbackID string `json:"host_callback_id"`
+}
+
+type rpcHostContextWaitResponse struct {
+	Canceled bool `json:"canceled"`
+}
+
 type pluginRuntime struct {
 	mu sync.RWMutex
 	pluginConfig
 	pools              *codexPoolManager
 	managementBasePath string
-	resourceBasePath   string
 	shutdown           bool
 }
 
@@ -323,23 +326,22 @@ func (r *pluginRuntime) updateConfig(cfg pluginConfig) {
 	}
 }
 
-func (r *pluginRuntime) setManagementPaths(basePath, resourceBasePath string) {
+func (r *pluginRuntime) setManagementBasePath(basePath string) {
 	if r == nil {
 		return
 	}
 	r.mu.Lock()
 	r.managementBasePath = strings.TrimSpace(basePath)
-	r.resourceBasePath = strings.TrimSpace(resourceBasePath)
 	r.mu.Unlock()
 }
 
-func (r *pluginRuntime) managementPaths() (string, string) {
+func (r *pluginRuntime) managementPath() string {
 	if r == nil {
-		return "", ""
+		return ""
 	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return r.managementBasePath, r.resourceBasePath
+	return r.managementBasePath
 }
 
 func (r *pluginRuntime) setShutdown() {
@@ -426,13 +428,13 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 	case pluginabi.MethodModelRoute:
 		return routeModel(request)
 	case pluginabi.MethodExecutorIdentifier:
-		return okEnvelope(map[string]string{"identifier": pluginIdentifier})
+		return okEnvelope(map[string]string{"identifier": executorProvider})
 	case pluginabi.MethodExecutorExecute:
 		return execute(request)
 	case pluginabi.MethodExecutorExecuteStream:
 		return executeStream(request)
 	case pluginabi.MethodExecutorCountTokens:
-		return okEnvelope(pluginapi.ExecutorResponse{Payload: []byte(`{"input_tokens":0,"output_tokens":0,"total_tokens":0}`)})
+		return countTokens(request)
 	case pluginabi.MethodManagementRegister:
 		return managementRegister(request)
 	case pluginabi.MethodManagementHandle:

@@ -72,6 +72,7 @@ const (
 	MethodHostModelStreamClose   = "host.model.stream_close"
 	MethodHostStreamEmit         = "host.stream.emit"
 	MethodHostStreamClose        = "host.stream.close"
+	MethodHostContextWait        = "host.context.wait"
 	MethodHostLog                = "host.log"
 	MethodHostAuthList           = "host.auth.list"
 	MethodHostAuthGet            = "host.auth.get"

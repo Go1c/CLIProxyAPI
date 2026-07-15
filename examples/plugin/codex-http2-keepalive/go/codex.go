@@ -16,12 +16,12 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/proxyutil"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
+	"github.com/tiktoken-go/tokenizer"
 )
 
 type codexAuthSettings struct {
@@ -70,7 +70,9 @@ func execute(raw []byte) ([]byte, error) {
 		return nil, err
 	}
 	cfg := currentConfig()
-	resp, outcome, err := runCodexExecution(context.Background(), req, cfg, false)
+	ctx, cancel := requestContext(req.HostCallbackID)
+	defer cancel()
+	resp, outcome, err := runCodexExecution(ctx, req, cfg, false)
 	if err != nil {
 		return errorEnvelope(pluginErrorCode(err), err.Error(), isRetryableError(err), pluginErrorStatus(err)), nil
 	}
@@ -87,13 +89,15 @@ func executeStream(raw []byte) ([]byte, error) {
 		return errorEnvelope("invalid_request", "stream_id is required for executor.execute_stream", false, http.StatusBadRequest), nil
 	}
 	cfg := currentConfig()
+	ctx, cancel := requestContext(req.HostCallbackID)
 	go func() {
+		defer cancel()
 		defer func() {
 			if recovered := recover(); recovered != nil {
 				_ = closePluginStream(req.StreamID, fmt.Sprintf("stream panic: %v", recovered))
 			}
 		}()
-		resp, outcome, errRun := runCodexExecution(context.Background(), req, cfg, true)
+		resp, outcome, errRun := runCodexExecution(ctx, req, cfg, true)
 		_ = resp
 		if errRun != nil {
 			logCodexFailure(req.HostCallbackID, outcome, errRun)
@@ -108,6 +112,139 @@ func executeStream(raw []byte) ([]byte, error) {
 	})
 }
 
+func requestContext(hostCallbackID string) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(context.Background())
+	if strings.TrimSpace(hostCallbackID) == "" {
+		return ctx, cancel
+	}
+	go func() {
+		raw, errWait := hostCall(pluginabi.MethodHostContextWait, rpcHostContextWaitRequest{HostCallbackID: hostCallbackID})
+		if errWait != nil {
+			return
+		}
+		var resp rpcHostContextWaitResponse
+		if errDecode := json.Unmarshal(raw, &resp); errDecode == nil && resp.Canceled {
+			cancel()
+		}
+	}()
+	return ctx, cancel
+}
+
+func countTokens(raw []byte) ([]byte, error) {
+	var req rpcExecutorRequest
+	if err := json.Unmarshal(raw, &req); err != nil {
+		return nil, err
+	}
+	body := req.Payload
+	if len(body) == 0 {
+		body = req.OriginalRequest
+	}
+	model := resolveCodexModel(req)
+	if model != "" {
+		updated, errSet := sjson.SetBytes(body, "model", model)
+		if errSet != nil {
+			return errorEnvelope("token_count_failed", errSet.Error(), false, http.StatusBadRequest), nil
+		}
+		body = updated
+	}
+	body, _ = sjson.SetBytes(body, "stream", false)
+	enc, errTokenizer := tokenizerForCodexModel(model)
+	if errTokenizer != nil {
+		return errorEnvelope("token_count_failed", errTokenizer.Error(), false, http.StatusInternalServerError), nil
+	}
+	count, errCount := countCodexInputTokens(enc, body)
+	if errCount != nil {
+		return errorEnvelope("token_count_failed", errCount.Error(), false, http.StatusInternalServerError), nil
+	}
+	payload := []byte(fmt.Sprintf(`{"response":{"usage":{"input_tokens":%d,"output_tokens":0,"total_tokens":%d}}}`, count, count))
+	return okEnvelope(pluginapi.ExecutorResponse{Payload: payload})
+}
+
+func tokenizerForCodexModel(model string) (tokenizer.Codec, error) {
+	sanitized := strings.ToLower(strings.TrimSpace(model))
+	switch {
+	case sanitized == "":
+		return tokenizer.Get(tokenizer.Cl100kBase)
+	case strings.HasPrefix(sanitized, "gpt-5"):
+		return tokenizer.ForModel(tokenizer.GPT5)
+	case strings.HasPrefix(sanitized, "gpt-4.1"):
+		return tokenizer.ForModel(tokenizer.GPT41)
+	case strings.HasPrefix(sanitized, "gpt-4o"):
+		return tokenizer.ForModel(tokenizer.GPT4o)
+	case strings.HasPrefix(sanitized, "gpt-4"):
+		return tokenizer.ForModel(tokenizer.GPT4)
+	case strings.HasPrefix(sanitized, "gpt-3.5"), strings.HasPrefix(sanitized, "gpt-3"):
+		return tokenizer.ForModel(tokenizer.GPT35Turbo)
+	default:
+		return tokenizer.Get(tokenizer.Cl100kBase)
+	}
+}
+
+func countCodexInputTokens(enc tokenizer.Codec, body []byte) (int64, error) {
+	if enc == nil {
+		return 0, fmt.Errorf("encoder is nil")
+	}
+	if len(body) == 0 {
+		return 0, nil
+	}
+	root := gjson.ParseBytes(body)
+	segments := make([]string, 0, 16)
+	if instructions := strings.TrimSpace(root.Get("instructions").String()); instructions != "" {
+		segments = append(segments, instructions)
+	}
+	for _, item := range root.Get("input").Array() {
+		switch item.Get("type").String() {
+		case "message":
+			for _, part := range item.Get("content").Array() {
+				if text := strings.TrimSpace(part.Get("text").String()); text != "" {
+					segments = append(segments, text)
+				}
+			}
+		case "function_call":
+			segments = appendNonEmpty(segments, item.Get("name").String(), item.Get("arguments").String())
+		case "function_call_output":
+			segments = appendNonEmpty(segments, item.Get("output").String())
+		default:
+			segments = appendNonEmpty(segments, item.Get("text").String())
+		}
+	}
+	for _, tool := range root.Get("tools").Array() {
+		segments = appendNonEmpty(segments, tool.Get("name").String(), tool.Get("description").String())
+		if parameters := tool.Get("parameters"); parameters.Exists() {
+			value := parameters.Raw
+			if parameters.Type == gjson.String {
+				value = parameters.String()
+			}
+			segments = appendNonEmpty(segments, value)
+		}
+	}
+	if format := root.Get("text.format"); format.Exists() {
+		segments = appendNonEmpty(segments, format.Get("name").String())
+		if schema := format.Get("schema"); schema.Exists() {
+			value := schema.Raw
+			if schema.Type == gjson.String {
+				value = schema.String()
+			}
+			segments = appendNonEmpty(segments, value)
+		}
+	}
+	text := strings.Join(segments, "\n")
+	if text == "" {
+		return 0, nil
+	}
+	count, errCount := enc.Count(text)
+	return int64(count), errCount
+}
+
+func appendNonEmpty(dst []string, values ...string) []string {
+	for _, value := range values {
+		if value = strings.TrimSpace(value); value != "" {
+			dst = append(dst, value)
+		}
+	}
+	return dst
+}
+
 func runCodexExecution(ctx context.Context, req rpcExecutorRequest, cfg pluginConfig, stream bool) (pluginapi.ExecutorResponse, codexExecutionOutcome, error) {
 	settings, errSettings := resolveCodexAuthSettings(req, cfg)
 	if errSettings != nil {
@@ -118,17 +255,17 @@ func runCodexExecution(ctx context.Context, req rpcExecutorRequest, cfg pluginCo
 	if errBase != nil {
 		return pluginapi.ExecutorResponse{}, codexExecutionOutcome{}, errBase
 	}
-	pool, errPool := runtime.pools.acquire(baseURL, settings.ProxyURL, cfg)
+	pool, errPool := runtime.pools.acquireForRequest(baseURL, settings.ProxyURL, cfg)
 	if errPool != nil {
 		return pluginapi.ExecutorResponse{}, codexExecutionOutcome{}, errPool
 	}
-	pool.recordRequestStart()
+	defer pool.recordRequestDone()
 	requestBody, errBody := prepareCodexRequestBody(req, model)
 	if errBody != nil {
 		pool.recordFailure(errBody)
 		return pluginapi.ExecutorResponse{}, codexExecutionOutcome{AuthID: settings.AuthID, Model: model, UpstreamURL: baseURL, ProxyURL: settings.ProxyURL, PoolKey: pool.key, Stream: stream}, errBody
 	}
-	headers := buildCodexRequestHeaders(req, settings, stream)
+	headers := buildCodexRequestHeaders(req, settings)
 	outcome := codexExecutionOutcome{
 		AuthID:      settings.AuthID,
 		Model:       model,
@@ -311,16 +448,25 @@ func resolveCodexAuthSettings(req rpcExecutorRequest, cfg pluginConfig) (codexAu
 	settings := codexAuthSettings{
 		AuthID: req.AuthID,
 	}
-	settings.BaseURL = firstStringFromSources(req.StorageJSON, req.AuthMetadata, req.AuthAttributes, "base_url")
-	if settings.BaseURL == "" {
-		settings.BaseURL = cfg.BaseURL
+	storage := decodeStringMap(req.StorageJSON)
+	configuredBaseURL := strings.TrimSpace(cfg.BaseURL)
+	if configuredBaseURL == "" {
+		configuredBaseURL = defaultCodexResponsesURL
 	}
-	if settings.BaseURL == "" {
-		settings.BaseURL = defaultCodexResponsesURL
+	settings.BaseURL = configuredBaseURL
+	if authBaseURL := firstStringFromSources(storage, req.AuthMetadata, req.AuthAttributes, "base_url"); authBaseURL != "" {
+		allowed, errAllowed := sameCodexOrigin(authBaseURL, configuredBaseURL)
+		if errAllowed != nil {
+			return settings, newPluginError("invalid_base_url", http.StatusBadRequest, false, errAllowed.Error(), errAllowed)
+		}
+		if !allowed {
+			return settings, newPluginError("invalid_base_url", http.StatusBadRequest, false, "oauth base_url must match the configured Codex origin", nil)
+		}
+		settings.BaseURL = authBaseURL
 	}
-	settings.AccessToken = firstStringFromSources(req.StorageJSON, req.AuthMetadata, req.AuthAttributes, "access_token")
-	settings.AccountID = firstStringFromSources(req.StorageJSON, req.AuthMetadata, req.AuthAttributes, "account_id")
-	settings.ProxyURL = firstStringFromSources(req.StorageJSON, req.AuthMetadata, req.AuthAttributes, "proxy_url")
+	settings.AccessToken = firstStringFromSources(storage, req.AuthMetadata, req.AuthAttributes, "access_token")
+	settings.AccountID = firstStringFromSources(storage, req.AuthMetadata, req.AuthAttributes, "account_id")
+	settings.ProxyURL = firstStringFromSources(storage, req.AuthMetadata, req.AuthAttributes, "proxy_url")
 	if settings.AccessToken == "" {
 		return settings, newPluginError("auth_not_found", http.StatusServiceUnavailable, false, "no oauth access token available", nil)
 	}
@@ -362,59 +508,82 @@ func prepareCodexRequestBody(req rpcExecutorRequest, model string) ([]byte, erro
 	return updated, nil
 }
 
-func buildCodexRequestHeaders(req rpcExecutorRequest, settings codexAuthSettings, stream bool) http.Header {
+func buildCodexRequestHeaders(req rpcExecutorRequest, settings codexAuthSettings) http.Header {
 	headers := sanitizeForwardHeaders(req.Headers)
 	headers.Set("Content-Type", "application/json")
 	headers.Set("Authorization", "Bearer "+settings.AccessToken)
 	headers.Set("Connection", "Keep-Alive")
-	if stream {
-		headers.Set("Accept", "text/event-stream")
-	} else {
-		headers.Set("Accept", "application/json")
-	}
+	// Codex Responses returns SSE upstream even when the plugin aggregates it for a non-streaming client.
+	headers.Set("Accept", "text/event-stream")
 	if headers.Get("User-Agent") == "" {
-		headers.Set("User-Agent", config.DefaultCodexHeaderUserAgent)
+		headers.Set("User-Agent", defaultCodexUserAgent)
 	}
 	if headers.Get("Originator") == "" {
-		headers.Set("Originator", config.DefaultCodexHeaderOriginator)
+		headers.Set("Originator", defaultCodexOriginator)
 	}
 	if headers.Get("Version") == "" {
-		headers.Set("Version", config.DefaultCodexHeaderVersion)
+		headers.Set("Version", defaultCodexVersion)
 	}
 	if headers.Get("X-Codex-Beta-Features") == "" {
-		headers.Set("X-Codex-Beta-Features", config.DefaultCodexHeaderBetaFeatures)
+		headers.Set("X-Codex-Beta-Features", defaultCodexBetaFeatures)
 	}
 	if settings.AccountID != "" {
 		headers.Set("Chatgpt-Account-Id", settings.AccountID)
 	}
-	util.ApplyCustomHeadersFromAttrs(&http.Request{Header: headers}, req.AuthAttributes)
+	applyAuthHeaderOverrides(headers, req.AuthAttributes)
 	return headers
 }
 
 func sanitizeForwardHeaders(src http.Header) http.Header {
-	dst := cloneHeaders(src)
-	if dst == nil {
-		dst = make(http.Header)
-	}
-	for _, key := range []string{"Authorization", "Proxy-Authorization", "Cookie", "Set-Cookie", "Content-Length", "Host"} {
-		dst.Del(key)
+	dst := make(http.Header)
+	for _, key := range []string{
+		"User-Agent",
+		"Originator",
+		"Version",
+		"X-Codex-Beta-Features",
+		"X-Codex-Turn-Metadata",
+		"X-Client-Request-Id",
+		"Session-Id",
+		"Conversation-Id",
+		"Thread-Id",
+		"X-Codex-Window-Id",
+	} {
+		if values := src.Values(key); len(values) > 0 {
+			dst[key] = append([]string(nil), values...)
+		}
 	}
 	return dst
 }
 
 func sanitizeResponseHeaders(src http.Header, stream bool) http.Header {
-	dst := cloneHeaders(src)
-	if dst == nil {
-		dst = make(http.Header)
+	dst := make(http.Header)
+	for key, values := range src {
+		normalized := strings.ToLower(strings.TrimSpace(key))
+		if normalized == "content-type" || normalized == "retry-after" || normalized == "x-request-id" ||
+			strings.HasPrefix(normalized, "x-ratelimit-") || strings.HasPrefix(normalized, "openai-") {
+			dst[key] = append([]string(nil), values...)
+		}
 	}
-	dst.Del("Content-Length")
-	dst.Del("Transfer-Encoding")
 	if stream {
 		dst.Set("Content-Type", "text/event-stream")
 	} else {
 		dst.Set("Content-Type", "application/json")
 	}
 	return dst
+}
+
+func applyAuthHeaderOverrides(headers http.Header, attrs map[string]string) {
+	for key, value := range attrs {
+		if !strings.HasPrefix(key, "header:") {
+			continue
+		}
+		name := strings.TrimSpace(strings.TrimPrefix(key, "header:"))
+		value = strings.TrimSpace(value)
+		if name == "" || value == "" || strings.EqualFold(name, "Host") || strings.EqualFold(name, "Content-Length") {
+			continue
+		}
+		headers.Set(name, value)
+	}
 }
 
 func collectCodexOutputItemDone(eventData []byte, outputItemsByIndex map[int64][]byte, outputItemsFallback *[][]byte) {
@@ -514,8 +683,8 @@ func rebuildSSELine(original []byte, patched []byte) []byte {
 	return append(out, suffix...)
 }
 
-func firstStringFromSources(storageJSON []byte, metadata map[string]any, attrs map[string]string, key string) string {
-	if value := firstStringFromJSON(storageJSON, key); value != "" {
+func firstStringFromSources(storageJSON map[string]any, metadata map[string]any, attrs map[string]string, key string) string {
+	if value := firstStringFromAnyMap(storageJSON, key); value != "" {
 		return value
 	}
 	if value := firstStringFromAnyMap(metadata, key); value != "" {
@@ -527,6 +696,17 @@ func firstStringFromSources(storageJSON []byte, metadata map[string]any, attrs m
 		}
 	}
 	return ""
+}
+
+func decodeStringMap(raw []byte) map[string]any {
+	if len(raw) == 0 {
+		return nil
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return nil
+	}
+	return parsed
 }
 
 func firstStringFromJSON(raw []byte, key string) string {
@@ -587,7 +767,7 @@ func logCodexStart(callbackID string, outcome codexExecutionOutcome) {
 		"plugin_id": pluginIdentifier,
 		"auth_id":   outcome.AuthID,
 		"base_url":  outcome.UpstreamURL,
-		"proxy":     maskProxyURL(outcome.ProxyURL),
+		"proxy":     proxyutil.Redact(outcome.ProxyURL),
 		"pool_key":  outcome.PoolKey,
 		"stream":    outcome.Stream,
 		"model":     outcome.Model,
@@ -599,7 +779,7 @@ func logCodexCompletion(callbackID string, outcome codexExecutionOutcome, err er
 		"plugin_id":   pluginIdentifier,
 		"auth_id":     outcome.AuthID,
 		"base_url":    outcome.UpstreamURL,
-		"proxy":       maskProxyURL(outcome.ProxyURL),
+		"proxy":       proxyutil.Redact(outcome.ProxyURL),
 		"pool_key":    outcome.PoolKey,
 		"stream":      outcome.Stream,
 		"model":       outcome.Model,
@@ -630,7 +810,7 @@ func logCodexFailure(callbackID string, outcome codexExecutionOutcome, err error
 		"plugin_id": pluginIdentifier,
 		"auth_id":   outcome.AuthID,
 		"base_url":  outcome.UpstreamURL,
-		"proxy":     maskProxyURL(outcome.ProxyURL),
+		"proxy":     proxyutil.Redact(outcome.ProxyURL),
 		"pool_key":  outcome.PoolKey,
 		"stream":    outcome.Stream,
 		"model":     outcome.Model,
