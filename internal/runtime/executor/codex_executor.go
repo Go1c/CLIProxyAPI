@@ -1455,41 +1455,21 @@ type codexIdentityReplacement struct {
 }
 
 func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Format, url string, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, userPayload []byte, rawJSON []byte) (*http.Request, []byte, codexIdentityConfuseState, error) {
-	var cache helps.CodexCache
-	if sourceFormatEqual(from, sdktranslator.FormatClaude) {
-		cached, ok, errCache := helps.ClaudeCodePromptCache(ctx, req.Model, req.Payload, nil)
-		if errCache != nil {
-			return nil, nil, codexIdentityConfuseState{}, errCache
-		}
-		if ok {
-			cache = cached
-		}
-	} else if sourceFormatEqual(from, sdktranslator.FormatOpenAIResponse) {
-		promptCacheKey := gjson.GetBytes(req.Payload, "prompt_cache_key")
-		if promptCacheKey.Exists() {
-			cache.ID = promptCacheKey.String()
-		}
-	} else if sourceFormatEqual(from, sdktranslator.FormatOpenAI) {
-		if apiKey := strings.TrimSpace(helps.APIKeyFromContext(ctx)); apiKey != "" {
-			cache.ID = uuid.NewSHA1(uuid.NameSpaceOID, []byte("cli-proxy-api:codex:prompt-cache:"+apiKey)).String()
-		}
+	assembly, errAssembly := helps.ApplyCodexCacheAssembly(ctx, from, req.Model, req.Payload, rawJSON, nil)
+	if errAssembly != nil {
+		return nil, nil, codexIdentityConfuseState{}, errAssembly
 	}
-
-	if cache.ID != "" {
-		rawJSON, _ = sjson.SetBytes(rawJSON, "prompt_cache_key", cache.ID)
-	}
+	rawJSON = assembly.Body
 	var identityState codexIdentityConfuseState
 	rawJSON, identityState = applyCodexIdentityConfuseBody(e.cfg, auth, userPayload, rawJSON)
 	if identityState.promptCacheKey != "" {
-		cache.ID = identityState.promptCacheKey
+		assembly.Headers.Set("Session_id", identityState.promptCacheKey)
 	}
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(rawJSON))
 	if err != nil {
 		return nil, nil, codexIdentityConfuseState{}, err
 	}
-	if cache.ID != "" {
-		httpReq.Header.Set("Session_id", cache.ID)
-	}
+	httpReq.Header = assembly.Headers
 	return httpReq, rawJSON, identityState, nil
 }
 
@@ -1603,11 +1583,7 @@ func replaceCodexIdentityResponsePayload(payload []byte, from string, to string)
 }
 
 func codexIdentityConfuseEnabled(cfg *config.Config) bool {
-	if cfg == nil || !cfg.Codex.IdentityConfuse {
-		return false
-	}
-	strategy := strings.ToLower(strings.TrimSpace(cfg.Routing.Strategy))
-	return cfg.Routing.SessionAffinity || strategy == "fill-first" || strategy == "fillfirst" || strategy == "ff"
+	return helps.CodexIdentityConfuseEnabled(cfg)
 }
 
 func codexIdentityConfuseUUID(authID string, kind string, value string) string {

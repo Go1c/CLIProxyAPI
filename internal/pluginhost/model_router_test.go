@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"testing"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
@@ -129,6 +130,29 @@ func TestHostRouteModelAllowsExplicitExecutorPluginTarget(t *testing.T) {
 	resp, ok := host.RouteModel(context.Background(), pluginapi.ModelRouteRequest{RequestedModel: "original-model"})
 	if !ok || !resp.Handled || resp.Target != "executor" {
 		t.Fatalf("RouteModel() = %#v, %v; want executor target handled", resp, ok)
+	}
+}
+
+func TestHostRouteModelSkipsCodexExecutorWhenIdentityConfuseIsActive(t *testing.T) {
+	host := newRouteModelHostWithRecords(capabilityRecord{
+		id: "codex-executor",
+		plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
+			Executor:              &fakeExecutor{identifier: "codex"},
+			ExecutorInputFormats:  []string{"codex"},
+			ExecutorOutputFormats: []string{"codex"},
+			ModelRouter: modelRouterFunc(func(context.Context, pluginapi.ModelRouteRequest) (pluginapi.ModelRouteResponse, error) {
+				return pluginapi.ModelRouteResponse{Handled: true, TargetKind: pluginapi.ModelRouteTargetSelf}, nil
+			}),
+		}},
+	})
+	host.runtimeConfig = &config.Config{
+		Routing: config.RoutingConfig{Strategy: "fill-first"},
+		Codex:   config.CodexConfig{IdentityConfuse: true},
+	}
+
+	resp, ok := host.RouteModel(context.Background(), pluginapi.ModelRouteRequest{SourceFormat: "openai", RequestedModel: "gpt-5.4"})
+	if ok || resp.Handled {
+		t.Fatalf("RouteModel() = %#v, %v; want native fallback", resp, ok)
 	}
 }
 

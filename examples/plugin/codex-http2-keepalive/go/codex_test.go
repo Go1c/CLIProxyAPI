@@ -105,6 +105,35 @@ func TestHeaderSanitizersDoNotForwardCredentialsOrCookies(t *testing.T) {
 	}
 }
 
+func TestSanitizeForwardHeadersPreservesCodexSessionHeaderVariants(t *testing.T) {
+	for _, key := range []string{"session_id", "Session_id", "Session-Id", "conversation_id", "Conversation-Id"} {
+		t.Run(key, func(t *testing.T) {
+			forwarded := sanitizeForwardHeaders(http.Header{key: []string{"affinity-1"}})
+			if got := forwarded[key]; len(got) != 1 || got[0] != "affinity-1" {
+				t.Fatalf("forwarded[%q] = %#v, want [affinity-1]", key, got)
+			}
+		})
+	}
+}
+
+func TestCodexExecutorRequestHeaderKeySurvivesJSONRoundTrip(t *testing.T) {
+	original := rpcExecutorRequest{ExecutorRequest: pluginapi.ExecutorRequest{
+		Headers: http.Header{"session_id": []string{"cache-1"}},
+	}}
+	raw, errMarshal := json.Marshal(original)
+	if errMarshal != nil {
+		t.Fatalf("json.Marshal() error = %v", errMarshal)
+	}
+	var decoded rpcExecutorRequest
+	if errUnmarshal := json.Unmarshal(raw, &decoded); errUnmarshal != nil {
+		t.Fatalf("json.Unmarshal() error = %v", errUnmarshal)
+	}
+	forwarded := sanitizeForwardHeaders(decoded.Headers)
+	if got := forwarded["session_id"]; len(got) != 1 || got[0] != "cache-1" {
+		t.Fatalf("session_id after round trip = %#v, want [cache-1]", got)
+	}
+}
+
 func TestProcessCodexResponseStreamsPatchedEvents(t *testing.T) {
 	var emitted [][]byte
 	withHostCallStub(t, func(method string, payload any) (json.RawMessage, error) {

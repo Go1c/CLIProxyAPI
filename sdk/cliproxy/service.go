@@ -144,6 +144,21 @@ var registerPluginExecutors = func(host *pluginhost.Host, manager *coreauth.Mana
 	host.RegisterExecutors(manager, registry.GetGlobalRegistry())
 }
 
+func codexPluginExecutorRequestDecorator(ctx context.Context, _ *coreauth.Auth, decoration pluginhost.ExecutorRequestDecoration) (pluginhost.ExecutorRequestDecoration, error) {
+	assembly, errAssembly := helps.ApplyCodexCacheAssembly(ctx, decoration.SourceFormat, decoration.Model, decoration.SourcePayload, decoration.Payload, decoration.Headers)
+	if errAssembly != nil {
+		return pluginhost.ExecutorRequestDecoration{}, fmt.Errorf("assemble Codex plugin prompt cache: %w", errAssembly)
+	}
+	decoration.Payload = assembly.Body
+	decoration.Headers = assembly.Headers
+	log.WithFields(log.Fields{
+		"cache_key_present":  assembly.CacheKeyPresent,
+		"cache_key_source":   assembly.Source,
+		"session_header_key": assembly.SessionHeaderKey,
+	}).Debug("codex plugin executor request cache assembly")
+	return decoration, nil
+}
+
 // RegisterUsagePlugin registers a usage plugin on the global usage manager.
 // This allows external code to monitor API usage and token consumption.
 //

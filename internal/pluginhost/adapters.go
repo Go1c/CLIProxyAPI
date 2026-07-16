@@ -1605,6 +1605,10 @@ func (a *executorAdapter) Execute(ctx context.Context, auth *coreauth.Auth, req 
 	if errPrepare != nil {
 		return coreexecutor.Response{}, errPrepare
 	}
+	prepared, errPrepare = a.decorateExecutorCall(ctx, auth, req, prepared)
+	if errPrepare != nil {
+		return coreexecutor.Response{}, errPrepare
+	}
 	pluginResp, errExecute := a.executor.Execute(ctx, buildExecutorRequest(a.host, a.provider, auth, prepared.req, prepared.opts))
 	if errExecute != nil {
 		return coreexecutor.Response{}, errExecute
@@ -1629,6 +1633,10 @@ func (a *executorAdapter) ExecuteStream(ctx context.Context, auth *coreauth.Auth
 	}()
 
 	prepared, errPrepare := a.prepareExecutorCall(req, opts)
+	if errPrepare != nil {
+		return nil, errPrepare
+	}
+	prepared, errPrepare = a.decorateExecutorCall(ctx, auth, req, prepared)
 	if errPrepare != nil {
 		return nil, errPrepare
 	}

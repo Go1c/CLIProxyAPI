@@ -61,6 +61,7 @@ type Host struct {
 	modelRegistrations     map[string]pluginModelRegistration
 	providerModels         map[string][]*registryModelInfo
 	executorProviders      map[string]struct{}
+	executorDecorators     map[string]ExecutorRequestDecorator
 	accessProviderKeys     map[string]struct{}
 	commandLineFlags       map[string]commandLineFlagRecord
 	commandLineHits        map[string]struct{}
@@ -90,6 +91,7 @@ func New() *Host {
 		modelRegistrations:     make(map[string]pluginModelRegistration),
 		providerModels:         make(map[string][]*registryModelInfo),
 		executorProviders:      make(map[string]struct{}),
+		executorDecorators:     make(map[string]ExecutorRequestDecorator),
 		accessProviderKeys:     make(map[string]struct{}),
 		commandLineFlags:       make(map[string]commandLineFlagRecord),
 		commandLineHits:        make(map[string]struct{}),
@@ -311,6 +313,7 @@ func (h *Host) ApplyConfig(ctx context.Context, cfg *config.Config) {
 	h.snapshot.Store(&Snapshot{enabled: true, records: records})
 	h.mu.Unlock()
 	h.refreshThinkingProviders(records)
+	h.warnCodexExecutorIdentityConfuseFallback()
 	for _, fields := range hotReloadLogs {
 		log.WithFields(fields).Info("pluginhost: plugin hot reloaded")
 	}

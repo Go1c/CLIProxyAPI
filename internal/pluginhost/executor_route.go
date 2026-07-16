@@ -7,10 +7,12 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
+	log "github.com/sirupsen/logrus"
 )
 
 // executorPluginReady reports whether the named plugin can actually execute a
@@ -26,6 +28,9 @@ func (h *Host) executorPluginReady(pluginID string, routeReq pluginapi.ModelRout
 	}
 	pluginID = strings.TrimSpace(pluginID)
 	if pluginID == "" {
+		return false
+	}
+	if h.executorPluginBlockedByCodexIdentityConfuse(pluginID) {
 		return false
 	}
 	for _, record := range h.activeRecords() {
@@ -58,6 +63,28 @@ func (h *Host) executorPluginReady(pluginID string, routeReq pluginapi.ModelRout
 		)
 	}
 	return false
+}
+
+func (h *Host) executorPluginBlockedByCodexIdentityConfuse(pluginID string) bool {
+	if h == nil || !helps.CodexIdentityConfuseEnabled(h.currentRuntimeConfig()) {
+		return false
+	}
+	pluginID = strings.TrimSpace(pluginID)
+	for _, record := range h.activeRecords() {
+		if record.id != pluginID || h.isPluginFused(record.id) || record.plugin.Capabilities.Executor == nil {
+			continue
+		}
+		provider, okProvider := h.executorProvider(record, record.plugin.Capabilities.Executor)
+		return okProvider && provider == "codex"
+	}
+	return false
+}
+
+func (h *Host) warnCodexExecutorIdentityConfuseFallback() {
+	if h == nil || !helps.CodexIdentityConfuseEnabled(h.currentRuntimeConfig()) || !h.HasExecutorCandidateProvider("codex") {
+		return
+	}
+	log.WithField("provider", "codex").Warn("pluginhost: Codex executor plugins are disabled while identity-confuse is active; requests will use the native executor")
 }
 
 func (a *executorAdapter) supportsExecutorFormats(req coreexecutor.Request, opts coreexecutor.Options) bool {

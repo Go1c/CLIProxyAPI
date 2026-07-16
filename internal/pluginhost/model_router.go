@@ -61,6 +61,9 @@ func (h *Host) RouteModelExcept(ctx context.Context, req pluginapi.ModelRouteReq
 			}
 			return resp, true
 		case pluginapi.ModelRouteTargetSelf, pluginapi.ModelRouteTargetExecutor:
+			if h.executorPluginBlockedByCodexIdentityConfuse(resp.Target) {
+				continue
+			}
 			if !h.executorPluginReady(resp.Target, nextReq) {
 				log.WithFields(log.Fields{"plugin_id": record.id, "target_plugin_id": resp.Target}).Warn("pluginhost: model router returned unavailable executor plugin")
 				continue

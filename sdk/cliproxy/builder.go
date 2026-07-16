@@ -218,6 +218,7 @@ func (b *Builder) Build() (*Service, error) {
 	if pluginHost == nil {
 		pluginHost = pluginhost.New()
 	}
+	pluginHost.RegisterExecutorRequestDecorator("codex", codexPluginExecutorRequestDecorator)
 	if b.cfg != nil {
 		pluginHost.ApplyConfig(context.Background(), b.cfg)
 		pluginHost.RegisterFrontendAuthProviders()

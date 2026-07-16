@@ -51,17 +51,18 @@ type codexProcessState struct {
 }
 
 type codexExecutionOutcome struct {
-	AuthID      string
-	Model       string
-	UpstreamURL string
-	ProxyURL    string
-	PoolKey     string
-	Usage       codexUsageSummary
-	TTFT        time.Duration
-	Duration    time.Duration
-	StatusCode  int
-	Attempts    int
-	Stream      bool
+	AuthID          string
+	Model           string
+	UpstreamURL     string
+	ProxyURL        string
+	PoolKey         string
+	Usage           codexUsageSummary
+	TTFT            time.Duration
+	Duration        time.Duration
+	StatusCode      int
+	Attempts        int
+	Stream          bool
+	CacheKeyPresent bool
 }
 
 func execute(raw []byte) ([]byte, error) {
@@ -267,12 +268,13 @@ func runCodexExecution(ctx context.Context, req rpcExecutorRequest, cfg pluginCo
 	}
 	headers := buildCodexRequestHeaders(req, settings)
 	outcome := codexExecutionOutcome{
-		AuthID:      settings.AuthID,
-		Model:       model,
-		UpstreamURL: baseURL,
-		ProxyURL:    settings.ProxyURL,
-		PoolKey:     pool.key,
-		Stream:      stream,
+		AuthID:          settings.AuthID,
+		Model:           model,
+		UpstreamURL:     baseURL,
+		ProxyURL:        settings.ProxyURL,
+		PoolKey:         pool.key,
+		Stream:          stream,
+		CacheKeyPresent: strings.TrimSpace(gjson.GetBytes(requestBody, "prompt_cache_key").String()) != "",
 	}
 	logCodexStart(req.HostCallbackID, outcome)
 	var attempt int
@@ -536,23 +538,27 @@ func buildCodexRequestHeaders(req rpcExecutorRequest, settings codexAuthSettings
 
 func sanitizeForwardHeaders(src http.Header) http.Header {
 	dst := make(http.Header)
-	for _, key := range []string{
-		"User-Agent",
-		"Originator",
-		"Version",
-		"X-Codex-Beta-Features",
-		"X-Codex-Turn-Metadata",
-		"X-Client-Request-Id",
-		"Session-Id",
-		"Conversation-Id",
-		"Thread-Id",
-		"X-Codex-Window-Id",
-	} {
-		if values := src.Values(key); len(values) > 0 {
-			dst[key] = append([]string(nil), values...)
+	for key, values := range src {
+		normalized := strings.ReplaceAll(strings.ToLower(strings.TrimSpace(key)), "_", "-")
+		if _, ok := codexForwardHeaderAllowlist[normalized]; !ok {
+			continue
 		}
+		dst[key] = append([]string(nil), values...)
 	}
 	return dst
+}
+
+var codexForwardHeaderAllowlist = map[string]struct{}{
+	"user-agent":            {},
+	"originator":            {},
+	"version":               {},
+	"x-codex-beta-features": {},
+	"x-codex-turn-metadata": {},
+	"x-client-request-id":   {},
+	"session-id":            {},
+	"conversation-id":       {},
+	"thread-id":             {},
+	"x-codex-window-id":     {},
 }
 
 func sanitizeResponseHeaders(src http.Header, stream bool) http.Header {
@@ -764,13 +770,14 @@ func isRetryableError(err error) bool {
 
 func logCodexStart(callbackID string, outcome codexExecutionOutcome) {
 	_ = logPluginEvent(callbackID, "info", "codex request start", map[string]any{
-		"plugin_id": pluginIdentifier,
-		"auth_id":   outcome.AuthID,
-		"base_url":  outcome.UpstreamURL,
-		"proxy":     proxyutil.Redact(outcome.ProxyURL),
-		"pool_key":  outcome.PoolKey,
-		"stream":    outcome.Stream,
-		"model":     outcome.Model,
+		"plugin_id":         pluginIdentifier,
+		"auth_id":           outcome.AuthID,
+		"base_url":          outcome.UpstreamURL,
+		"proxy":             proxyutil.Redact(outcome.ProxyURL),
+		"pool_key":          outcome.PoolKey,
+		"stream":            outcome.Stream,
+		"model":             outcome.Model,
+		"cache_key_present": outcome.CacheKeyPresent,
 	})
 }
 
