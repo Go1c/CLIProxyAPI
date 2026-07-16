@@ -1593,6 +1593,10 @@ func (a *executorAdapter) Execute(ctx context.Context, auth *coreauth.Auth, req 
 	if a == nil || a.executor == nil || a.host.isPluginFused(a.pluginID) || !a.host.pluginIdentityCurrent(a.pluginID, a.path, a.version) {
 		return coreexecutor.Response{}, fmt.Errorf("plugin executor %s is unavailable", a.Identifier())
 	}
+	usageReporter := a.codexUsageReporter(ctx, auth, req.Model)
+	if usageReporter != nil {
+		defer usageReporter.TrackFailure(ctx, &err)
+	}
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			a.host.fusePlugin(a.pluginID, "Executor.Execute", recovered)
@@ -1609,10 +1613,14 @@ func (a *executorAdapter) Execute(ctx context.Context, auth *coreauth.Auth, req 
 	if errPrepare != nil {
 		return coreexecutor.Response{}, errPrepare
 	}
+	if usageReporter != nil {
+		usageReporter.SetTranslatedReasoningEffort(prepared.req.Payload, prepared.inputFormat.String())
+	}
 	pluginResp, errExecute := a.executor.Execute(ctx, buildExecutorRequest(a.host, a.provider, auth, prepared.req, prepared.opts))
 	if errExecute != nil {
 		return coreexecutor.Response{}, errExecute
 	}
+	publishCodexPluginNonStreamUsage(ctx, usageReporter, pluginResp.Payload)
 	return coreexecutor.Response{
 		Payload:  a.translateExecutorResponse(ctx, prepared, pluginResp.Payload, false, nil),
 		Metadata: cloneAnyMap(pluginResp.Metadata),
@@ -1623,6 +1631,10 @@ func (a *executorAdapter) Execute(ctx context.Context, auth *coreauth.Auth, req 
 func (a *executorAdapter) ExecuteStream(ctx context.Context, auth *coreauth.Auth, req coreexecutor.Request, opts coreexecutor.Options) (result *coreexecutor.StreamResult, err error) {
 	if a == nil || a.executor == nil || a.host.isPluginFused(a.pluginID) || !a.host.pluginIdentityCurrent(a.pluginID, a.path, a.version) {
 		return nil, fmt.Errorf("plugin executor %s is unavailable", a.Identifier())
+	}
+	usageReporter := a.codexUsageReporter(ctx, auth, req.Model)
+	if usageReporter != nil {
+		defer usageReporter.TrackFailure(ctx, &err)
 	}
 	defer func() {
 		if recovered := recover(); recovered != nil {
@@ -1640,13 +1652,18 @@ func (a *executorAdapter) ExecuteStream(ctx context.Context, auth *coreauth.Auth
 	if errPrepare != nil {
 		return nil, errPrepare
 	}
+	if usageReporter != nil {
+		usageReporter.SetTranslatedReasoningEffort(prepared.req.Payload, prepared.inputFormat.String())
+		usageReporter.StartResponseTTFT()
+	}
 	pluginResp, errExecuteStream := a.executor.ExecuteStream(ctx, buildExecutorRequest(a.host, a.provider, auth, prepared.req, prepared.opts))
 	if errExecuteStream != nil {
 		return nil, errExecuteStream
 	}
 	return &coreexecutor.StreamResult{
 		Headers: cloneHeader(pluginResp.Headers),
-		Chunks:  mapExecutorStreamChunks(ctx, a.translateExecutorStreamChunks(ctx, prepared, pluginResp.Chunks)),
+		Chunks: mapExecutorStreamChunks(ctx, a.translateExecutorStreamChunks(ctx, prepared,
+			observeCodexPluginStreamUsage(ctx, usageReporter, pluginResp.Chunks))),
 	}, nil
 }
 
