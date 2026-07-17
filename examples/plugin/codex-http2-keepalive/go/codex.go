@@ -360,7 +360,11 @@ func processCodexResponse(ctx context.Context, resp *http.Response, requestStart
 	for {
 		line, errRead := reader.ReadBytes('\n')
 		if len(line) > 0 {
-			raw.Write(line)
+			// raw only feeds the non-SSE fallback below; once SSE is detected,
+			// buffering the stream would hold the full transcript in memory.
+			if !state.sawSSE {
+				raw.Write(line)
+			}
 			outLine, done, errHandle := processCodexLine(&state, line, requestStarted, stream)
 			if stream && len(outLine) > 0 {
 				if errEmit := emitPluginStreamChunk(req.StreamID, outLine); errEmit != nil {
@@ -535,6 +539,24 @@ func stripUnsupportedCodexResponsesFields(body []byte) []byte {
 	for _, field := range unsupportedCodexResponsesFields {
 		body, _ = sjson.DeleteBytes(body, field)
 	}
+	// Codex internal upstream accepts service_tier only for priority processing.
+	if tier := gjson.GetBytes(body, "service_tier"); tier.Exists() && tier.String() != "priority" {
+		body, _ = sjson.DeleteBytes(body, "service_tier")
+	}
+	return normalizeCodexParallelToolCallsForTools(body)
+}
+
+// normalizeCodexParallelToolCallsForTools mirrors the codex_executor helper of the
+// same name: upstream rejects parallel_tool_calls when the request carries no tools.
+func normalizeCodexParallelToolCallsForTools(body []byte) []byte {
+	if !gjson.GetBytes(body, "parallel_tool_calls").Exists() {
+		return body
+	}
+	tools := gjson.GetBytes(body, "tools")
+	if tools.Exists() && tools.IsArray() && len(tools.Array()) > 0 {
+		return body
+	}
+	body, _ = sjson.DeleteBytes(body, "parallel_tool_calls")
 	return body
 }
 

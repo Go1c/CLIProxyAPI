@@ -79,6 +79,60 @@ func TestPrepareCodexRequestBodyStripsUnsupportedResponsesFields(t *testing.T) {
 	}
 }
 
+func TestPrepareCodexRequestBodyServiceTier(t *testing.T) {
+	dropped, err := prepareCodexRequestBody(rpcExecutorRequest{
+		ExecutorRequest: pluginapi.ExecutorRequest{Payload: []byte(`{"model":"gpt-5.3-codex","service_tier":"default","input":[]}`)},
+	}, "")
+	if err != nil {
+		t.Fatalf("prepareCodexRequestBody() error = %v", err)
+	}
+	if gjson.GetBytes(dropped, "service_tier").Exists() {
+		t.Fatalf("non-priority service_tier leaked to upstream body: %s", dropped)
+	}
+
+	kept, err := prepareCodexRequestBody(rpcExecutorRequest{
+		ExecutorRequest: pluginapi.ExecutorRequest{Payload: []byte(`{"model":"gpt-5.3-codex","service_tier":"priority","input":[]}`)},
+	}, "")
+	if err != nil {
+		t.Fatalf("prepareCodexRequestBody() error = %v", err)
+	}
+	if got := gjson.GetBytes(kept, "service_tier").String(); got != "priority" {
+		t.Fatalf("service_tier = %q, want preserved priority; body=%s", got, kept)
+	}
+}
+
+func TestPrepareCodexRequestBodyParallelToolCalls(t *testing.T) {
+	withoutTools, err := prepareCodexRequestBody(rpcExecutorRequest{
+		ExecutorRequest: pluginapi.ExecutorRequest{Payload: []byte(`{"model":"gpt-5.3-codex","parallel_tool_calls":true,"input":[]}`)},
+	}, "")
+	if err != nil {
+		t.Fatalf("prepareCodexRequestBody() error = %v", err)
+	}
+	if gjson.GetBytes(withoutTools, "parallel_tool_calls").Exists() {
+		t.Fatalf("parallel_tool_calls without tools leaked to upstream body: %s", withoutTools)
+	}
+
+	emptyTools, err := prepareCodexRequestBody(rpcExecutorRequest{
+		ExecutorRequest: pluginapi.ExecutorRequest{Payload: []byte(`{"model":"gpt-5.3-codex","parallel_tool_calls":true,"tools":[],"input":[]}`)},
+	}, "")
+	if err != nil {
+		t.Fatalf("prepareCodexRequestBody() error = %v", err)
+	}
+	if gjson.GetBytes(emptyTools, "parallel_tool_calls").Exists() {
+		t.Fatalf("parallel_tool_calls with empty tools leaked to upstream body: %s", emptyTools)
+	}
+
+	withTools, err := prepareCodexRequestBody(rpcExecutorRequest{
+		ExecutorRequest: pluginapi.ExecutorRequest{Payload: []byte(`{"model":"gpt-5.3-codex","parallel_tool_calls":true,"tools":[{"type":"function","name":"shell"}],"input":[]}`)},
+	}, "")
+	if err != nil {
+		t.Fatalf("prepareCodexRequestBody() error = %v", err)
+	}
+	if !gjson.GetBytes(withTools, "parallel_tool_calls").Bool() {
+		t.Fatalf("parallel_tool_calls with tools must be preserved; body=%s", withTools)
+	}
+}
+
 func TestPrepareCodexRequestBodyEmptyBody(t *testing.T) {
 	_, err := prepareCodexRequestBody(rpcExecutorRequest{}, "")
 	if err == nil {
@@ -111,6 +165,23 @@ func TestProcessCodexResponseAggregatesCompletedBody(t *testing.T) {
 	}
 	if !strings.Contains(string(result.finalBody), `"total_tokens":12`) {
 		t.Fatalf("final body = %s, want usage", result.finalBody)
+	}
+}
+
+func TestProcessCodexResponseReturnsNonSSEBody(t *testing.T) {
+	body := `{"id":"resp-json","object":"response","output":[{"type":"message","content":[{"type":"output_text","text":"plain"}]}]}`
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}
+
+	result, err := processCodexResponse(context.Background(), resp, time.Now(), rpcExecutorRequest{}, codexAuthSettings{}, false, nil)
+	if err != nil {
+		t.Fatalf("processCodexResponse() error = %v", err)
+	}
+	if string(result.finalBody) != body {
+		t.Fatalf("finalBody = %s, want full non-SSE body", result.finalBody)
 	}
 }
 
