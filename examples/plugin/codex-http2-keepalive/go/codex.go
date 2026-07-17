@@ -488,6 +488,26 @@ func resolveCodexModel(req rpcExecutorRequest) string {
 	return ""
 }
 
+// unsupportedCodexResponsesFields are top-level Responses parameters rejected by the
+// ChatGPT Codex internal upstream (chatgpt.com/backend-api/codex/responses).
+// Keep aligned with internal/runtime/executor/codex_executor.go and
+// internal/translator/codex/openai/responses/codex_openai-responses_request.go.
+var unsupportedCodexResponsesFields = []string{
+	// codex_executor strips these on the HTTP responses path.
+	"previous_response_id",
+	"prompt_cache_retention",
+	"safety_identifier",
+	"stream_options",
+	// translator strips these for Codex internal compatibility.
+	"max_output_tokens",
+	"max_completion_tokens",
+	"temperature",
+	"top_p",
+	"truncation",
+	"user",
+	"context_management",
+}
+
 func prepareCodexRequestBody(req rpcExecutorRequest, model string) ([]byte, error) {
 	body := req.Payload
 	if len(body) == 0 {
@@ -496,6 +516,7 @@ func prepareCodexRequestBody(req rpcExecutorRequest, model string) ([]byte, erro
 	if len(body) == 0 {
 		return nil, fmt.Errorf("codex request body is empty")
 	}
+	body = stripUnsupportedCodexResponsesFields(body)
 	if model != "" {
 		updated, errSet := sjson.SetBytes(body, "model", model)
 		if errSet != nil {
@@ -508,6 +529,13 @@ func prepareCodexRequestBody(req rpcExecutorRequest, model string) ([]byte, erro
 		return nil, errSet
 	}
 	return updated, nil
+}
+
+func stripUnsupportedCodexResponsesFields(body []byte) []byte {
+	for _, field := range unsupportedCodexResponsesFields {
+		body, _ = sjson.DeleteBytes(body, field)
+	}
+	return body
 }
 
 func buildCodexRequestHeaders(req rpcExecutorRequest, settings codexAuthSettings) http.Header {

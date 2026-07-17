@@ -14,6 +14,78 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+func TestPrepareCodexRequestBodyStripsUnsupportedResponsesFields(t *testing.T) {
+	// Client-origin fields that ChatGPT Codex internal upstream rejects (production 400:
+	// Unsupported parameter: safety_identifier) plus the rest of the core strip set.
+	payload := []byte(`{
+		"model": "gpt-5-codex-client",
+		"input": [{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],
+		"prompt_cache_key": "cache-keep",
+		"safety_identifier": "sid-from-cursor",
+		"prompt_cache_retention": "24h",
+		"stream_options": {"include_usage": true},
+		"previous_response_id": "resp_should_drop",
+		"user": "user-1",
+		"metadata": {"source": "test"},
+		"context_management": {"compaction": {"type":"auto"}},
+		"temperature": 0.2,
+		"top_p": 0.9,
+		"max_output_tokens": 128,
+		"max_completion_tokens": 256,
+		"truncation": "auto",
+		"stream": false
+	}`)
+	out, err := prepareCodexRequestBody(rpcExecutorRequest{
+		ExecutorRequest: pluginapi.ExecutorRequest{Payload: payload},
+	}, "gpt-5.3-codex")
+	if err != nil {
+		t.Fatalf("prepareCodexRequestBody() error = %v", err)
+	}
+
+	if got := gjson.GetBytes(out, "model").String(); got != "gpt-5.3-codex" {
+		t.Fatalf("model = %q, want gpt-5.3-codex", got)
+	}
+	if !gjson.GetBytes(out, "stream").Bool() {
+		t.Fatalf("stream = false, want true; body=%s", out)
+	}
+	if got := gjson.GetBytes(out, "prompt_cache_key").String(); got != "cache-keep" {
+		t.Fatalf("prompt_cache_key = %q, want preserved cache-keep", got)
+	}
+	if !gjson.GetBytes(out, "input").Exists() {
+		t.Fatalf("input must be preserved; body=%s", out)
+	}
+
+	for _, field := range []string{
+		"safety_identifier",
+		"prompt_cache_retention",
+		"stream_options",
+		"previous_response_id",
+		"user",
+		"context_management",
+		"temperature",
+		"top_p",
+		"max_output_tokens",
+		"max_completion_tokens",
+		"truncation",
+	} {
+		if gjson.GetBytes(out, field).Exists() {
+			t.Fatalf("unsupported field %q leaked to upstream body: %s", field, out)
+		}
+	}
+	// metadata is not stripped by codex_executor HTTP path; leave it unless translator
+	// path already removed it. Core HTTP strip set does not delete metadata.
+	if !gjson.GetBytes(out, "metadata").Exists() {
+		t.Fatalf("metadata should remain (not in core executor strip set); body=%s", out)
+	}
+}
+
+func TestPrepareCodexRequestBodyEmptyBody(t *testing.T) {
+	_, err := prepareCodexRequestBody(rpcExecutorRequest{}, "")
+	if err == nil {
+		t.Fatal("prepareCodexRequestBody() error = nil, want empty body error")
+	}
+}
+
 func TestProcessCodexResponseAggregatesCompletedBody(t *testing.T) {
 	body := strings.Join([]string{
 		`data: {"type":"response.output_item.done","output_index":0,"item":{"type":"message","content":[{"type":"output_text","text":"hello"}]}}`,
