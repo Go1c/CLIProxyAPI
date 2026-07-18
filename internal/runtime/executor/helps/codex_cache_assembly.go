@@ -98,11 +98,6 @@ func cloneCodexCacheHeaders(headers http.Header) http.Header {
 	return headers.Clone()
 }
 
-// SetCodexCacheSessionHeader replaces any existing Session_id-style header with key/value.
-func SetCodexCacheSessionHeader(headers http.Header, key, value string) string {
-	return setCodexCacheSessionHeader(headers, key, value)
-}
-
 func setCodexCacheSessionHeader(headers http.Header, key, value string) string {
 	key = strings.TrimSpace(key)
 	value = strings.TrimSpace(value)

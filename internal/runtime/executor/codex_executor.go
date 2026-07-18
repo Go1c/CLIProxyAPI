@@ -1828,29 +1828,46 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Form
 	if len(headerSets) > 0 {
 		headers = headerSets[0]
 	}
-	modelName := strings.TrimSpace(req.Model)
+	var cache helps.CodexCache
 	if sourceFormatEqual(from, sdktranslator.FormatClaude) {
-		if bodyModel := strings.TrimSpace(gjson.GetBytes(rawJSON, "model").String()); bodyModel != "" {
-			modelName = bodyModel
-		} else {
+		modelName := strings.TrimSpace(gjson.GetBytes(rawJSON, "model").String())
+		if modelName == "" {
 			modelName = thinking.ParseSuffix(req.Model).ModelName
 		}
+		cached, ok, errCache := helps.ClaudeCodePromptCache(ctx, modelName, req.Payload, headers)
+		if errCache != nil {
+			return nil, nil, codexIdentityConfuseState{}, errCache
+		}
+		if ok {
+			cache = cached
+		}
+	} else if sourceFormatEqual(from, sdktranslator.FormatOpenAIResponse) {
+		promptCacheKey := gjson.GetBytes(req.Payload, "prompt_cache_key")
+		if promptCacheKey.Exists() {
+			cache.ID = promptCacheKey.String()
+		}
+	} else if sourceFormatEqual(from, sdktranslator.FormatOpenAI) {
+		if apiKey := strings.TrimSpace(helps.APIKeyFromContext(ctx)); apiKey != "" {
+			cache.ID = uuid.NewSHA1(uuid.NameSpaceOID, []byte("cli-proxy-api:codex:prompt-cache:"+apiKey)).String()
+		}
 	}
-	assembly, errAssembly := helps.ApplyCodexCacheAssembly(ctx, from, modelName, req.Payload, rawJSON, headers)
-	if errAssembly != nil {
-		return nil, nil, codexIdentityConfuseState{}, errAssembly
+
+	if cache.ID != "" {
+		rawJSON, _ = sjson.SetBytes(rawJSON, "prompt_cache_key", cache.ID)
 	}
-	rawJSON = helps.SanitizeCodexInputItemIDs(assembly.Body)
+	rawJSON = helps.SanitizeCodexInputItemIDs(rawJSON)
 	var identityState codexIdentityConfuseState
 	rawJSON, identityState = applyCodexIdentityConfuseBody(e.cfg, auth, userPayload, rawJSON)
 	if identityState.promptCacheKey != "" {
-		helps.SetCodexCacheSessionHeader(assembly.Headers, "Session_id", identityState.promptCacheKey)
+		cache.ID = identityState.promptCacheKey
 	}
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(rawJSON))
 	if err != nil {
 		return nil, nil, codexIdentityConfuseState{}, err
 	}
-	httpReq.Header = assembly.Headers
+	if cache.ID != "" {
+		httpReq.Header.Set("Session_id", cache.ID)
+	}
 	return httpReq, rawJSON, identityState, nil
 }
 
