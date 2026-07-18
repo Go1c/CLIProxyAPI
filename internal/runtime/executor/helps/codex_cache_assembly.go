@@ -49,7 +49,7 @@ func ApplyCodexCacheAssembly(ctx context.Context, sourceFormat sdktranslator.For
 	cacheSource := CodexCacheSourceNone
 	switch {
 	case codexSourceFormatEqual(sourceFormat, sdktranslator.FormatClaude):
-		cached, ok, errCache := ClaudeCodePromptCache(ctx, modelName, sourcePayload, nil)
+		cached, ok, errCache := ClaudeCodePromptCache(ctx, modelName, sourcePayload, headers)
 		if errCache != nil {
 			return CodexCacheAssembly{}, errCache
 		}
@@ -96,6 +96,11 @@ func cloneCodexCacheHeaders(headers http.Header) http.Header {
 		return make(http.Header)
 	}
 	return headers.Clone()
+}
+
+// SetCodexCacheSessionHeader replaces any existing Session_id-style header with key/value.
+func SetCodexCacheSessionHeader(headers http.Header, key, value string) string {
+	return setCodexCacheSessionHeader(headers, key, value)
 }
 
 func setCodexCacheSessionHeader(headers http.Header, key, value string) string {

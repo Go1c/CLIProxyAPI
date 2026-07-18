@@ -1,7 +1,6 @@
 package auth
 
 import (
-	"errors"
 	"strings"
 	"time"
 
@@ -121,24 +120,9 @@ func markProxyAttempted(tried map[string]struct{}, auth *Auth, err error) bool {
 }
 
 func resultErrorFromExecution(err error) *Error {
-	if err == nil {
-		return nil
-	}
-	if proxyErr, ok := proxyutil.AsError(err); ok {
-		return &Error{
-			Code:      proxyErr.Code,
-			Message:   proxyErr.Message,
-			Retryable: proxyErr.Retryable,
-		}
-	}
-	resultErr := &Error{Message: err.Error()}
-	if statusErr, ok := errors.AsType[interface {
-		error
-		StatusCode() int
-	}](err); ok && statusErr != nil {
-		resultErr.HTTPStatus = statusErr.StatusCode()
-	}
-	return resultErr
+	// Keep the historical helper for proxy-health call sites; it now shares
+	// the same mapping as resultErrorFromError (proxy codes + request-scoped).
+	return resultErrorFromError(err)
 }
 
 func proxyErrorFromResult(auth *Auth, resultErr *Error) *proxyutil.Error {
