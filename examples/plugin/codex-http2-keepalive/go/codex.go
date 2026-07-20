@@ -75,9 +75,9 @@ func execute(raw []byte) ([]byte, error) {
 	defer cancel()
 	resp, outcome, err := runCodexExecution(ctx, req, cfg, false)
 	if err != nil {
-		return errorEnvelope(pluginErrorCode(err), err.Error(), isRetryableError(err), pluginErrorStatus(err)), nil
+		logCodexFailure(req.HostCallbackID, outcome, err)
+		return errorEnvelopeWithRetryAfter(pluginErrorCode(err), err.Error(), isRetryableError(err), pluginErrorStatus(err), pluginErrorRetryAfterSeconds(err)), nil
 	}
-	logCodexCompletion(req.HostCallbackID, outcome, nil)
 	return okEnvelope(resp)
 }
 
@@ -102,10 +102,9 @@ func executeStream(raw []byte) ([]byte, error) {
 		_ = resp
 		if errRun != nil {
 			logCodexFailure(req.HostCallbackID, outcome, errRun)
-			_ = closePluginStream(req.StreamID, errRun.Error())
+			_ = closePluginStreamWithError(req.StreamID, errRun)
 			return
 		}
-		logCodexCompletion(req.HostCallbackID, outcome, nil)
 		_ = closePluginStream(req.StreamID, "")
 	}()
 	return okEnvelope(rpcExecutorStreamResponse{
@@ -276,7 +275,6 @@ func runCodexExecution(ctx context.Context, req rpcExecutorRequest, cfg pluginCo
 		Stream:          stream,
 		CacheKeyPresent: strings.TrimSpace(gjson.GetBytes(requestBody, "prompt_cache_key").String()) != "",
 	}
-	logCodexStart(req.HostCallbackID, outcome)
 	var attempt int
 	var lastErr error
 	for attempt = 0; attempt < 2; attempt++ {
@@ -298,13 +296,7 @@ func runCodexExecution(ctx context.Context, req rpcExecutorRequest, cfg pluginCo
 			return pluginapi.ExecutorResponse{}, outcome, errDo
 		}
 		result, errProcess := processCodexResponse(ctx, resp, requestStart, req, settings, stream, pool)
-		if errClose := resp.Body.Close(); errClose != nil {
-			_ = logPluginEvent(req.HostCallbackID, "warn", "failed to close upstream body", map[string]any{
-				"plugin_id": pluginIdentifier,
-				"error":     errClose.Error(),
-				"pool":      pool.key,
-			})
-		}
+		_ = resp.Body.Close()
 		if errProcess != nil {
 			lastErr = errProcess
 			pool.recordFailure(errProcess)
@@ -349,7 +341,7 @@ func processCodexResponse(ctx context.Context, resp *http.Response, requestStart
 		if errRead != nil {
 			return result, errRead
 		}
-		return result, newPluginError("upstream_status", http.StatusBadGateway, false, fmt.Sprintf("upstream returned status %d: %s", resp.StatusCode, summarizeBody(body)), nil)
+		return result, newCodexUpstreamStatusError(resp.StatusCode, body)
 	}
 
 	reader := bufio.NewReader(resp.Body)
@@ -438,11 +430,11 @@ func processCodexLine(state *codexProcessState, line []byte, requestStarted time
 		}
 		return nil, true, nil
 	case "response.failed", "error":
-		body := codexErrorBody(data)
+		errEvent := newCodexStreamEventError(data)
 		if streaming {
-			return rebuildSSELine(line, data), false, newPluginError("codex_response_error", http.StatusBadGateway, false, body, nil)
+			return rebuildSSELine(line, data), false, errEvent
 		}
-		return nil, false, newPluginError("codex_response_error", http.StatusBadGateway, false, body, nil)
+		return nil, false, errEvent
 	}
 	if streaming {
 		return line, false, nil
@@ -698,31 +690,207 @@ func parseCodexUsage(eventData []byte) (codexUsageSummary, bool) {
 	}, true
 }
 
-func codexErrorBody(eventData []byte) string {
-	candidates := []string{
-		gjson.GetBytes(eventData, "response.error.message").String(),
-		gjson.GetBytes(eventData, "error.message").String(),
-		gjson.GetBytes(eventData, "message").String(),
-	}
-	for _, candidate := range candidates {
-		if trimmed := strings.TrimSpace(candidate); trimmed != "" {
-			return trimmed
-		}
-	}
-	if raw := strings.TrimSpace(string(eventData)); raw != "" {
-		return raw
-	}
-	return "codex response error"
+// maxErrorBodyBytes caps error payloads forwarded to the host. This is not a
+// logging buffer; it only prevents oversized upstream bodies from being carried
+// through the plugin RPC path. Success responses never go through this helper.
+const maxErrorBodyBytes = 2048
+
+// newCodexUpstreamStatusError keeps the upstream status and a bounded body, and
+// only adds the host-facing cooldown hint (retry_after) when the body is a
+// usage-limit failure.
+func newCodexUpstreamStatusError(statusCode int, body []byte) error {
+	status := normalizeCodexStatus(statusCode, body)
+	return newPluginErrorWithRetryAfter(
+		"upstream_status",
+		status,
+		isRetryableCodexStatus(status),
+		passThroughErrorBody(body),
+		nil,
+		parseCodexRetryAfter(status, body, time.Now()),
+	)
 }
 
-func summarizeBody(body []byte) string {
+// newCodexStreamEventError handles SSE terminal failures. HTTP may already have
+// returned 200, so status is inferred from the event body; unknown events stay 502.
+func newCodexStreamEventError(eventData []byte) error {
+	body := codexEventErrorJSON(eventData)
+	status := normalizeCodexStatus(0, body)
+	if status == 0 {
+		status = http.StatusBadGateway
+	}
+	message := passThroughErrorBody(body)
+	if message == "" {
+		message = passThroughErrorBody(eventData)
+	}
+	if message == "" {
+		message = "codex response error"
+	}
+	return newPluginErrorWithRetryAfter(
+		"codex_response_error",
+		status,
+		isRetryableCodexStatus(status),
+		message,
+		nil,
+		parseCodexRetryAfter(status, body, time.Now()),
+	)
+}
+
+func codexEventErrorJSON(eventData []byte) []byte {
+	for _, path := range []string{"response.error", "error"} {
+		result := gjson.GetBytes(eventData, path)
+		if !result.Exists() {
+			continue
+		}
+		if result.Type == gjson.JSON {
+			// Wrap raw error objects so host-facing body looks like the normal
+			// {"error":{...}} envelope clients already understand.
+			if gjson.Get(result.Raw, "type").Exists() || gjson.Get(result.Raw, "message").Exists() || gjson.Get(result.Raw, "code").Exists() {
+				out := []byte(`{"error":{}}`)
+				out, _ = sjson.SetRawBytes(out, "error", []byte(result.Raw))
+				return out
+			}
+			return []byte(result.Raw)
+		}
+		if message := strings.TrimSpace(result.String()); message != "" {
+			out := []byte(`{"error":{}}`)
+			out, _ = sjson.SetBytes(out, "error.message", message)
+			return out
+		}
+	}
+	if errorType := strings.TrimSpace(gjson.GetBytes(eventData, "type").String()); strings.EqualFold(errorType, "usage_limit_reached") {
+		return eventData
+	}
+	return nil
+}
+
+// normalizeCodexStatus prefers the real HTTP status. The only semantic rewrite is
+// usage-limit / capacity bodies -> 429, matching the built-in Codex executor so
+// credential cooldown still works when upstream mislabels the status.
+func normalizeCodexStatus(statusCode int, body []byte) int {
+	if isCodexUsageLimitError(body) || isCodexModelCapacityError(body) {
+		return http.StatusTooManyRequests
+	}
+	if statusCode > 0 {
+		return statusCode
+	}
+	errorType := strings.ToLower(strings.TrimSpace(firstNonEmpty(
+		gjson.GetBytes(body, "error.type").String(),
+		gjson.GetBytes(body, "type").String(),
+	)))
+	errorCode := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "error.code").String()))
+	switch {
+	case errorType == "rate_limit_error", errorCode == "rate_limit_exceeded":
+		return http.StatusTooManyRequests
+	case errorType == "authentication_error", errorCode == "invalid_api_key", errorCode == "unauthorized":
+		return http.StatusUnauthorized
+	case errorType == "permission_error", errorCode == "forbidden", errorCode == "permission_denied":
+		return http.StatusForbidden
+	case errorType == "not_found_error", errorCode == "not_found", errorCode == "model_not_found":
+		return http.StatusNotFound
+	case errorType == "invalid_request_error", errorType == "bad_request_error":
+		return http.StatusBadRequest
+	default:
+		return 0
+	}
+}
+
+func isCodexUsageLimitError(errorBody []byte) bool {
+	if len(errorBody) == 0 {
+		return false
+	}
+	for _, path := range []string{"error.type", "type"} {
+		if strings.EqualFold(strings.TrimSpace(gjson.GetBytes(errorBody, path).String()), "usage_limit_reached") {
+			return true
+		}
+	}
+	return false
+}
+
+func isCodexModelCapacityError(errorBody []byte) bool {
+	if len(errorBody) == 0 {
+		return false
+	}
+	candidates := []string{
+		gjson.GetBytes(errorBody, "error.message").String(),
+		gjson.GetBytes(errorBody, "message").String(),
+		string(errorBody),
+	}
+	for _, candidate := range candidates {
+		lower := strings.ToLower(strings.TrimSpace(candidate))
+		if lower == "" {
+			continue
+		}
+		if strings.Contains(lower, "selected model is at capacity") ||
+			strings.Contains(lower, "model is at capacity. please try a different model") {
+			return true
+		}
+	}
+	return false
+}
+
+func parseCodexRetryAfter(statusCode int, errorBody []byte, now time.Time) *time.Duration {
+	if statusCode != http.StatusTooManyRequests || len(errorBody) == 0 {
+		return nil
+	}
+	errorType := firstNonEmpty(
+		gjson.GetBytes(errorBody, "error.type").String(),
+		gjson.GetBytes(errorBody, "type").String(),
+	)
+	if !strings.EqualFold(strings.TrimSpace(errorType), "usage_limit_reached") {
+		return nil
+	}
+	if resetsAt := firstPositiveInt(gjson.GetBytes(errorBody, "error.resets_at").Int(), gjson.GetBytes(errorBody, "resets_at").Int()); resetsAt > 0 {
+		resetAtTime := time.Unix(resetsAt, 0)
+		if resetAtTime.After(now) {
+			retryAfter := resetAtTime.Sub(now)
+			return &retryAfter
+		}
+	}
+	if resetsInSeconds := firstPositiveInt(gjson.GetBytes(errorBody, "error.resets_in_seconds").Int(), gjson.GetBytes(errorBody, "resets_in_seconds").Int()); resetsInSeconds > 0 {
+		retryAfter := time.Duration(resetsInSeconds) * time.Second
+		return &retryAfter
+	}
+	return nil
+}
+
+func firstPositiveInt(values ...int64) int64 {
+	for _, value := range values {
+		if value > 0 {
+			return value
+		}
+	}
+	return 0
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func isRetryableCodexStatus(status int) bool {
+	switch status {
+	case http.StatusRequestTimeout, http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return true
+	default:
+		return false
+	}
+}
+
+// passThroughErrorBody forwards upstream error text with a hard size cap.
+// Empty bodies stay empty so callers can supply their own fallback.
+func passThroughErrorBody(body []byte) string {
 	text := strings.TrimSpace(string(body))
 	if text == "" {
 		return ""
 	}
-	text = strings.Join(strings.Fields(text), " ")
-	if len(text) > 240 {
-		text = text[:240] + "..."
+	// Collapse only pure whitespace runs that break one-line host logs; do not
+	// rewrite JSON structure beyond a length limit.
+	if len(text) > maxErrorBodyBytes {
+		return text[:maxErrorBodyBytes] + "..."
 	}
 	return text
 }
@@ -810,6 +978,15 @@ func pluginErrorStatus(err error) int {
 	return http.StatusInternalServerError
 }
 
+func pluginErrorRetryAfterSeconds(err error) *float64 {
+	var pe *pluginError
+	if !errors.As(err, &pe) || pe == nil || pe.retryAfter == nil || *pe.retryAfter <= 0 {
+		return nil
+	}
+	seconds := pe.retryAfter.Seconds()
+	return &seconds
+}
+
 func isRetryableError(err error) bool {
 	var pe *pluginError
 	if errors.As(err, &pe) {
@@ -818,52 +995,13 @@ func isRetryableError(err error) bool {
 	return isRetryableNetworkError(err)
 }
 
-func logCodexStart(callbackID string, outcome codexExecutionOutcome) {
-	_ = logPluginEvent(callbackID, "info", "codex request start", map[string]any{
-		"plugin_id":         pluginIdentifier,
-		"auth_id":           outcome.AuthID,
-		"base_url":          outcome.UpstreamURL,
-		"proxy":             proxyutil.Redact(outcome.ProxyURL),
-		"pool_key":          outcome.PoolKey,
-		"stream":            outcome.Stream,
-		"model":             outcome.Model,
-		"cache_key_present": outcome.CacheKeyPresent,
-	})
-}
-
-func logCodexCompletion(callbackID string, outcome codexExecutionOutcome, err error) {
-	fields := map[string]any{
-		"plugin_id":   pluginIdentifier,
-		"auth_id":     outcome.AuthID,
-		"base_url":    outcome.UpstreamURL,
-		"proxy":       proxyutil.Redact(outcome.ProxyURL),
-		"pool_key":    outcome.PoolKey,
-		"stream":      outcome.Stream,
-		"model":       outcome.Model,
-		"attempts":    outcome.Attempts,
-		"status":      outcome.StatusCode,
-		"ttft_ms":     outcome.TTFT.Milliseconds(),
-		"duration_ms": outcome.Duration.Milliseconds(),
-	}
-	if outcome.Usage.InputTokens > 0 || outcome.Usage.OutputTokens > 0 || outcome.Usage.TotalTokens > 0 {
-		fields["input_tokens"] = outcome.Usage.InputTokens
-		fields["output_tokens"] = outcome.Usage.OutputTokens
-		fields["reasoning_tokens"] = outcome.Usage.ReasoningTokens
-		fields["total_tokens"] = outcome.Usage.TotalTokens
-	}
-	if err != nil {
-		fields["error"] = err.Error()
-		_ = logPluginEvent(callbackID, "error", "codex request failed", fields)
-		return
-	}
-	_ = logPluginEvent(callbackID, "info", "codex request completed", fields)
-}
-
+// logCodexFailure reports only failed executions to the host. Successful
+// requests intentionally produce no plugin log traffic.
 func logCodexFailure(callbackID string, outcome codexExecutionOutcome, err error) {
 	if err == nil {
 		return
 	}
-	_ = logPluginEvent(callbackID, "error", "codex request failed", map[string]any{
+	fields := map[string]any{
 		"plugin_id": pluginIdentifier,
 		"auth_id":   outcome.AuthID,
 		"base_url":  outcome.UpstreamURL,
@@ -872,18 +1010,27 @@ func logCodexFailure(callbackID string, outcome codexExecutionOutcome, err error
 		"stream":    outcome.Stream,
 		"model":     outcome.Model,
 		"attempts":  outcome.Attempts,
+		"status":    pluginErrorStatus(err),
 		"error":     err.Error(),
-	})
+	}
+	if retryAfter := pluginErrorRetryAfterSeconds(err); retryAfter != nil {
+		fields["retry_after_seconds"] = *retryAfter
+	}
+	_ = logPluginEvent(callbackID, "error", "codex request failed", fields)
 }
 
 func logPluginEvent(callbackID string, level, message string, fields map[string]any) error {
+	// Only error-level reports are emitted from this plugin.
+	if !strings.EqualFold(strings.TrimSpace(level), "error") {
+		return nil
+	}
 	if fields == nil {
 		fields = make(map[string]any)
 	}
 	sanitized := sanitizeLogFields(fields)
 	_, err := hostCall(pluginabi.MethodHostLog, rpcHostLogRequest{
 		HostCallbackID: callbackID,
-		Level:          level,
+		Level:          "error",
 		Message:        message,
 		Fields:         sanitized,
 	})
@@ -915,12 +1062,25 @@ func emitPluginStreamChunk(streamID string, payload []byte) error {
 }
 
 func closePluginStream(streamID, errMsg string) error {
+	return closePluginStreamWithDetails(streamID, errMsg, 0, nil)
+}
+
+func closePluginStreamWithError(streamID string, err error) error {
+	if err == nil {
+		return closePluginStream(streamID, "")
+	}
+	return closePluginStreamWithDetails(streamID, err.Error(), pluginErrorStatus(err), pluginErrorRetryAfterSeconds(err))
+}
+
+func closePluginStreamWithDetails(streamID, errMsg string, statusCode int, retryAfterSeconds *float64) error {
 	if strings.TrimSpace(streamID) == "" {
 		return nil
 	}
 	_, err := hostCall(pluginabi.MethodHostStreamClose, rpcStreamCloseRequest{
-		StreamID: streamID,
-		Error:    strings.TrimSpace(errMsg),
+		StreamID:          streamID,
+		Error:             strings.TrimSpace(errMsg),
+		HTTPStatus:        statusCode,
+		RetryAfterSeconds: retryAfterSeconds,
 	})
 	return err
 }
@@ -929,6 +1089,7 @@ type pluginError struct {
 	code       string
 	statusCode int
 	retryable  bool
+	retryAfter *time.Duration
 	message    string
 	cause      error
 }
@@ -946,8 +1107,26 @@ func (e *pluginError) Error() string {
 	return e.code
 }
 
+func (e *pluginError) StatusCode() int {
+	if e == nil {
+		return 0
+	}
+	return e.statusCode
+}
+
+func (e *pluginError) RetryAfter() *time.Duration {
+	if e == nil {
+		return nil
+	}
+	return e.retryAfter
+}
+
 func newPluginError(code string, status int, retryable bool, message string, cause error) error {
-	return &pluginError{code: code, statusCode: status, retryable: retryable, message: message, cause: cause}
+	return newPluginErrorWithRetryAfter(code, status, retryable, message, cause, nil)
+}
+
+func newPluginErrorWithRetryAfter(code string, status int, retryable bool, message string, cause error, retryAfter *time.Duration) error {
+	return &pluginError{code: code, statusCode: status, retryable: retryable, retryAfter: retryAfter, message: message, cause: cause}
 }
 
 func isRetryableNetworkError(err error) bool {

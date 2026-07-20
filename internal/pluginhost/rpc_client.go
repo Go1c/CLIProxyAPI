@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
@@ -38,6 +39,7 @@ type rpcThinkingApplier struct {
 type rpcPluginError struct {
 	message    string
 	statusCode int
+	retryAfter *time.Duration
 }
 
 func (e rpcPluginError) Error() string {
@@ -46,6 +48,10 @@ func (e rpcPluginError) Error() string {
 
 func (e rpcPluginError) StatusCode() int {
 	return e.statusCode
+}
+
+func (e rpcPluginError) RetryAfter() *time.Duration {
+	return e.retryAfter
 }
 
 type rpcResponseNormalizer struct {
@@ -292,8 +298,13 @@ func decodeEnvelopeResult[T any](envelope pluginabi.Envelope) (T, error) {
 			if message == "" {
 				message = "plugin call failed"
 			}
-			if envelope.Error.HTTPStatus > 0 {
-				return zero, rpcPluginError{message: message, statusCode: envelope.Error.HTTPStatus}
+			if envelope.Error.HTTPStatus > 0 || envelope.Error.RetryAfterSeconds != nil {
+				pluginErr := rpcPluginError{message: message, statusCode: envelope.Error.HTTPStatus}
+				if envelope.Error.RetryAfterSeconds != nil && *envelope.Error.RetryAfterSeconds > 0 {
+					retryAfter := time.Duration(*envelope.Error.RetryAfterSeconds * float64(time.Second))
+					pluginErr.retryAfter = &retryAfter
+				}
+				return zero, pluginErr
 			}
 			return zero, fmt.Errorf("%s", message)
 		}

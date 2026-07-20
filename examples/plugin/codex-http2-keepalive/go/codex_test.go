@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -335,14 +336,113 @@ func TestProcessCodexResponseReturnsRetryableErrorOnFailedEvent(t *testing.T) {
 	}
 }
 
-func TestSummarizeBodyAndRetryableClassification(t *testing.T) {
-	if got := summarizeBody([]byte("  hello \n world  ")); got != "hello world" {
-		t.Fatalf("summarizeBody() = %q, want %q", got, "hello world")
+func TestProcessCodexResponsePreservesUsageLimitStatusAndRetryAfter(t *testing.T) {
+	resetAt := time.Now().Add(5 * time.Minute).Unix()
+	body := fmt.Sprintf(`{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","plan_type":"pro","resets_at":%d}}`, resetAt)
+	resp := &http.Response{
+		StatusCode: http.StatusTooManyRequests,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}
+
+	_, err := processCodexResponse(context.Background(), resp, time.Now(), rpcExecutorRequest{}, codexAuthSettings{}, false, nil)
+	if err == nil {
+		t.Fatal("processCodexResponse() error = nil, want upstream_status")
+	}
+	if pluginErrorCode(err) != "upstream_status" {
+		t.Fatalf("pluginErrorCode = %q, want upstream_status", pluginErrorCode(err))
+	}
+	if pluginErrorStatus(err) != http.StatusTooManyRequests {
+		t.Fatalf("pluginErrorStatus = %d, want %d", pluginErrorStatus(err), http.StatusTooManyRequests)
+	}
+	if err.Error() != body {
+		t.Fatalf("error message = %q, want pass-through body %q", err.Error(), body)
+	}
+	if !isRetryableError(err) {
+		t.Fatal("isRetryableError() = false, want true for usage limit")
+	}
+	retryAfter := pluginErrorRetryAfterSeconds(err)
+	if retryAfter == nil {
+		t.Fatal("pluginErrorRetryAfterSeconds() = nil, want resets_at based retry")
+	}
+	if *retryAfter < 4*60 || *retryAfter > 6*60 {
+		t.Fatalf("pluginErrorRetryAfterSeconds() = %v, want ~5 minutes", *retryAfter)
+	}
+	envelopeRaw := errorEnvelopeWithRetryAfter(pluginErrorCode(err), err.Error(), isRetryableError(err), pluginErrorStatus(err), retryAfter)
+	var env envelope
+	if errDecode := json.Unmarshal(envelopeRaw, &env); errDecode != nil {
+		t.Fatalf("unmarshal error envelope: %v", errDecode)
+	}
+	if env.Error == nil || env.Error.HTTPStatus != http.StatusTooManyRequests {
+		t.Fatalf("envelope error = %#v, want HTTPStatus 429", env.Error)
+	}
+	if env.Error.Message != body {
+		t.Fatalf("envelope message = %q, want pass-through body", env.Error.Message)
+	}
+	if env.Error.RetryAfterSeconds == nil || *env.Error.RetryAfterSeconds < 4*60 {
+		t.Fatalf("envelope retry_after_seconds = %#v, want ~5 minutes", env.Error.RetryAfterSeconds)
+	}
+}
+
+func TestProcessCodexResponseMapsSSEUsageLimitTo429(t *testing.T) {
+	body := `data: {"type":"response.failed","response":{"error":{"type":"usage_limit_reached","message":"usage limit reached","resets_in_seconds":120}}}
+`
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}
+
+	_, err := processCodexResponse(context.Background(), resp, time.Now(), rpcExecutorRequest{}, codexAuthSettings{}, false, nil)
+	if err == nil {
+		t.Fatal("processCodexResponse() error = nil, want codex_response_error")
+	}
+	if pluginErrorStatus(err) != http.StatusTooManyRequests {
+		t.Fatalf("pluginErrorStatus = %d, want %d", pluginErrorStatus(err), http.StatusTooManyRequests)
+	}
+	if !strings.Contains(err.Error(), `"type":"usage_limit_reached"`) {
+		t.Fatalf("error message = %q, want usage_limit_reached body", err.Error())
+	}
+	retryAfter := pluginErrorRetryAfterSeconds(err)
+	if retryAfter == nil || *retryAfter != 120 {
+		t.Fatalf("pluginErrorRetryAfterSeconds() = %v, want 120", retryAfter)
+	}
+}
+
+func TestPassThroughErrorBodyAndRetryableClassification(t *testing.T) {
+	if got := passThroughErrorBody([]byte("  hello  ")); got != "hello" {
+		t.Fatalf("passThroughErrorBody() = %q, want %q", got, "hello")
+	}
+	long := strings.Repeat("a", maxErrorBodyBytes+10)
+	if got := passThroughErrorBody([]byte(long)); !strings.HasSuffix(got, "...") || len(got) != maxErrorBodyBytes+3 {
+		t.Fatalf("passThroughErrorBody(long) length = %d, want capped", len(got))
 	}
 	if got := isRetryableNetworkError(io.ErrUnexpectedEOF); !got {
 		t.Fatal("isRetryableNetworkError(io.ErrUnexpectedEOF) = false, want true")
 	}
 	if got := isRetryableNetworkError(context.Canceled); got {
 		t.Fatal("isRetryableNetworkError(context.Canceled) = true, want false")
+	}
+}
+
+func TestLogPluginEventDropsNonErrorLevels(t *testing.T) {
+	var called bool
+	withHostCallStub(t, func(method string, payload any) (json.RawMessage, error) {
+		if method == pluginabi.MethodHostLog {
+			called = true
+		}
+		return nil, nil
+	})
+	if err := logPluginEvent("cb", "info", "should not log", map[string]any{"x": 1}); err != nil {
+		t.Fatalf("logPluginEvent(info) error = %v", err)
+	}
+	if called {
+		t.Fatal("info log reached host, want error-only logging")
+	}
+	if err := logPluginEvent("cb", "error", "codex request failed", map[string]any{"error": "boom"}); err != nil {
+		t.Fatalf("logPluginEvent(error) error = %v", err)
+	}
+	if !called {
+		t.Fatal("error log did not reach host")
 	}
 }

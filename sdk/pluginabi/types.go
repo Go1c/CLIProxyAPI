@@ -91,4 +91,8 @@ type Error struct {
 	Message    string `json:"message"`
 	Retryable  bool   `json:"retryable,omitempty"`
 	HTTPStatus int    `json:"http_status,omitempty"`
+	// RetryAfterSeconds is an optional provider retry hint (for example usage
+	// limit resets_in_seconds / resets_at). Hosts that understand this field can
+	// apply credential cooldown without re-parsing the message body.
+	RetryAfterSeconds *float64 `json:"retry_after_seconds,omitempty"`
 }

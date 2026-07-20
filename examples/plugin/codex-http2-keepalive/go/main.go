@@ -88,10 +88,11 @@ type envelope struct {
 }
 
 type envelopeError struct {
-	Code       string `json:"code"`
-	Message    string `json:"message"`
-	Retryable  bool   `json:"retryable,omitempty"`
-	HTTPStatus int    `json:"http_status,omitempty"`
+	Code              string   `json:"code"`
+	Message           string   `json:"message"`
+	Retryable         bool     `json:"retryable,omitempty"`
+	HTTPStatus        int      `json:"http_status,omitempty"`
+	RetryAfterSeconds *float64 `json:"retry_after_seconds,omitempty"`
 }
 
 type rawPluginConfig struct {
@@ -183,8 +184,10 @@ type rpcStreamEmitRequest struct {
 }
 
 type rpcStreamCloseRequest struct {
-	StreamID string `json:"stream_id"`
-	Error    string `json:"error,omitempty"`
+	StreamID          string   `json:"stream_id"`
+	Error             string   `json:"error,omitempty"`
+	HTTPStatus        int      `json:"http_status,omitempty"`
+	RetryAfterSeconds *float64 `json:"retry_after_seconds,omitempty"`
 }
 
 type rpcHostContextWaitRequest struct {
@@ -542,13 +545,18 @@ func okEnvelope(v any) ([]byte, error) {
 }
 
 func errorEnvelope(code, message string, retryable bool, status int) []byte {
+	return errorEnvelopeWithRetryAfter(code, message, retryable, status, nil)
+}
+
+func errorEnvelopeWithRetryAfter(code, message string, retryable bool, status int, retryAfterSeconds *float64) []byte {
 	raw, _ := json.Marshal(envelope{
 		OK: false,
 		Error: &envelopeError{
-			Code:       code,
-			Message:    message,
-			Retryable:  retryable,
-			HTTPStatus: status,
+			Code:              code,
+			Message:           message,
+			Retryable:         retryable,
+			HTTPStatus:        status,
+			RetryAfterSeconds: retryAfterSeconds,
 		},
 	})
 	return raw

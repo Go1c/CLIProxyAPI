@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 )
@@ -40,6 +41,37 @@ func TestDecodeEnvelopeResultPreservesPluginHTTPStatus(t *testing.T) {
 	}
 	if got := statusProvider.StatusCode(); got != http.StatusForbidden {
 		t.Fatalf("status = %d, want %d", got, http.StatusForbidden)
+	}
+}
+
+func TestDecodeEnvelopeResultPreservesPluginRetryAfter(t *testing.T) {
+	retryAfter := 120.0
+	_, errDecode := decodeEnvelopeResult[rpcEmptyResponse](pluginabi.Envelope{
+		OK: false,
+		Error: &pluginabi.Error{
+			Code:              "upstream_status",
+			Message:           "usage limit reached",
+			HTTPStatus:        http.StatusTooManyRequests,
+			RetryAfterSeconds: &retryAfter,
+		},
+	})
+	if errDecode == nil {
+		t.Fatal("decodeEnvelopeResult returned nil error")
+	}
+	statusProvider, ok := errDecode.(interface{ StatusCode() int })
+	if !ok {
+		t.Fatalf("error %T does not expose StatusCode", errDecode)
+	}
+	if got := statusProvider.StatusCode(); got != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want %d", got, http.StatusTooManyRequests)
+	}
+	retryProvider, ok := errDecode.(interface{ RetryAfter() *time.Duration })
+	if !ok {
+		t.Fatalf("error %T does not expose RetryAfter", errDecode)
+	}
+	got := retryProvider.RetryAfter()
+	if got == nil || *got != 120*time.Second {
+		t.Fatalf("RetryAfter() = %v, want 120s", got)
 	}
 }
 
