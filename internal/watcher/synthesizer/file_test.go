@@ -698,3 +698,45 @@ func TestFileSynthesizer_Synthesize_NoteParsing(t *testing.T) {
 		})
 	}
 }
+
+func TestFileSynthesizer_PromotesBaseURLToAttributes(t *testing.T) {
+	tempDir := t.TempDir()
+	authData := map[string]any{
+		"type":          "xai",
+		"auth_kind":     "oauth",
+		"access_token":  "tok",
+		"refresh_token": "ref",
+		"base_url":      "https://cli-chat-proxy.grok.com/v1",
+		"email":         "free@example.com",
+		"headers": map[string]string{
+			"x-xai-token-auth": "xai-grok-cli",
+		},
+	}
+	data, _ := json.Marshal(authData)
+	if err := os.WriteFile(filepath.Join(tempDir, "xai-free.json"), data, 0644); err != nil {
+		t.Fatalf("write auth file: %v", err)
+	}
+	synth := NewFileSynthesizer()
+	ctx := &SynthesisContext{
+		Config:      &config.Config{},
+		AuthDir:     tempDir,
+		Now:         time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
+		IDGenerator: NewStableIDGenerator(),
+	}
+	auths, err := synth.Synthesize(ctx)
+	if err != nil {
+		t.Fatalf("Synthesize error: %v", err)
+	}
+	if len(auths) != 1 {
+		t.Fatalf("auths = %d, want 1", len(auths))
+	}
+	if got := auths[0].Attributes["base_url"]; got != "https://cli-chat-proxy.grok.com/v1" {
+		t.Fatalf("attributes base_url = %q, want cli-chat-proxy", got)
+	}
+	if got := auths[0].Attributes["auth_kind"]; got != "oauth" {
+		t.Fatalf("auth_kind = %q, want oauth", got)
+	}
+	if got := auths[0].Attributes["header:x-xai-token-auth"]; got != "xai-grok-cli" {
+		t.Fatalf("header not promoted: %q", got)
+	}
+}

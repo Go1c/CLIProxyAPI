@@ -4303,6 +4303,211 @@ func TestXAICompactBaseURL(t *testing.T) {
 	}
 }
 
+func TestXAIRefreshDefaultsEmptyBaseURLToCLIChatProxy(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Fatalf("method = %s, want POST", r.Method)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"access_token":"new-access","refresh_token":"new-refresh","token_type":"Bearer","expires_in":3600}`))
+	}))
+	defer server.Close()
+
+	exec := NewXAIExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		Provider: "xai",
+		Attributes: map[string]string{
+			"auth_kind": "oauth",
+		},
+		Metadata: map[string]any{
+			"auth_kind":      "oauth",
+			"refresh_token":  "old-refresh",
+			"token_endpoint": server.URL,
+			// base_url intentionally absent (CPA import may only set it after promote)
+		},
+	}
+	refreshed, err := exec.Refresh(context.Background(), auth)
+	if err != nil {
+		t.Fatalf("Refresh() error = %v", err)
+	}
+	if got := xaiMetadataString(refreshed.Metadata, "base_url"); got != xaiauth.CLIChatProxyBaseURL {
+		t.Fatalf("metadata base_url = %q, want %q", got, xaiauth.CLIChatProxyBaseURL)
+	}
+	if got := refreshed.Attributes["base_url"]; got != xaiauth.CLIChatProxyBaseURL {
+		t.Fatalf("attributes base_url = %q, want %q", got, xaiauth.CLIChatProxyBaseURL)
+	}
+	if got := xaiChatBaseURL(refreshed); got != xaiauth.CLIChatProxyBaseURL {
+		t.Fatalf("xaiChatBaseURL after refresh = %q, want %q", got, xaiauth.CLIChatProxyBaseURL)
+	}
+}
+
+func TestXAIRefreshPreservesExistingCLIChatProxyBaseURL(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"access_token":"new-access","refresh_token":"new-refresh","token_type":"Bearer","expires_in":3600}`))
+	}))
+	defer server.Close()
+
+	exec := NewXAIExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		Provider: "xai",
+		Metadata: map[string]any{
+			"auth_kind":      "oauth",
+			"refresh_token":  "old-refresh",
+			"token_endpoint": server.URL,
+			"base_url":       xaiauth.CLIChatProxyBaseURL,
+		},
+	}
+	refreshed, err := exec.Refresh(context.Background(), auth)
+	if err != nil {
+		t.Fatalf("Refresh() error = %v", err)
+	}
+	if got := xaiMetadataString(refreshed.Metadata, "base_url"); got != xaiauth.CLIChatProxyBaseURL {
+		t.Fatalf("metadata base_url = %q, want preserved CLI proxy", got)
+	}
+	if got := refreshed.Attributes["base_url"]; got != xaiauth.CLIChatProxyBaseURL {
+		t.Fatalf("attributes base_url = %q, want promoted CLI proxy", got)
+	}
+}
+
+func TestXAIOfficialAPITransportBlockedForFreeCLI(t *testing.T) {
+	tests := []struct {
+		name    string
+		auth    *cliproxyauth.Auth
+		blocked bool
+	}{
+		{
+			// xaiUsingAPI(nil) defaults to true (official API path).
+			name:    "nil auth treated as official API path",
+			auth:    nil,
+			blocked: false,
+		},
+		{
+			name: "oauth empty base blocked",
+			auth: &cliproxyauth.Auth{
+				Attributes: map[string]string{"auth_kind": "oauth"},
+			},
+			blocked: true,
+		},
+		{
+			name: "oauth cli proxy base blocked",
+			auth: &cliproxyauth.Auth{
+				Attributes: map[string]string{
+					"auth_kind": "oauth",
+					"base_url":  xaiauth.CLIChatProxyBaseURL,
+				},
+			},
+			blocked: true,
+		},
+		{
+			name: "oauth official default blocked",
+			auth: &cliproxyauth.Auth{
+				Attributes: map[string]string{
+					"auth_kind": "oauth",
+					"base_url":  xaiauth.DefaultAPIBaseURL,
+				},
+			},
+			blocked: true,
+		},
+		{
+			name: "oauth custom gateway allowed",
+			auth: &cliproxyauth.Auth{
+				Attributes: map[string]string{
+					"auth_kind": "oauth",
+					"base_url":  "https://gateway.example.com/v1",
+				},
+			},
+			blocked: false,
+		},
+		{
+			name: "using_api true allowed",
+			auth: &cliproxyauth.Auth{
+				Attributes: map[string]string{
+					"auth_kind":     "oauth",
+					"base_url":      xaiauth.CLIChatProxyBaseURL,
+					xaiUsingAPIAttr: "true",
+				},
+			},
+			blocked: false,
+		},
+		{
+			name: "api key allowed",
+			auth: &cliproxyauth.Auth{
+				Attributes: map[string]string{
+					"base_url": xaiauth.DefaultAPIBaseURL,
+					"api_key":  "sk-test",
+				},
+			},
+			blocked: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := xaiOfficialAPITransportBlockedForFreeCLI(tt.auth); got != tt.blocked {
+				t.Fatalf("blocked = %v, want %v", got, tt.blocked)
+			}
+		})
+	}
+}
+
+func TestXAIExecutorCompactRejectsFreeCLIOAuth(t *testing.T) {
+	exec := NewXAIExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		Provider: "xai",
+		Attributes: map[string]string{
+			"auth_kind": "oauth",
+			"base_url":  xaiauth.CLIChatProxyBaseURL,
+		},
+		Metadata: map[string]any{"access_token": "free-token"},
+	}
+	_, err := exec.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "grok-4.5",
+		Payload: []byte(`{"model":"grok-4.5","input":[{"role":"user","content":"hi"}]}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FormatOpenAIResponse,
+		Alt:          "responses/compact",
+	})
+	if err == nil {
+		t.Fatal("Execute compact error = nil, want free CLI rejection")
+	}
+	if se, ok := err.(interface{ StatusCode() int }); !ok || se.StatusCode() != http.StatusBadRequest {
+		t.Fatalf("status = %#v, want 400 Bad Request", err)
+	}
+	if !strings.Contains(err.Error(), "responses/compact") || !strings.Contains(err.Error(), "free Grok CLI") {
+		t.Fatalf("error = %q, want free CLI compact message", err.Error())
+	}
+}
+
+func TestXAIWebsocketsRejectsFreeCLIOAuth(t *testing.T) {
+	exec := NewXAIWebsocketsExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		Provider: "xai",
+		Attributes: map[string]string{
+			"auth_kind":  "oauth",
+			"base_url":   xaiauth.CLIChatProxyBaseURL,
+			"websockets": "true",
+		},
+		Metadata: map[string]any{"access_token": "free-token"},
+	}
+	_, err := exec.ExecuteStream(cliproxyexecutor.WithDownstreamWebsocket(context.Background()), auth, cliproxyexecutor.Request{
+		Model:   "grok-4.5",
+		Payload: []byte(`{"model":"grok-4.5","stream":true,"input":[{"type":"message","role":"user","content":"hi"}]}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat:   sdktranslator.FormatOpenAIResponse,
+		ResponseFormat: sdktranslator.FormatOpenAIResponse,
+		Stream:         true,
+	})
+	if err == nil {
+		t.Fatal("ExecuteStream error = nil, want free CLI websocket rejection")
+	}
+	if se, ok := err.(interface{ StatusCode() int }); !ok || se.StatusCode() != http.StatusBadRequest {
+		t.Fatalf("status = %#v, want 400 Bad Request", err)
+	}
+	if !strings.Contains(err.Error(), "websocket") || !strings.Contains(err.Error(), "free Grok CLI") {
+		t.Fatalf("error = %q, want free CLI websocket message", err.Error())
+	}
+}
+
 func TestApplyXAIChatHeaders(t *testing.T) {
 	t.Run("non OAuth defaults to official API headers", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodPost, "https://example.invalid/responses", nil)

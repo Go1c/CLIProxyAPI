@@ -405,8 +405,12 @@ func (e *XAIWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 	// Keep websocket on the official API base URL (or an explicit non-default
 	// base_url). Do not reuse xaiChatBaseURL: cli-chat-proxy only accepts HTTP
 	// POST and returns 405 for websocket upgrades.
+	// Free Grok CLI OAuth must not silently dial api.x.ai (402 spending-limit).
+	if err := xaiRejectOfficialAPITransportForFreeCLI(auth, "websocket"); err != nil {
+		return nil, err
+	}
 	token, baseURL := xaiCreds(auth)
-	if baseURL == "" {
+	if baseURL == "" || xaiIsCLIChatProxyBaseURL(baseURL) {
 		baseURL = xaiauth.DefaultAPIBaseURL
 	}
 

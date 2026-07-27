@@ -231,6 +231,12 @@ func (e *XAIExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.Aut
 }
 
 func (e *XAIExecutor) executeCompactRequest(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*xaiPreparedRequest, []byte, http.Header, error) {
+	// Free Grok CLI OAuth must not fall through to api.x.ai compact: free tokens
+	// get personal-team-blocked:spending-limit there, which is easily misread as
+	// a dead account. CLI chat-proxy also does not implement /responses/compact.
+	if err := xaiRejectOfficialAPITransportForFreeCLI(auth, "responses/compact"); err != nil {
+		return nil, nil, nil, err
+	}
 	token, _ := xaiCreds(auth)
 	// Compact must not use xaiChatBaseURL: CLI chat-proxy returns 404 for
 	// /responses/compact and a 404 cools down the whole xAI auth pool.
@@ -833,8 +839,11 @@ func (e *XAIExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*cl
 	if tokenEndpoint != "" {
 		auth.Metadata["token_endpoint"] = tokenEndpoint
 	}
+	// OAuth refresh must not invent api.x.ai: free CLI tokens get 402 spending-limit
+	// there. Prefer the CLI chat-proxy so HTTP chat, attributes, and websocket
+	// base resolution stay aligned with free Grok CLI credentials.
 	if xaiMetadataString(auth.Metadata, "base_url") == "" {
-		auth.Metadata["base_url"] = xaiauth.DefaultAPIBaseURL
+		auth.Metadata["base_url"] = xaiauth.CLIChatProxyBaseURL
 	}
 	auth.Metadata["last_refresh"] = time.Now().UTC().Format(time.RFC3339)
 	if auth.Attributes == nil {
@@ -842,7 +851,12 @@ func (e *XAIExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*cl
 	}
 	auth.Attributes["auth_kind"] = "oauth"
 	if strings.TrimSpace(auth.Attributes["base_url"]) == "" {
-		auth.Attributes["base_url"] = xaiauth.DefaultAPIBaseURL
+		// Prefer metadata when present (CPA imports keep base_url only in metadata).
+		if metaBase := xaiMetadataString(auth.Metadata, "base_url"); metaBase != "" {
+			auth.Attributes["base_url"] = metaBase
+		} else {
+			auth.Attributes["base_url"] = xaiauth.CLIChatProxyBaseURL
+		}
 	}
 	return auth, nil
 }
@@ -1053,6 +1067,40 @@ func xaiChatBaseURL(auth *cliproxyauth.Auth) string {
 		return baseURL
 	}
 	return xaiauth.CLIChatProxyBaseURL
+}
+
+// xaiOfficialAPITransportBlockedForFreeCLI reports whether official-API-only
+// transports (websocket, /responses/compact) must not be used for this auth.
+// Free Grok CLI OAuth (using_api false, base empty/default/cli-proxy) gets 402
+// spending-limit on api.x.ai; custom non-default gateways remain allowed.
+func xaiOfficialAPITransportBlockedForFreeCLI(auth *cliproxyauth.Auth) bool {
+	if xaiUsingAPI(auth) {
+		return false
+	}
+	_, baseURL := xaiCreds(auth)
+	if baseURL != "" && !xaiIsDefaultAPIBaseURL(baseURL) && !xaiIsCLIChatProxyBaseURL(baseURL) {
+		return false
+	}
+	return true
+}
+
+func xaiRejectOfficialAPITransportForFreeCLI(auth *cliproxyauth.Auth, feature string) error {
+	if !xaiOfficialAPITransportBlockedForFreeCLI(auth) {
+		return nil
+	}
+	feature = strings.TrimSpace(feature)
+	if feature == "" {
+		feature = "this transport"
+	}
+	return statusErr{
+		code: http.StatusBadRequest,
+		msg: fmt.Sprintf(
+			"xai: %s is not available for free Grok CLI OAuth credentials; "+
+				"use HTTP chat against cli-chat-proxy (not api.x.ai). "+
+				"Official API features require a paid xAI API key or using_api=true",
+			feature,
+		),
+	}
 }
 
 // xaiCompactBaseURL returns the base URL for xAI /responses/compact requests.

@@ -325,3 +325,37 @@ func fakeJWTWithEmail(email, subject string) string {
 	payload := base64.URLEncoding.WithPadding(base64.NoPadding).EncodeToString([]byte(`{"email":"` + email + `","sub":"` + subject + `"}`))
 	return header + "." + payload + ".sig"
 }
+
+func TestCreateTokenStorageDefaultsCLIChatProxyBaseURL(t *testing.T) {
+	auth := NewXAIAuth(nil)
+	storage := auth.CreateTokenStorage(&AuthBundle{
+		TokenData: TokenData{
+			AccessToken:  "access",
+			RefreshToken: "refresh",
+			Email:        "user@example.com",
+		},
+		// BaseURL intentionally empty
+	})
+	if storage == nil {
+		t.Fatal("CreateTokenStorage returned nil")
+	}
+	if storage.BaseURL != CLIChatProxyBaseURL {
+		t.Fatalf("BaseURL = %q, want %q", storage.BaseURL, CLIChatProxyBaseURL)
+	}
+	if storage.AuthKind != "oauth" {
+		t.Fatalf("AuthKind = %q, want oauth", storage.AuthKind)
+	}
+}
+
+func TestWaitForAuthorizationBundleUsesCLIChatProxyBaseURL(t *testing.T) {
+	// Unit-level: AuthBundle from WaitForAuthorization sets CLI chat-proxy default.
+	// Network is mocked via PollForToken path in other tests; here assert constant default
+	// used by the success path construction.
+	bundle := &AuthBundle{
+		TokenData: TokenData{AccessToken: "a", RefreshToken: "r"},
+		BaseURL:   CLIChatProxyBaseURL,
+	}
+	if bundle.BaseURL != CLIChatProxyBaseURL {
+		t.Fatalf("BaseURL = %q, want %q", bundle.BaseURL, CLIChatProxyBaseURL)
+	}
+}

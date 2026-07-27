@@ -184,6 +184,14 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
+	// Promote base_url into attributes so executors that prefer Attributes
+	// (e.g. xAI websocket / refresh) do not fall back to a wrong default when
+	// CPA JSON only stores base_url in the root object (metadata).
+	if rawBase, ok := metadata["base_url"].(string); ok {
+		if base := strings.TrimSpace(rawBase); base != "" {
+			a.Attributes["base_url"] = base
+		}
+	}
 	// Read priority from auth file.
 	if rawPriority, ok := metadata["priority"]; ok {
 		switch v := rawPriority.(type) {
