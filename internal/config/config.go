@@ -89,8 +89,14 @@ type Config struct {
 	SaveCooldownStatus bool `yaml:"save-cooldown-status" json:"save-cooldown-status"`
 
 	// TransientErrorCooldownSeconds controls cooldowns for transient upstream errors.
-	// 0 keeps the legacy default cooldown. Negative values disable these cooldowns.
+	// 0 keeps the default cooldown (15s). Negative values disable these cooldowns.
 	TransientErrorCooldownSeconds int `yaml:"transient-error-cooldown-seconds" json:"transient-error-cooldown-seconds"`
+
+	// TransientErrorThreshold is the number of consecutive transient failures
+	// (408/500/502/503/504, excluding shared upstream capacity errors) required
+	// before a credential is cooled down. 0 keeps the default (2). Use 1 for the
+	// legacy single-failure behavior.
+	TransientErrorThreshold int `yaml:"transient-error-threshold" json:"transient-error-threshold"`
 
 	// AuthAutoRefreshWorkers overrides the size of the core auth auto-refresh worker pool.
 	// When <= 0, the default worker count is used.
@@ -781,6 +787,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.DisableCooling = false
 	cfg.SaveCooldownStatus = false
 	cfg.TransientErrorCooldownSeconds = 0
+	cfg.TransientErrorThreshold = 0
 	cfg.DisableImageGeneration = DisableImageGenerationOff
 	cfg.WebsocketAuth = true
 	cfg.Pprof.Enable = false

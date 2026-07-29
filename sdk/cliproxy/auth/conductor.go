@@ -84,14 +84,16 @@ const (
 	// success but the auth still evaluates as needing refresh (e.g. token expiry
 	// wasn't updated). Without this guard, the auto-refresh loop can tight-loop and
 	// burn CPU at idle.
-	refreshIneffectiveBackoff = 30 * time.Second
-	quotaBackoffBase          = time.Second
-	quotaBackoffMax           = 30 * time.Minute
-	transientErrorCooldown    = time.Minute
+	refreshIneffectiveBackoff      = 30 * time.Second
+	quotaBackoffBase               = time.Second
+	quotaBackoffMax                = 30 * time.Minute
+	transientErrorCooldown         = 15 * time.Second
+	transientErrorThresholdDefault = int64(2)
 )
 
 var quotaCooldownDisabled atomic.Bool
 var transientErrorCooldownSeconds atomic.Int64
+var transientErrorThreshold atomic.Int64
 
 // SetQuotaCooldownDisabled toggles quota cooldown scheduling globally.
 func SetQuotaCooldownDisabled(disable bool) {
@@ -99,9 +101,25 @@ func SetQuotaCooldownDisabled(disable bool) {
 }
 
 // SetTransientErrorCooldownSeconds configures cooldowns for 408/500/502/503/504.
-// 0 keeps the legacy default; negative values disable transient error cooldowns.
+// 0 keeps the default cooldown (15s). Negative values disable transient error cooldowns.
 func SetTransientErrorCooldownSeconds(seconds int) {
 	transientErrorCooldownSeconds.Store(int64(seconds))
+}
+
+// SetTransientErrorThreshold configures how many consecutive transient failures
+// (408/500/502/503/504, excluding shared upstream capacity errors) are required
+// before a credential is cooled down. 0 keeps the default (2). Use 1 for the
+// legacy single-failure behavior.
+func SetTransientErrorThreshold(n int) {
+	transientErrorThreshold.Store(int64(n))
+}
+
+func transientErrorFailureThreshold() int64 {
+	n := transientErrorThreshold.Load()
+	if n <= 0 {
+		return transientErrorThresholdDefault
+	}
+	return n
 }
 
 func quotaCooldownDisabledForAuth(auth *Auth) bool {
@@ -156,6 +174,47 @@ func nextTransientErrorRetryAfter(now time.Time) time.Time {
 		return now.Add(transientErrorCooldown)
 	}
 	return now.Add(time.Duration(seconds) * time.Second)
+}
+
+// nextTransientErrorCooldownAfterFailure advances the consecutive-failure counter and,
+// once the threshold is reached, returns a cooldown deadline. Shared upstream capacity
+// errors never cool a credential: cooling a healthy account cannot fix provider-wide
+// overload and only shrinks the available pool.
+//
+// When cooling is disabled, the counter is left unchanged and no deadline is scheduled.
+func nextTransientErrorCooldownAfterFailure(failCount int, disableCooling bool, now time.Time, resultErr *Error) (time.Time, int) {
+	if isSharedUpstreamCapacityError(resultErr) {
+		return time.Time{}, failCount
+	}
+	if disableCooling {
+		return time.Time{}, failCount
+	}
+	failCount++
+	if int64(failCount) < transientErrorFailureThreshold() {
+		return time.Time{}, failCount
+	}
+	return nextTransientErrorRetryAfter(now), 0
+}
+
+// isSharedUpstreamCapacityError reports whether the failure is an upstream-wide capacity
+// signal (e.g. server_is_overloaded) rather than a credential-local fault.
+func isSharedUpstreamCapacityError(err *Error) bool {
+	if err == nil {
+		return false
+	}
+	switch statusCodeFromResult(err) {
+	case http.StatusRequestTimeout, http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+	default:
+		return false
+	}
+	combined := strings.ToLower(strings.TrimSpace(err.Code) + " " + strings.TrimSpace(err.Message))
+	if combined == "" {
+		return false
+	}
+	return strings.Contains(combined, "server_is_overloaded") ||
+		strings.Contains(combined, "overloaded_error") ||
+		strings.Contains(combined, "model_capacity_exhausted") ||
+		strings.Contains(combined, "capacity_exhausted")
 }
 
 // Result captures execution outcome used to adjust auth state.
@@ -3964,11 +4023,15 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 								setModelQuota = true
 							}
 						case 408, 500, 502, 503, 504:
-							if disableCooling {
-								state.NextRetryAfter = time.Time{}
-							} else {
-								state.NextRetryAfter = nextTransientErrorRetryAfter(now)
+							if isSharedUpstreamCapacityError(result.Error) {
+								state.StatusMessage = "upstream capacity exhausted"
+								if auth.LastError != nil {
+									auth.StatusMessage = "upstream capacity exhausted"
+								}
 							}
+							next, failCount := nextTransientErrorCooldownAfterFailure(state.TransientFailCount, disableCooling, now, result.Error)
+							state.TransientFailCount = failCount
+							state.NextRetryAfter = next
 						default:
 							state.NextRetryAfter = time.Time{}
 						}
@@ -4068,6 +4131,7 @@ func resetModelState(state *ModelState, now time.Time) {
 	state.NextRetryAfter = time.Time{}
 	state.LastError = nil
 	state.Quota = QuotaState{}
+	state.TransientFailCount = 0
 	state.UpdatedAt = now
 }
 
@@ -4079,6 +4143,9 @@ func modelStateIsClean(state *ModelState) bool {
 		return false
 	}
 	if state.Unavailable || state.StatusMessage != "" || !state.NextRetryAfter.IsZero() || state.LastError != nil {
+		return false
+	}
+	if state.TransientFailCount != 0 {
 		return false
 	}
 	if state.Quota.Exceeded || state.Quota.Reason != "" || !state.Quota.NextRecoverAt.IsZero() || state.Quota.BackoffLevel != 0 {
@@ -4200,6 +4267,7 @@ func clearAuthStateOnSuccess(auth *Auth, now time.Time) {
 	auth.Quota.BackoffLevel = 0
 	auth.LastError = nil
 	auth.NextRetryAfter = time.Time{}
+	auth.TransientFailCount = 0
 	auth.UpdatedAt = now
 }
 
@@ -4772,12 +4840,14 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 		auth.Quota.NextRecoverAt = next
 		auth.NextRetryAfter = next
 	case 408, 500, 502, 503, 504:
-		auth.StatusMessage = "transient upstream error"
-		if disableCooling {
-			auth.NextRetryAfter = time.Time{}
+		if isSharedUpstreamCapacityError(resultErr) {
+			auth.StatusMessage = "upstream capacity exhausted"
 		} else {
-			auth.NextRetryAfter = nextTransientErrorRetryAfter(now)
+			auth.StatusMessage = "transient upstream error"
 		}
+		next, failCount := nextTransientErrorCooldownAfterFailure(auth.TransientFailCount, disableCooling, now, resultErr)
+		auth.TransientFailCount = failCount
+		auth.NextRetryAfter = next
 	default:
 		if auth.StatusMessage == "" {
 			auth.StatusMessage = "request failed"

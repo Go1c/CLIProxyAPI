@@ -87,6 +87,9 @@ type Auth struct {
 	NextRefreshAfter time.Time `json:"next_refresh_after"`
 	// NextRetryAfter is the earliest time a retry should retrigger.
 	NextRetryAfter time.Time `json:"next_retry_after"`
+	// TransientFailCount tracks consecutive auth-level transient upstream failures
+	// (408/500/502/503/504) used to gate credential cooldown.
+	TransientFailCount int `json:"transient_fail_count,omitempty"`
 	// ModelStates tracks per-model runtime availability data.
 	ModelStates map[string]*ModelState `json:"model_states,omitempty"`
 
@@ -190,6 +193,9 @@ type ModelState struct {
 	LastError *Error `json:"last_error,omitempty"`
 	// Quota retains quota information if this model hit rate limits.
 	Quota QuotaState `json:"quota"`
+	// TransientFailCount tracks consecutive transient upstream failures for this model
+	// (408/500/502/503/504) used to gate credential cooldown.
+	TransientFailCount int `json:"transient_fail_count,omitempty"`
 	// UpdatedAt tracks the last update timestamp for this model state.
 	UpdatedAt time.Time `json:"updated_at"`
 }

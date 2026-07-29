@@ -690,7 +690,12 @@ func TestManagerExecuteStream_ModelSupportBadRequestFallsBackAndSuspendsAuth(t *
 func TestManager_MarkResult_RespectsAuthDisableCoolingOverride(t *testing.T) {
 	prev := quotaCooldownDisabled.Load()
 	quotaCooldownDisabled.Store(false)
-	t.Cleanup(func() { quotaCooldownDisabled.Store(prev) })
+	prevThreshold := transientErrorThreshold.Load()
+	SetTransientErrorThreshold(1)
+	t.Cleanup(func() {
+		quotaCooldownDisabled.Store(prev)
+		transientErrorThreshold.Store(prevThreshold)
+	})
 
 	m := NewManager(nil, nil, nil)
 
@@ -731,10 +736,13 @@ func TestManager_MarkResult_TransientErrorCooldownDefault(t *testing.T) {
 	prevQuota := quotaCooldownDisabled.Load()
 	quotaCooldownDisabled.Store(false)
 	prevTransient := transientErrorCooldownSeconds.Load()
+	prevThreshold := transientErrorThreshold.Load()
 	SetTransientErrorCooldownSeconds(0)
+	SetTransientErrorThreshold(0)
 	t.Cleanup(func() {
 		quotaCooldownDisabled.Store(prevQuota)
 		transientErrorCooldownSeconds.Store(prevTransient)
+		transientErrorThreshold.Store(prevThreshold)
 	})
 
 	m := NewManager(nil, nil, nil)
@@ -748,6 +756,7 @@ func TestManager_MarkResult_TransientErrorCooldownDefault(t *testing.T) {
 	}
 
 	model := "test-model-transient-default"
+	// First failure stays below the default threshold and must not cool the credential.
 	m.MarkResult(context.Background(), Result{
 		AuthID:   auth.ID,
 		Provider: auth.Provider,
@@ -764,12 +773,39 @@ func TestManager_MarkResult_TransientErrorCooldownDefault(t *testing.T) {
 	if state == nil {
 		t.Fatalf("expected model state to be present")
 	}
+	if !state.NextRetryAfter.IsZero() {
+		t.Fatalf("expected first transient failure not to cool credential, got NextRetryAfter=%v", state.NextRetryAfter)
+	}
+	if state.TransientFailCount != 1 {
+		t.Fatalf("expected TransientFailCount=1 after first failure, got %d", state.TransientFailCount)
+	}
+
+	// Second consecutive failure reaches the default threshold (2) and applies the 15s default cooldown.
+	m.MarkResult(context.Background(), Result{
+		AuthID:   auth.ID,
+		Provider: auth.Provider,
+		Model:    model,
+		Success:  false,
+		Error:    &Error{HTTPStatus: http.StatusBadGateway, Message: "bad gateway again"},
+	})
+
+	updated, ok = m.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatalf("expected auth to be present after second failure")
+	}
+	state = updated.ModelStates[model]
+	if state == nil {
+		t.Fatalf("expected model state to be present after second failure")
+	}
 	if state.NextRetryAfter.IsZero() {
-		t.Fatal("expected transient error cooldown to keep the legacy default")
+		t.Fatal("expected transient error cooldown after consecutive failures")
+	}
+	if state.TransientFailCount != 0 {
+		t.Fatalf("expected TransientFailCount to reset after cooldown starts, got %d", state.TransientFailCount)
 	}
 	diff := time.Until(state.NextRetryAfter)
-	if diff < 55*time.Second || diff > 65*time.Second {
-		t.Fatalf("expected transient error cooldown to be ~60 seconds, got %v", diff)
+	if diff < 10*time.Second || diff > 20*time.Second {
+		t.Fatalf("expected transient error cooldown to be ~15 seconds, got %v", diff)
 	}
 }
 
@@ -777,10 +813,13 @@ func TestManager_MarkResult_TransientErrorCooldownDisabled(t *testing.T) {
 	prevQuota := quotaCooldownDisabled.Load()
 	quotaCooldownDisabled.Store(false)
 	prevTransient := transientErrorCooldownSeconds.Load()
+	prevThreshold := transientErrorThreshold.Load()
 	SetTransientErrorCooldownSeconds(-1)
+	SetTransientErrorThreshold(1)
 	t.Cleanup(func() {
 		quotaCooldownDisabled.Store(prevQuota)
 		transientErrorCooldownSeconds.Store(prevTransient)
+		transientErrorThreshold.Store(prevThreshold)
 	})
 
 	m := NewManager(nil, nil, nil)
@@ -835,6 +874,157 @@ func TestManager_MarkResult_TransientErrorCooldownDisabled(t *testing.T) {
 	}
 	if !updatedAuthLevel.NextRetryAfter.IsZero() {
 		t.Fatalf("expected transient auth cooldown to be disabled, got %v", updatedAuthLevel.NextRetryAfter)
+	}
+}
+
+func TestManager_MarkResult_TransientErrorThresholdLegacySingleFailure(t *testing.T) {
+	prevQuota := quotaCooldownDisabled.Load()
+	quotaCooldownDisabled.Store(false)
+	prevTransient := transientErrorCooldownSeconds.Load()
+	prevThreshold := transientErrorThreshold.Load()
+	SetTransientErrorCooldownSeconds(0)
+	SetTransientErrorThreshold(1)
+	t.Cleanup(func() {
+		quotaCooldownDisabled.Store(prevQuota)
+		transientErrorCooldownSeconds.Store(prevTransient)
+		transientErrorThreshold.Store(prevThreshold)
+	})
+
+	m := NewManager(nil, nil, nil)
+	auth := &Auth{ID: "auth-transient-threshold-1", Provider: "codex"}
+	if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	model := "gpt-5.5"
+	m.MarkResult(context.Background(), Result{
+		AuthID:   auth.ID,
+		Provider: auth.Provider,
+		Model:    model,
+		Success:  false,
+		Error:    &Error{HTTPStatus: http.StatusBadGateway, Message: "bad gateway"},
+	})
+
+	updated, ok := m.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatalf("expected auth to be present")
+	}
+	state := updated.ModelStates[model]
+	if state == nil {
+		t.Fatalf("expected model state to be present")
+	}
+	if state.NextRetryAfter.IsZero() {
+		t.Fatal("expected single failure to cool credential when threshold=1")
+	}
+	diff := time.Until(state.NextRetryAfter)
+	if diff < 10*time.Second || diff > 20*time.Second {
+		t.Fatalf("expected ~15s cooldown, got %v", diff)
+	}
+}
+
+func TestManager_MarkResult_SharedUpstreamCapacityDoesNotCooldown(t *testing.T) {
+	prevQuota := quotaCooldownDisabled.Load()
+	quotaCooldownDisabled.Store(false)
+	prevTransient := transientErrorCooldownSeconds.Load()
+	prevThreshold := transientErrorThreshold.Load()
+	SetTransientErrorCooldownSeconds(0)
+	SetTransientErrorThreshold(1)
+	t.Cleanup(func() {
+		quotaCooldownDisabled.Store(prevQuota)
+		transientErrorCooldownSeconds.Store(prevTransient)
+		transientErrorThreshold.Store(prevThreshold)
+	})
+
+	m := NewManager(nil, nil, nil)
+	auth := &Auth{ID: "auth-overloaded", Provider: "codex"}
+	if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	model := "gpt-5.5"
+	for i := 0; i < 3; i++ {
+		m.MarkResult(context.Background(), Result{
+			AuthID:   auth.ID,
+			Provider: auth.Provider,
+			Model:    model,
+			Success:  false,
+			Error:    &Error{HTTPStatus: http.StatusServiceUnavailable, Message: `{"error":{"type":"server_is_overloaded","message":"The server is overloaded"}}`},
+		})
+	}
+
+	updated, ok := m.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatalf("expected auth to be present")
+	}
+	state := updated.ModelStates[model]
+	if state == nil {
+		t.Fatalf("expected model state to be present")
+	}
+	if !state.NextRetryAfter.IsZero() {
+		t.Fatalf("expected shared capacity errors not to cool credential, got NextRetryAfter=%v", state.NextRetryAfter)
+	}
+	if state.TransientFailCount != 0 {
+		t.Fatalf("expected TransientFailCount to stay 0 for capacity errors, got %d", state.TransientFailCount)
+	}
+	if state.StatusMessage != "upstream capacity exhausted" {
+		t.Fatalf("StatusMessage = %q, want upstream capacity exhausted", state.StatusMessage)
+	}
+}
+
+func TestManager_MarkResult_TransientFailCountResetsOnSuccess(t *testing.T) {
+	prevQuota := quotaCooldownDisabled.Load()
+	quotaCooldownDisabled.Store(false)
+	prevTransient := transientErrorCooldownSeconds.Load()
+	prevThreshold := transientErrorThreshold.Load()
+	SetTransientErrorCooldownSeconds(0)
+	SetTransientErrorThreshold(2)
+	t.Cleanup(func() {
+		quotaCooldownDisabled.Store(prevQuota)
+		transientErrorCooldownSeconds.Store(prevTransient)
+		transientErrorThreshold.Store(prevThreshold)
+	})
+
+	m := NewManager(nil, nil, nil)
+	auth := &Auth{ID: "auth-transient-reset", Provider: "claude"}
+	if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	model := "test-model-reset"
+	m.MarkResult(context.Background(), Result{
+		AuthID:   auth.ID,
+		Provider: auth.Provider,
+		Model:    model,
+		Success:  false,
+		Error:    &Error{HTTPStatus: http.StatusBadGateway, Message: "bad gateway"},
+	})
+	m.MarkResult(context.Background(), Result{
+		AuthID:   auth.ID,
+		Provider: auth.Provider,
+		Model:    model,
+		Success:  true,
+	})
+	m.MarkResult(context.Background(), Result{
+		AuthID:   auth.ID,
+		Provider: auth.Provider,
+		Model:    model,
+		Success:  false,
+		Error:    &Error{HTTPStatus: http.StatusBadGateway, Message: "bad gateway"},
+	})
+
+	updated, ok := m.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatalf("expected auth to be present")
+	}
+	state := updated.ModelStates[model]
+	if state == nil {
+		t.Fatalf("expected model state to be present")
+	}
+	if !state.NextRetryAfter.IsZero() {
+		t.Fatalf("expected success to reset streak so one later failure does not cool, got NextRetryAfter=%v", state.NextRetryAfter)
+	}
+	if state.TransientFailCount != 1 {
+		t.Fatalf("expected TransientFailCount=1 after reset+one failure, got %d", state.TransientFailCount)
 	}
 }
 
