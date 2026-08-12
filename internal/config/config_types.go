@@ -115,7 +115,13 @@ type ClaudeHeaderDefaults struct {
 // model requests for OAuth/file-backed auth when the client omits them.
 // UserAgent applies to HTTP and websocket requests; BetaFeatures only applies to websockets.
 type CodexHeaderDefaults struct {
-	UserAgent    string `yaml:"user-agent" json:"user-agent"`
+	// UserAgent applies to HTTP and websocket requests.
+	UserAgent string `yaml:"user-agent" json:"user-agent"`
+	// Originator is the Codex originator identity header.
+	Originator string `yaml:"originator" json:"originator"`
+	// Version is the Codex client version header.
+	Version string `yaml:"version" json:"version"`
+	// BetaFeatures only applies to websockets (x-codex-beta-features).
 	BetaFeatures string `yaml:"beta-features" json:"beta-features"`
 }
 

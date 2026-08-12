@@ -403,7 +403,7 @@ func (b *contextCheckingBody) Read(p []byte) (int, error) {
 
 func (b *contextCheckingBody) Close() error { return nil }
 
-func TestCodexRustlsClientHelloMatchesCLI01441(t *testing.T) {
+func TestCodexRustlsClientHelloMatchesCLI01460(t *testing.T) {
 	t.Parallel()
 
 	spec := codexRustlsLikeClientHelloSpec([]string{"h2", "http/1.1"})
@@ -610,4 +610,25 @@ func codexTestExtensionIDs(extensions []tls.TLSExtension) []uint16 {
 		}
 	}
 	return ids
+}
+
+func TestIsCodexOfficialHostIncludesAuthOpenAI(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		host string
+		want bool
+	}{
+		{"chatgpt.com", true},
+		{"www.chatgpt.com", true},
+		{"auth.openai.com", true},
+		{"AUTH.OPENAI.COM", true},
+		{"api.openai.com", false},
+		{"example.com", false},
+		{"", false},
+	}
+	for _, tc := range cases {
+		if got := isCodexOfficialHost(tc.host); got != tc.want {
+			t.Fatalf("isCodexOfficialHost(%q) = %v, want %v", tc.host, got, tc.want)
+		}
+	}
 }

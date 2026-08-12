@@ -23,7 +23,10 @@ import (
 	"golang.org/x/net/http2"
 )
 
-const codexOfficialHost = "chatgpt.com"
+const (
+	codexOfficialHost     = "chatgpt.com"
+	codexOfficialAuthHost = "auth.openai.com"
+)
 
 // CodexProxyTimings captures pre-header network stages for management probes.
 type CodexProxyTimings struct {
@@ -380,7 +383,18 @@ func roundTripBeforeHeaders(req *http.Request, transport codexHTTP2Transport, ti
 
 func isCodexOfficialHost(host string) bool {
 	host = strings.ToLower(strings.TrimSpace(host))
-	return host == codexOfficialHost || strings.HasSuffix(host, "."+codexOfficialHost)
+	if host == "" {
+		return false
+	}
+	// ChatGPT API / websocket plane.
+	if host == codexOfficialHost || strings.HasSuffix(host, "."+codexOfficialHost) {
+		return true
+	}
+	// OAuth token exchange / refresh plane used by Codex CLI login.
+	if host == codexOfficialAuthHost || strings.HasSuffix(host, "."+codexOfficialAuthHost) {
+		return true
+	}
+	return false
 }
 
 func (d *codexRustlsDialer) dialTCP(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -564,7 +578,7 @@ func codexAuthUsesAPIKey(auth *cliproxyauth.Auth) bool {
 }
 
 // NewCodexRustlsHTTPClient creates a proxy-aware HTTP/2 client matching the
-// ClientHello captured from Codex CLI 0.144.1 for official OAuth traffic.
+// ClientHello aligned to local Codex CLI 0.146.0 (chatgpt.com OAuth capture).
 func NewCodexRustlsHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth) (*http.Client, error) {
 	return newCodexRustlsHTTPClient(ctx, cfg, auth, nil)
 }
@@ -650,4 +664,53 @@ func NewCodexRustlsNetDialTLSContext(cfg *config.Config, auth *cliproxyauth.Auth
 		}
 		return dialer.dialTLS(ctx, network, addr, "", nil)
 	}
+}
+
+// NewCodexOAuthHTTPClient builds the HTTP client used by Codex login/refresh.
+// It applies the same rustls-like ClientHello profile as Codex CLI OAuth traffic
+// for chatgpt.com and auth.openai.com, with proxy-aware fallback for other hosts.
+// proxyURL overrides cfg.ProxyURL when non-empty (including "direct").
+func NewCodexOAuthHTTPClient(cfg *config.Config, proxyURL string) (*http.Client, error) {
+	effective := strings.TrimSpace(proxyURL)
+	var full *config.Config
+	if cfg != nil {
+		clone := *cfg
+		if effective != "" {
+			clone.ProxyURL = effective
+		}
+		full = &clone
+	} else if effective != "" {
+		full = &config.Config{SDKConfig: config.SDKConfig{ProxyURL: effective}}
+	}
+	// OAuth is always credentialed as ChatGPT OAuth (not API key), so enable fingerprinting.
+	auth := &cliproxyauth.Auth{Provider: "codex", ProxyURL: effective}
+	return NewCodexRustlsHTTPClient(context.Background(), full, auth)
+}
+
+// IsCodexFingerprintTransport reports whether rt is the Codex rustls-like transport.
+func IsCodexFingerprintTransport(rt http.RoundTripper) bool {
+	_, ok := rt.(*codexRustlsRoundTripper)
+	return ok
+}
+
+// CodexFingerprintTransportInfo exposes a few test/diagnostic fields for the
+// Codex rustls-like transport without exporting the concrete type.
+type CodexFingerprintTransportInfo struct {
+	Enabled         bool
+	InheritEnvProxy bool
+	ProxyHash       string
+}
+
+// CodexFingerprintTransportInfoOf returns diagnostics when rt is a Codex
+// fingerprint transport. ok is false for any other RoundTripper.
+func CodexFingerprintTransportInfoOf(rt http.RoundTripper) (info CodexFingerprintTransportInfo, ok bool) {
+	typed, ok := rt.(*codexRustlsRoundTripper)
+	if !ok || typed == nil {
+		return CodexFingerprintTransportInfo{}, false
+	}
+	return CodexFingerprintTransportInfo{
+		Enabled:         typed.enabled,
+		InheritEnvProxy: typed.inheritEnvProxy,
+		ProxyHash:       typed.proxyHash,
+	}, true
 }

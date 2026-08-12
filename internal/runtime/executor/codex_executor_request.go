@@ -23,8 +23,10 @@ import (
 )
 
 const (
-	codexUserAgent             = "codex-tui/0.146.0 (Mac OS 26.5.0; arm64) iTerm.app/3.6.10 (codex-tui; 0.146.0)"
+	codexUserAgent             = "codex-tui/0.146.0 (Mac OS 26.5.2; arm64) Orca/1.4.178 (codex-tui; 0.146.0)"
 	codexOriginator            = "codex-tui"
+	codexDefaultVersion        = "0.146.0"
+	codexDefaultBetaFeatures   = "remote_compaction_v2"
 	codexDefaultImageToolModel = "gpt-image-2"
 	codexResponsesLiteHeader   = "X-OpenAI-Internal-Codex-Responses-Lite"
 	codexResponsesLiteMetadata = "client_metadata.ws_request_header_x_openai_internal_codex_responses_lite"
@@ -78,7 +80,10 @@ func (e *CodexExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth
 	if err := e.PrepareRequest(httpReq, auth); err != nil {
 		return nil, err
 	}
-	httpClient := helps.NewUtlsHTTPClient(ctx, e.cfg, auth, 0)
+	httpClient, errClient := helps.NewCodexRustlsHTTPClient(ctx, e.cfg, auth)
+	if errClient != nil {
+		return nil, errClient
+	}
 	return httpClient.Do(httpReq)
 }
 
@@ -149,7 +154,12 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Form
 		return nil, nil, codexIdentityConfuseState{}, err
 	}
 	if cache.ID != "" {
+		// Match local Codex CLI 0.146.0 HTTP Responses headers (Session-Id / Thread-Id /
+		// X-Client-Request-Id / X-Codex-Window-Id share the session UUID).
 		httpReq.Header.Set("Session-Id", cache.ID)
+		httpReq.Header.Set("Thread-Id", cache.ID)
+		httpReq.Header.Set("X-Client-Request-Id", cache.ID)
+		httpReq.Header.Set("X-Codex-Window-Id", cache.ID+":0")
 	}
 	return httpReq, rawJSON, identityState, nil
 }
@@ -188,10 +198,29 @@ func applyCodexIdentityConfuseHeaders(headers http.Header, state *codexIdentityC
 		return
 	}
 
-	if rawTurnMetadata := strings.TrimSpace(headers.Get("X-Codex-Turn-Metadata")); rawTurnMetadata != "" {
-		headers.Set("X-Codex-Turn-Metadata", applyCodexTurnMetadataIdentityConfuse(rawTurnMetadata, state))
+	if rawTurnMetadata := strings.TrimSpace(headerValueCaseInsensitive(headers, "x-codex-turn-metadata")); rawTurnMetadata != "" {
+		// Prefer existing wire key casing (HTTP: X-Codex-Turn-Metadata, WS: x-codex-turn-metadata).
+		metaKey := "X-Codex-Turn-Metadata"
+		for existingKey := range headers {
+			if strings.EqualFold(existingKey, metaKey) {
+				metaKey = existingKey
+				break
+			}
+		}
+		setHeaderCasePreserved(headers, metaKey, applyCodexTurnMetadataIdentityConfuse(rawTurnMetadata, state))
 	}
 	if state.promptCacheKey == "" {
+		return
+	}
+
+	// Local Codex CLI 0.146.0 uses MIME-style names on HTTP and lowercase on websocket upgrades.
+	wsWire := headersHaveCodexWebsocketWireForm(headers)
+	if wsWire {
+		setCodexSessionHeaderCasePreserved(headers, "session-id", state.promptCacheKey)
+		setHeaderCasePreserved(headers, "x-client-request-id", state.promptCacheKey)
+		setHeaderCasePreserved(headers, "thread-id", state.promptCacheKey)
+		setHeaderCasePreserved(headers, "x-codex-window-id", state.promptCacheKey+":0")
+		normalizeCodexWebsocketWireHeaders(headers)
 		return
 	}
 
@@ -199,9 +228,25 @@ func applyCodexIdentityConfuseHeaders(headers http.Header, state *codexIdentityC
 	if headerValueCaseInsensitive(headers, "Conversation_id") != "" {
 		setHeaderCasePreserved(headers, "Conversation_id", state.promptCacheKey)
 	}
-	headers.Set("X-Client-Request-Id", state.promptCacheKey)
-	headers.Set("Thread-Id", state.promptCacheKey)
-	headers.Set("X-Codex-Window-Id", state.promptCacheKey+":0")
+	setHeaderCasePreserved(headers, "X-Client-Request-Id", state.promptCacheKey)
+	setHeaderCasePreserved(headers, "Thread-Id", state.promptCacheKey)
+	setHeaderCasePreserved(headers, "X-Codex-Window-Id", state.promptCacheKey+":0")
+}
+
+func headersHaveCodexWebsocketWireForm(headers http.Header) bool {
+	if headers == nil {
+		return false
+	}
+	if _, ok := headers["session-id"]; ok {
+		return true
+	}
+	if _, ok := headers["openai-beta"]; ok {
+		return true
+	}
+	if _, ok := headers["thread-id"]; ok {
+		return true
+	}
+	return false
 }
 
 func applyCodexTurnMetadataIdentityConfuse(rawTurnMetadata string, state *codexIdentityConfuseState) string {
@@ -351,7 +396,9 @@ func applyCodexHeadersFromSources(r *http.Request, auth *cliproxyauth.Auth, toke
 	if !isAPIKey {
 		if auth != nil && auth.Metadata != nil {
 			if accountID, ok := auth.Metadata["account_id"].(string); ok {
-				r.Header.Set("Chatgpt-Account-Id", accountID)
+				// Match local Codex CLI 0.146.0 wire form (lowercase). net/http may
+				// re-canonicalize on the wire for HTTP/1.1; case is preserved for H2/WS maps.
+				setHeaderCasePreserved(r.Header, "chatgpt-account-id", accountID)
 			}
 		}
 	}
@@ -369,6 +416,13 @@ func applyCodexCloakingHeaders(headers http.Header, cfg *config.Config) {
 	}
 	headers.Set("User-Agent", codexUserAgent)
 	headers.Set("Originator", codexOriginator)
+	if strings.TrimSpace(headers.Get("Version")) == "" {
+		headers.Set("Version", codexDefaultVersion)
+	}
+	if strings.TrimSpace(headers.Get("X-Codex-Beta-Features")) == "" && strings.TrimSpace(headers.Get("x-codex-beta-features")) == "" {
+		headers.Set("X-Codex-Beta-Features", codexDefaultBetaFeatures)
+		headers.Set("x-codex-beta-features", codexDefaultBetaFeatures)
+	}
 }
 
 func normalizeCodexInstructions(body []byte) []byte {

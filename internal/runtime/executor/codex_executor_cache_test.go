@@ -52,6 +52,15 @@ func TestCodexExecutorCacheHelper_OpenAIChatCompletions_StablePromptCacheKeyFrom
 	if gotSession := httpReq.Header["Session-Id"]; len(gotSession) != 1 || gotSession[0] != expectedKey {
 		t.Fatalf("Session-Id = %#v, want [%q]", gotSession, expectedKey)
 	}
+	if gotThread := httpReq.Header.Get("Thread-Id"); gotThread != expectedKey {
+		t.Fatalf("Thread-Id = %q, want %q", gotThread, expectedKey)
+	}
+	if gotWindow := httpReq.Header.Get("X-Codex-Window-Id"); gotWindow != expectedKey+":0" {
+		t.Fatalf("X-Codex-Window-Id = %q, want %q", gotWindow, expectedKey+":0")
+	}
+	if gotRequestID := httpReq.Header.Get("X-Client-Request-Id"); gotRequestID != expectedKey {
+		t.Fatalf("X-Client-Request-Id = %q, want %q", gotRequestID, expectedKey)
+	}
 	if gotLegacySession := httpReq.Header.Get("Session_id"); gotLegacySession != "" {
 		t.Fatalf("Session_id = %q, want empty", gotLegacySession)
 	}
@@ -230,10 +239,11 @@ func TestCodexExecutorCacheHelper_IdentityConfuseRemapsBodyAndHeaders(t *testing
 	if gotHeader := httpReq.Header["Session-Id"]; len(gotHeader) != 1 || gotHeader[0] != expectedPromptCacheKey {
 		t.Fatalf("Session-Id = %#v, want [%q]", gotHeader, expectedPromptCacheKey)
 	}
-	for _, headerName := range []string{"X-Client-Request-Id", "Thread-Id"} {
-		if gotHeader := httpReq.Header.Get(headerName); gotHeader != expectedPromptCacheKey {
-			t.Fatalf("%s = %q, want %q", headerName, gotHeader, expectedPromptCacheKey)
-		}
+	if gotRequestID := httpReq.Header.Get("X-Client-Request-Id"); gotRequestID != expectedPromptCacheKey {
+		t.Fatalf("X-Client-Request-Id = %q, want %q", gotRequestID, expectedPromptCacheKey)
+	}
+	if gotThreadID := httpReq.Header.Get("Thread-Id"); gotThreadID != expectedPromptCacheKey {
+		t.Fatalf("Thread-Id = %q, want %q", gotThreadID, expectedPromptCacheKey)
 	}
 	if gotLegacySession := httpReq.Header.Get("Session_id"); gotLegacySession != "" {
 		t.Fatalf("Session_id = %q, want empty", gotLegacySession)
@@ -241,7 +251,7 @@ func TestCodexExecutorCacheHelper_IdentityConfuseRemapsBodyAndHeaders(t *testing
 	if gotWindow := httpReq.Header.Get("X-Codex-Window-Id"); gotWindow != expectedPromptCacheKey+":0" {
 		t.Fatalf("X-Codex-Window-Id = %q, want %q", gotWindow, expectedPromptCacheKey+":0")
 	}
-	gotHeaderMetadata := httpReq.Header.Get("X-Codex-Turn-Metadata")
+	gotHeaderMetadata := headerValueCaseInsensitive(httpReq.Header, "X-Codex-Turn-Metadata")
 	if gotMetadataPromptCacheKey := gjson.Get(gotHeaderMetadata, "prompt_cache_key").String(); gotMetadataPromptCacheKey != expectedPromptCacheKey {
 		t.Fatalf("X-Codex-Turn-Metadata.prompt_cache_key = %q, want %q", gotMetadataPromptCacheKey, expectedPromptCacheKey)
 	}
@@ -262,8 +272,11 @@ func TestApplyCodexHeadersUsesAccountHeaderForOAuth(t *testing.T) {
 
 	applyCodexHeaders(httpReq, auth, "oauth-token", true, nil)
 
-	if got := httpReq.Header.Get("Chatgpt-Account-Id"); got != "acct-1" {
-		t.Fatalf("Chatgpt-Account-Id = %q, want acct-1", got)
+	if got := headerValueCaseInsensitive(httpReq.Header, "chatgpt-account-id"); got != "acct-1" {
+		t.Fatalf("chatgpt-account-id = %q, want acct-1", got)
+	}
+	if _, ok := httpReq.Header["chatgpt-account-id"]; !ok {
+		t.Fatalf("expected exact chatgpt-account-id key, got %#v", httpReq.Header)
 	}
 }
 

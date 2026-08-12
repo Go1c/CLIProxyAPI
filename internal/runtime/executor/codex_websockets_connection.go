@@ -31,6 +31,14 @@ func (e *CodexWebsocketsExecutor) dialCodexWebsocket(ctx context.Context, auth *
 	dialer := newProxyAwareWebsocketDialer(e.cfg, auth)
 	dialer.HandshakeTimeout = codexResponsesWebsocketHandshakeTO
 	dialer.EnableCompression = true
+	// Official ChatGPT OAuth websockets use the Codex CLI rustls-like TLS profile.
+	// Leave gorilla's Proxy hook disabled when the custom TLS dialer owns proxying.
+	if !codexAuthUsesAPIKey(auth) {
+		if tlsDial := helps.NewCodexRustlsNetDialTLSContext(e.cfg, auth); tlsDial != nil {
+			dialer.NetDialTLSContext = tlsDial
+			dialer.Proxy = nil
+		}
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}

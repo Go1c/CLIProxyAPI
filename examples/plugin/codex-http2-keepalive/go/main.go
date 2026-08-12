@@ -75,9 +75,9 @@ const (
 	defaultPluginVersion     = "0.1.0"
 	defaultCodexResponsesURL = "https://chatgpt.com/backend-api/codex/responses"
 	defaultPluginPrompt      = "Help me use Codex HTTP/2 keepalive."
-	defaultCodexUserAgent    = "codex-tui/0.144.1 (Mac OS 26.4.1; arm64) Orca/1.4.103 (codex-tui; 0.144.1)"
+	defaultCodexUserAgent    = "codex-tui/0.146.0 (Mac OS 26.5.2; arm64) Orca/1.4.178 (codex-tui; 0.146.0)"
 	defaultCodexOriginator   = "codex-tui"
-	defaultCodexVersion      = "0.144.1"
+	defaultCodexVersion      = "0.146.0"
 	defaultCodexBetaFeatures = "remote_compaction_v2"
 )
 

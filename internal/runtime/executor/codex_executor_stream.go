@@ -104,7 +104,11 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		AuthValue: authValue,
 	})
 
-	httpClient := helps.NewUtlsHTTPClient(ctx, e.cfg, auth, 0)
+	httpClient, errClient := helps.NewCodexRustlsHTTPClient(ctx, e.cfg, auth)
+	if errClient != nil {
+		helps.RecordAPIResponseError(ctx, e.cfg, errClient)
+		return nil, errClient
+	}
 	httpClient = reporter.TrackHTTPClient(httpClient)
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
