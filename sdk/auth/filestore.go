@@ -77,6 +77,9 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 	if auth == nil {
 		return "", fmt.Errorf("auth filestore: auth is nil")
 	}
+	if errWeight := cliproxyauth.ValidateAuthWeight(auth); errWeight != nil {
+		return "", fmt.Errorf("auth filestore: %w", errWeight)
+	}
 
 	path, err := s.resolveAuthPath(auth)
 	if err != nil {
@@ -113,9 +116,7 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 		if setter, ok := auth.Storage.(metadataSetter); ok {
 			setter.SetMetadata(auth.Metadata)
 		}
-		if err = atomicReplaceAuthFile(path, func(tempPath string) error {
-			return auth.Storage.SaveTokenToFile(tempPath)
-		}); err != nil {
+		if err = auth.Storage.SaveTokenToFile(path); err != nil {
 			return "", err
 		}
 	case auth.Metadata != nil:
@@ -126,15 +127,25 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 		}
 		if existing, errRead := os.ReadFile(path); errRead == nil {
 			if jsonEqual(existing, raw) {
-				return path, nil
+				break
 			}
+			file, errOpen := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0o600)
+			if errOpen != nil {
+				return "", fmt.Errorf("auth filestore: open existing failed: %w", errOpen)
+			}
+			if _, errWrite := file.Write(raw); errWrite != nil {
+				_ = file.Close()
+				return "", fmt.Errorf("auth filestore: write existing failed: %w", errWrite)
+			}
+			if errClose := file.Close(); errClose != nil {
+				return "", fmt.Errorf("auth filestore: close existing failed: %w", errClose)
+			}
+			break
 		} else if !os.IsNotExist(errRead) {
 			return "", fmt.Errorf("auth filestore: read existing failed: %w", errRead)
 		}
-		if errWrite := atomicReplaceAuthFile(path, func(tempPath string) error {
-			return os.WriteFile(tempPath, raw, 0o600)
-		}); errWrite != nil {
-			return "", errWrite
+		if errWrite := os.WriteFile(path, raw, 0o600); errWrite != nil {
+			return "", fmt.Errorf("auth filestore: write file failed: %w", errWrite)
 		}
 	default:
 		return "", fmt.Errorf("auth filestore: nothing to persist for %s", auth.ID)
@@ -152,43 +163,6 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 	}
 
 	return path, nil
-}
-
-func atomicReplaceAuthFile(path string, writeTemp func(string) error) error {
-	if strings.TrimSpace(path) == "" || writeTemp == nil {
-		return fmt.Errorf("auth filestore: atomic write target is invalid")
-	}
-	tempFile, errCreate := os.CreateTemp(filepath.Dir(path), ".auth-*.tmp")
-	if errCreate != nil {
-		return fmt.Errorf("auth filestore: create temp file failed: %w", errCreate)
-	}
-	tempPath := tempFile.Name()
-	if errClose := tempFile.Close(); errClose != nil {
-		_ = os.Remove(tempPath)
-		return fmt.Errorf("auth filestore: close temp file failed: %w", errClose)
-	}
-	defer func() { _ = os.Remove(tempPath) }()
-	if errWrite := writeTemp(tempPath); errWrite != nil {
-		return fmt.Errorf("auth filestore: write temp file failed: %w", errWrite)
-	}
-	if errChmod := os.Chmod(tempPath, 0o600); errChmod != nil {
-		return fmt.Errorf("auth filestore: chmod temp file failed: %w", errChmod)
-	}
-	file, errOpen := os.OpenFile(tempPath, os.O_RDONLY, 0)
-	if errOpen != nil {
-		return fmt.Errorf("auth filestore: open temp file failed: %w", errOpen)
-	}
-	if errSync := file.Sync(); errSync != nil {
-		_ = file.Close()
-		return fmt.Errorf("auth filestore: sync temp file failed: %w", errSync)
-	}
-	if errClose := file.Close(); errClose != nil {
-		return fmt.Errorf("auth filestore: close synced temp file failed: %w", errClose)
-	}
-	if errRename := os.Rename(tempPath, path); errRename != nil {
-		return fmt.Errorf("auth filestore: replace file failed: %w", errRename)
-	}
-	return nil
 }
 
 // List enumerates all auth JSON files under the configured directory.
@@ -262,6 +236,9 @@ func (s *FileTokenStore) readAuthFiles(path, baseDir string) ([]*cliproxyauth.Au
 	if err = json.Unmarshal(data, &metadata); err != nil {
 		return nil, fmt.Errorf("unmarshal auth json: %w", err)
 	}
+	if errWeight := cliproxyauth.ValidateAuthWeight(&cliproxyauth.Auth{Metadata: metadata}); errWeight != nil {
+		return nil, errWeight
+	}
 	provider, _ := metadata["type"].(string)
 	provider = strings.TrimSpace(provider)
 	if strings.EqualFold(provider, "gemini") {
@@ -306,6 +283,9 @@ func (s *FileTokenStore) readAuthFiles(path, baseDir string) ([]*cliproxyauth.Au
 						auth.Metadata = make(map[string]any)
 					}
 					auth.Metadata["disabled"] = true
+				}
+				if errWeight := cliproxyauth.ApplyAuthWeightMetadata(auth, metadata); errWeight != nil {
+					return nil, errWeight
 				}
 				cliproxyauth.ApplyCustomHeadersFromMetadata(auth)
 			}
@@ -400,6 +380,9 @@ func compactPluginAuths(auths []*cliproxyauth.Auth) []*cliproxyauth.Auth {
 	out := auths[:0]
 	for _, auth := range auths {
 		if auth == nil {
+			continue
+		}
+		if errWeight := cliproxyauth.ValidateAuthWeight(auth); errWeight != nil {
 			continue
 		}
 		out = append(out, auth)

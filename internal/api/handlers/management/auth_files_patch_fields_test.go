@@ -277,50 +277,95 @@ func TestPatchAuthFileFields_ArbitraryFieldsPersistToFile(t *testing.T) {
 	}
 }
 
-func TestPatchAuthFileFieldsInvalidProxyLeavesFileUnchanged(t *testing.T) {
+func TestPatchAuthFileFields_WeightPersistsAndSyncsRuntime(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
+
 	authDir := t.TempDir()
-	path := filepath.Join(authDir, "codex.json")
+	fileName := "weighted.json"
+	filePath := filepath.Join(authDir, fileName)
 	store := fileauth.NewFileTokenStore()
 	store.SetBaseDir(authDir)
 	manager := coreauth.NewManager(store, nil, nil)
 	record := &coreauth.Auth{
-		ID:       "codex.json",
-		FileName: "codex.json",
-		Provider: "codex",
-		ProxyURL: "socks5://proxy.example.com:443",
-		Attributes: map[string]string{
-			"path": path,
-		},
-		Metadata: map[string]any{
-			"type":      "codex",
-			"proxy_url": "socks5://proxy.example.com:443",
-		},
+		ID:         fileName,
+		FileName:   fileName,
+		Provider:   "codex",
+		Attributes: map[string]string{"path": filePath},
+		Metadata:   map[string]any{"type": "codex"},
 	}
 	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
-		t.Fatalf("register auth: %v", errRegister)
-	}
-	before, errRead := os.ReadFile(path)
-	if errRead != nil {
-		t.Fatalf("read auth before patch: %v", errRead)
+		t.Fatalf("Register() error = %v", errRegister)
 	}
 	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
-	recorder := httptest.NewRecorder()
-	ctx, _ := gin.CreateTestContext(recorder)
-	request := httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/fields", strings.NewReader(`{"name":"codex.json","proxy_url":"socks5:user:pass@host:443"}`))
-	request.Header.Set("Content-Type", "application/json")
-	ctx.Request = request
 
-	h.PatchAuthFileFields(ctx)
+	patch := func(weight string) *httptest.ResponseRecorder {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(rec)
+		body := `{"name":"weighted.json","weight":` + weight + `}`
+		ctx.Request = httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/fields", strings.NewReader(body))
+		ctx.Request.Header.Set("Content-Type", "application/json")
+		h.PatchAuthFileFields(ctx)
+		return rec
+	}
 
-	if recorder.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusBadRequest, recorder.Body.String())
+	if rec := patch("7"); rec.Code != http.StatusOK {
+		t.Fatalf("update status = %d, want 200; body=%s", rec.Code, rec.Body.String())
 	}
-	after, errReadAfter := os.ReadFile(path)
-	if errReadAfter != nil {
-		t.Fatalf("read auth after patch: %v", errReadAfter)
+	updated, ok := manager.GetByID(fileName)
+	if !ok || updated.Attributes[coreauth.AttributeWeight] != "7" {
+		t.Fatalf("runtime weight = %#v, want 7", updated)
 	}
-	if string(after) != string(before) {
-		t.Fatal("auth file changed after failed proxy validation")
+	raw, errRead := os.ReadFile(filePath)
+	if errRead != nil {
+		t.Fatalf("ReadFile() error = %v", errRead)
+	}
+	var persisted map[string]any
+	if errUnmarshal := json.Unmarshal(raw, &persisted); errUnmarshal != nil {
+		t.Fatalf("Unmarshal() error = %v", errUnmarshal)
+	}
+	if persisted["weight"] != float64(7) {
+		t.Fatalf("persisted weight = %#v, want 7", persisted["weight"])
+	}
+
+	if rec := patch("null"); rec.Code != http.StatusOK {
+		t.Fatalf("reset status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	updated, _ = manager.GetByID(fileName)
+	if _, exists := updated.Attributes[coreauth.AttributeWeight]; exists {
+		t.Fatal("runtime weight remains after reset")
+	}
+	raw, errRead = os.ReadFile(filePath)
+	if errRead != nil {
+		t.Fatalf("ReadFile() after reset error = %v", errRead)
+	}
+	persisted = nil
+	if errUnmarshal := json.Unmarshal(raw, &persisted); errUnmarshal != nil {
+		t.Fatalf("Unmarshal() after reset error = %v", errUnmarshal)
+	}
+	if _, exists := persisted["weight"]; exists {
+		t.Fatal("persisted weight remains after reset")
+	}
+}
+
+func TestPatchAuthFileFields_RejectsInvalidWeights(t *testing.T) {
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+	record := &coreauth.Auth{ID: "auth.json", FileName: "auth.json", Provider: "codex", Metadata: map[string]any{"type": "codex"}}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("Register() error = %v", errRegister)
+	}
+	h := NewHandlerWithoutConfigFilePath(&config.Config{}, manager)
+
+	for _, weight := range []string{"1.5", "1000001", "9223372036854775808", `"7"`} {
+		rec := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(rec)
+		body := `{"name":"auth.json","weight":` + weight + `}`
+		ctx.Request = httptest.NewRequest(http.MethodPatch, "/v0/management/auth-files/fields", strings.NewReader(body))
+		ctx.Request.Header.Set("Content-Type", "application/json")
+		h.PatchAuthFileFields(ctx)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("weight %s status = %d, want 400; body=%s", weight, rec.Code, rec.Body.String())
+		}
 	}
 }
