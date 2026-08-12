@@ -11,6 +11,15 @@ on:
         required: false
         type: boolean
         default: false
+      deploy_target:
+        description: Which CPA CLIProxy instance to deploy (a=default pool, b=second pool, both)
+        required: false
+        type: choice
+        options:
+          - a
+          - b
+          - both
+        default: both
 
 permissions:
   contents: read
@@ -89,6 +98,32 @@ jobs:
         env:
           PROD_HOST: ${{ secrets.PROD_HOST }}
           PROD_USER: ${{ secrets.PROD_USER }}
+          # Push to publish deploys CPA-A and CPA-B together. Manual runs can still pick a/b/both.
+          DEPLOY_TARGET: ${{ github.event_name == 'workflow_dispatch' && inputs.deploy_target || 'both' }}
         run: |
-          ssh "${PROD_USER:-deploy}@${PROD_HOST}" \
-            "/opt/lumio/bin/deploy-service.sh cliproxyapi '${{ env.IMAGE_NAME }}:sha-${{ github.sha }}' '${{ github.sha }}'"
+          set -euo pipefail
+          IMAGE="${{ env.IMAGE_NAME }}:sha-${{ github.sha }}"
+          SHA="${{ github.sha }}"
+          TARGET="${DEPLOY_TARGET:-both}"
+          remote_cmd=""
+          case "${TARGET}" in
+            a)
+              remote_cmd="/opt/lumio/bin/deploy-service.sh cliproxyapi '${IMAGE}' '${SHA}'"
+              ;;
+            b)
+              remote_cmd="/opt/lumio/bin/deploy-service.sh cliproxyapi-b '${IMAGE}' '${SHA}'"
+              ;;
+            both)
+              remote_cmd="/opt/lumio/bin/deploy-service.sh cliproxyapi '${IMAGE}' '${SHA}' && /opt/lumio/bin/deploy-service.sh cliproxyapi-b '${IMAGE}' '${SHA}'"
+              ;;
+            *)
+              echo "Unknown deploy_target: ${TARGET}" >&2
+              exit 2
+              ;;
+          esac
+          echo "Deploy target=${TARGET}"
+          ssh \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=10 \
+            "${PROD_USER:-deploy}@${PROD_HOST}" \
+            "${remote_cmd}"
