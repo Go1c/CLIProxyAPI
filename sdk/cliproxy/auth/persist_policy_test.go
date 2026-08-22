@@ -108,7 +108,7 @@ func TestPersist_SkipsConfigAPIKeyAuth(t *testing.T) {
 	}
 }
 
-func TestUpdatePersistenceFailureLeavesRuntimeAuthUnchanged(t *testing.T) {
+func TestUpdateAppliesRuntimeStateWhenPersistFails(t *testing.T) {
 	store := &failingUpdateStore{}
 	manager := NewManager(store, nil, nil)
 	auth := &Auth{ID: "auth-1", Provider: "codex", ProxyURL: "socks5://proxy-a.example.com:443", Metadata: map[string]any{"type": "codex", "proxy_url": "socks5://proxy-a.example.com:443"}}
@@ -119,11 +119,11 @@ func TestUpdatePersistenceFailureLeavesRuntimeAuthUnchanged(t *testing.T) {
 	updated := auth.Clone()
 	updated.ProxyURL = "socks5://proxy-b.example.com:443"
 	updated.Metadata["proxy_url"] = updated.ProxyURL
-	if _, errUpdate := manager.Update(context.Background(), updated); errUpdate == nil {
-		t.Fatal("Update error = nil, want persistence failure")
+	if _, errUpdate := manager.Update(context.Background(), updated); errUpdate != nil {
+		t.Fatalf("Update returned error: %v", errUpdate)
 	}
 	current, ok := manager.GetByID(auth.ID)
-	if !ok || current.ProxyURL != "socks5://proxy-a.example.com:443" {
-		t.Fatalf("runtime auth changed after failed save: %#v", current)
+	if !ok || current.ProxyURL != "socks5://proxy-b.example.com:443" {
+		t.Fatalf("runtime auth = %#v, want updated proxy after ignored persist failure", current)
 	}
 }

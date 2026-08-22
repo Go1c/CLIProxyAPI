@@ -85,7 +85,9 @@ func (e *AntigravityExecutor) Execute(ctx context.Context, auth *cliproxyauth.Au
 	baseURLs := antigravityBaseURLFallbackOrder(auth)
 	httpClient := newAntigravityHTTPClient(ctx, e.cfg, auth, 0)
 	httpClient = reporter.TrackHTTPClient(httpClient)
-	attempts := antigravityRetryAttempts(auth, e.cfg)
+	// Credential retry rounds are owned by the conductor. Keep one upstream
+	// attempt per credential so request-retry is not consumed twice.
+	attempts := 1
 
 attemptLoop:
 	for attempt := 0; attempt < attempts; attempt++ {
@@ -110,6 +112,7 @@ attemptLoop:
 					return resp, err
 				}
 			}
+			requestPayload = ensureAntigravityGeminiLeadingUserContent(baseModel, requestPayload)
 
 			httpReq, errReq := e.buildRequest(ctx, auth, token, baseModel, requestPayload, false, opts.Alt, baseURL, helps.DerivedAntigravitySessionID(opts.Metadata, req.Metadata))
 			if errReq != nil {
@@ -234,6 +237,9 @@ attemptLoop:
 			reporter.Publish(ctx, helps.ParseAntigravityUsage(bodyBytes))
 			var param any
 			converted := sdktranslator.TranslateNonStream(ctx, to, responseFormat, req.Model, opts.OriginalRequest, translated, bodyBytes, &param)
+			if responseFormat == sdktranslator.FormatOpenAIResponse {
+				converted = helps.EnsureResponsesUsageDetails(converted)
+			}
 			resp = cliproxyexecutor.Response{Payload: converted, Headers: httpResp.Header.Clone()}
 			reporter.EnsurePublished(ctx)
 			return resp, nil
@@ -309,7 +315,9 @@ func (e *AntigravityExecutor) executeClaudeNonStream(ctx context.Context, auth *
 	httpClient := newAntigravityHTTPClient(ctx, e.cfg, auth, 0)
 	httpClient = reporter.TrackHTTPClient(httpClient)
 
-	attempts := antigravityRetryAttempts(auth, e.cfg)
+	// Credential retry rounds are owned by the conductor. Keep one upstream
+	// attempt per credential so request-retry is not consumed twice.
+	attempts := 1
 
 attemptLoop:
 	for attempt := 0; attempt < attempts; attempt++ {
@@ -334,6 +342,7 @@ attemptLoop:
 					return resp, err
 				}
 			}
+			requestPayload = ensureAntigravityGeminiLeadingUserContent(baseModel, requestPayload)
 			httpReq, errReq := e.buildRequest(ctx, auth, token, baseModel, requestPayload, true, opts.Alt, baseURL, helps.DerivedAntigravitySessionID(opts.Metadata, req.Metadata))
 			if errReq != nil {
 				err = errReq
@@ -526,6 +535,9 @@ attemptLoop:
 			reporter.Publish(ctx, helps.ParseAntigravityUsage(resp.Payload))
 			var param any
 			converted := sdktranslator.TranslateNonStream(ctx, to, responseFormat, req.Model, opts.OriginalRequest, translated, resp.Payload, &param)
+			if responseFormat == sdktranslator.FormatOpenAIResponse {
+				converted = helps.EnsureResponsesUsageDetails(converted)
+			}
 			resp = cliproxyexecutor.Response{Payload: converted, Headers: httpResp.Header.Clone()}
 			reporter.EnsurePublished(ctx)
 

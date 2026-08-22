@@ -10,7 +10,7 @@ import (
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 )
 
-// SetRetryConfig updates retry attempts, credential retry limit and cooldown wait interval.
+// SetRetryConfig updates additional credential retry rounds, the per-round credential limit, and the cooldown wait interval.
 func (m *Manager) SetRetryConfig(retry int, maxRetryInterval time.Duration, maxRetryCredentials int) {
 	if m == nil {
 		return
@@ -128,6 +128,14 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	if !existing.Disabled && existing.Status != StatusDisabled && !auth.Disabled && auth.Status != StatusDisabled {
 		if len(auth.ModelStates) == 0 && len(existing.ModelStates) > 0 {
 			auth.ModelStates = existing.ModelStates
+		}
+		if existing.Quota.Exceeded && existing.Quota.Reason == "credential_quota" && existing.Quota.NextRecoverAt.After(time.Now()) {
+			auth.Unavailable = existing.Unavailable
+			auth.NextRetryAfter = existing.NextRetryAfter
+			auth.Quota = existing.Quota
+			if auth.Status == StatusActive {
+				auth.Status = existing.Status
+			}
 		}
 	}
 	now := time.Now()
