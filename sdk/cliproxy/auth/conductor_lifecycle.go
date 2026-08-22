@@ -10,7 +10,7 @@ import (
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 )
 
-// SetRetryConfig updates retry attempts, credential retry limit and cooldown wait interval.
+// SetRetryConfig updates additional credential retry rounds, the per-round credential limit, and the cooldown wait interval.
 func (m *Manager) SetRetryConfig(retry int, maxRetryInterval time.Duration, maxRetryCredentials int) {
 	if m == nil {
 		return
@@ -118,6 +118,7 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 		m.mu.Unlock()
 		return nil, nil
 	}
+	existingSnapshot := existing.Clone()
 	if !auth.indexAssigned && auth.Index == "" {
 		auth.Index = existing.Index
 		auth.indexAssigned = existing.indexAssigned
@@ -128,6 +129,14 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	if !existing.Disabled && existing.Status != StatusDisabled && !auth.Disabled && auth.Status != StatusDisabled {
 		if len(auth.ModelStates) == 0 && len(existing.ModelStates) > 0 {
 			auth.ModelStates = existing.ModelStates
+		}
+		if existing.Quota.Exceeded && existing.Quota.Reason == "credential_quota" && existing.Quota.NextRecoverAt.After(time.Now()) {
+			auth.Unavailable = existing.Unavailable
+			auth.NextRetryAfter = existing.NextRetryAfter
+			auth.Quota = existing.Quota
+			if auth.Status == StatusActive {
+				auth.Status = existing.Status
+			}
 		}
 	}
 	now := time.Now()
@@ -150,7 +159,15 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 		m.scheduler.upsertAuth(authClone)
 	}
 	m.queueRefreshReschedule(auth.ID)
-	_ = m.persist(ctx, auth)
+	if errPersist := m.persist(ctx, auth); errPersist != nil {
+		m.mu.Lock()
+		m.auths[auth.ID] = existingSnapshot
+		m.mu.Unlock()
+		if m.scheduler != nil {
+			m.scheduler.upsertAuth(existingSnapshot)
+		}
+		return nil, errPersist
+	}
 	m.hook.OnAuthUpdated(ctx, auth.Clone())
 	if cooldownStateChanged {
 		m.persistCooldownStates(ctx)
