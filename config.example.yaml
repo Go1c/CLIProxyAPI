@@ -179,11 +179,12 @@ save-cooldown-status: false
 # Cooldown duration in seconds for transient upstream errors (408/500/502/503/504).
 # Set to 0 to keep the default 15-second cooldown; set to -1 to disable transient error cooldowns.
 # Shared upstream capacity signals (server_is_overloaded / overloaded_error / capacity_exhausted)
-# never cool individual credentials.
+# cool immediately so retry can rotate to another credential.
 transient-error-cooldown-seconds: 0
 
 # Consecutive transient failures required before cooling a credential for 408/500/502/503/504.
 # Set to 0 to keep the default (2). Set to 1 to restore the legacy single-failure behavior.
+# Overload/capacity errors cool on the first failure and do not use this threshold.
 transient-error-threshold: 0
 
 # When true, globally disable Claude request cloaking (the Claude Code CLI disguise and

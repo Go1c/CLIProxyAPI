@@ -1197,13 +1197,13 @@ func TestManager_MarkResult_TransientErrorThresholdLegacySingleFailure(t *testin
 	}
 }
 
-func TestManager_MarkResult_SharedUpstreamCapacityDoesNotCooldown(t *testing.T) {
+func TestManager_MarkResult_SharedUpstreamCapacityCoolsImmediately(t *testing.T) {
 	prevQuota := quotaCooldownDisabled.Load()
 	quotaCooldownDisabled.Store(false)
 	prevTransient := transientErrorCooldownSeconds.Load()
 	prevThreshold := transientErrorThreshold.Load()
 	SetTransientErrorCooldownSeconds(0)
-	SetTransientErrorThreshold(1)
+	SetTransientErrorThreshold(2)
 	t.Cleanup(func() {
 		quotaCooldownDisabled.Store(prevQuota)
 		transientErrorCooldownSeconds.Store(prevTransient)
@@ -1217,15 +1217,13 @@ func TestManager_MarkResult_SharedUpstreamCapacityDoesNotCooldown(t *testing.T) 
 	}
 
 	model := "gpt-5.5"
-	for i := 0; i < 3; i++ {
-		m.MarkResult(context.Background(), Result{
-			AuthID:   auth.ID,
-			Provider: auth.Provider,
-			Model:    model,
-			Success:  false,
-			Error:    &Error{HTTPStatus: http.StatusServiceUnavailable, Message: `{"error":{"type":"server_is_overloaded","message":"The server is overloaded"}}`},
-		})
-	}
+	m.MarkResult(context.Background(), Result{
+		AuthID:   auth.ID,
+		Provider: auth.Provider,
+		Model:    model,
+		Success:  false,
+		Error:    &Error{HTTPStatus: http.StatusServiceUnavailable, Message: `{"error":{"type":"server_is_overloaded","message":"The server is overloaded"}}`},
+	})
 
 	updated, ok := m.GetByID(auth.ID)
 	if !ok || updated == nil {
@@ -1235,11 +1233,11 @@ func TestManager_MarkResult_SharedUpstreamCapacityDoesNotCooldown(t *testing.T) 
 	if state == nil {
 		t.Fatalf("expected model state to be present")
 	}
-	if !state.NextRetryAfter.IsZero() {
-		t.Fatalf("expected shared capacity errors not to cool credential, got NextRetryAfter=%v", state.NextRetryAfter)
+	if state.NextRetryAfter.IsZero() {
+		t.Fatal("expected shared capacity errors to cool immediately so retry can rotate")
 	}
 	if state.TransientFailCount != 0 {
-		t.Fatalf("expected TransientFailCount to stay 0 for capacity errors, got %d", state.TransientFailCount)
+		t.Fatalf("expected TransientFailCount to reset after immediate cooldown, got %d", state.TransientFailCount)
 	}
 	if state.StatusMessage != "upstream capacity exhausted" {
 		t.Fatalf("StatusMessage = %q, want upstream capacity exhausted", state.StatusMessage)

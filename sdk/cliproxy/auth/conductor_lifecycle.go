@@ -118,7 +118,6 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 		m.mu.Unlock()
 		return nil, nil
 	}
-	existingSnapshot := existing.Clone()
 	if !auth.indexAssigned && auth.Index == "" {
 		auth.Index = existing.Index
 		auth.indexAssigned = existing.indexAssigned
@@ -159,15 +158,7 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 		m.scheduler.upsertAuth(authClone)
 	}
 	m.queueRefreshReschedule(auth.ID)
-	if errPersist := m.persist(ctx, auth); errPersist != nil {
-		m.mu.Lock()
-		m.auths[auth.ID] = existingSnapshot
-		m.mu.Unlock()
-		if m.scheduler != nil {
-			m.scheduler.upsertAuth(existingSnapshot)
-		}
-		return nil, errPersist
-	}
+	_ = m.persist(ctx, auth)
 	m.hook.OnAuthUpdated(ctx, auth.Clone())
 	if cooldownStateChanged {
 		m.persistCooldownStates(ctx)

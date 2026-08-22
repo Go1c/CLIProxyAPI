@@ -73,9 +73,9 @@ type Config struct {
 	TransientErrorCooldownSeconds int `yaml:"transient-error-cooldown-seconds" json:"transient-error-cooldown-seconds"`
 
 	// TransientErrorThreshold is the number of consecutive transient failures
-	// (408/500/502/503/504, excluding shared upstream capacity errors) required
-	// before a credential is cooled down. 0 keeps the default (2). Use 1 for the
-	// legacy single-failure behavior.
+	// (408/500/502/503/504) required before a credential is cooled down.
+	// 0 keeps the default (2). Use 1 for the legacy single-failure behavior.
+	// Shared upstream capacity errors cool immediately and ignore this threshold.
 	TransientErrorThreshold int `yaml:"transient-error-threshold" json:"transient-error-threshold"`
 
 	// AuthAutoRefreshWorkers overrides the size of the core auth auto-refresh worker pool.

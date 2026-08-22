@@ -39,9 +39,10 @@ func SetTransientErrorCooldownSeconds(seconds int) {
 }
 
 // SetTransientErrorThreshold configures how many consecutive transient failures
-// (408/500/502/503/504, excluding shared upstream capacity errors) are required
-// before a credential is cooled down. 0 keeps the default (2). Use 1 for the
-// legacy single-failure behavior.
+// (408/500/502/503/504) are required before a credential is cooled down.
+// 0 keeps the default (2). Use 1 for the legacy single-failure behavior.
+// Shared upstream capacity errors (server_is_overloaded / capacity_exhausted)
+// cool immediately, matching upstream overload failover.
 func SetTransientErrorThreshold(n int) {
 	transientErrorThreshold.Store(int64(n))
 }
@@ -116,17 +117,18 @@ func nextTransientErrorRetryAfter(now time.Time) time.Time {
 }
 
 // nextTransientErrorCooldownAfterFailure advances the consecutive-failure counter and,
-// once the threshold is reached, returns a cooldown deadline. Shared upstream capacity
-// errors never cool a credential: cooling a healthy account cannot fix provider-wide
-// overload and only shrinks the available pool.
+// once the threshold is reached, returns a cooldown deadline.
 //
-// When cooling is disabled, the counter is left unchanged and no deadline is scheduled.
+// Shared upstream capacity errors cool immediately so retry rounds can rotate
+// to other credentials. Generic 408/500/502/503/504 still require consecutive
+// failures. When cooling is disabled, the counter is left unchanged and no
+// deadline is scheduled.
 func nextTransientErrorCooldownAfterFailure(failCount int, disableCooling bool, now time.Time, resultErr *Error) (time.Time, int) {
-	if isSharedUpstreamCapacityError(resultErr) {
-		return time.Time{}, failCount
-	}
 	if disableCooling {
 		return time.Time{}, failCount
+	}
+	if isSharedUpstreamCapacityError(resultErr) {
+		return nextTransientErrorRetryAfter(now), 0
 	}
 	failCount++
 	if int64(failCount) < transientErrorFailureThreshold() {

@@ -959,12 +959,6 @@ func (m *Manager) shouldRetryAfterErrorWithHomeRetryLimit(ctx context.Context, o
 	if _, proxyFailure := proxyutil.AsError(err); proxyFailure {
 		return 0, false
 	}
-	// Shared upstream capacity (e.g. server_is_overloaded) does not cool a
-	// credential. Starting another retry round would re-attempt the same
-	// healthy accounts instead of waiting for provider capacity to recover.
-	if isSharedUpstreamCapacityError(resultErrorFromError(err)) {
-		return 0, false
-	}
 	status := statusCodeFromError(err)
 	if status == http.StatusOK {
 		return 0, false
