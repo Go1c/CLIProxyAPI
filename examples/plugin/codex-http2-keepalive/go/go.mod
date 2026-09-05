@@ -7,14 +7,14 @@ require (
 	github.com/router-for-me/CLIProxyAPI/v7 v7.0.0
 	github.com/tidwall/gjson v1.18.0
 	github.com/tidwall/sjson v1.2.5
-	github.com/tiktoken-go/tokenizer v0.7.0
+	github.com/tiktoken-go/tokenizer v0.8.1
 	golang.org/x/net v0.57.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (
 	github.com/andybalholm/brotli v1.0.6 // indirect
-	github.com/dlclark/regexp2 v1.11.5 // indirect
+	github.com/dlclark/regexp2/v2 v2.5.1 // indirect
 	github.com/klauspost/compress v1.17.4 // indirect
 	github.com/tidwall/match v1.1.1 // indirect
 	github.com/tidwall/pretty v1.2.0 // indirect
