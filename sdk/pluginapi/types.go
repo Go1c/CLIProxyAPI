@@ -112,6 +112,8 @@ type Capabilities struct {
 	ResponseInterceptor ResponseInterceptor
 	// StreamChunkInterceptor rewrites successful HTTP stream chunks before downstream delivery.
 	StreamChunkInterceptor StreamChunkInterceptor
+	// WebSocketResponseObserver receives upstream WebSocket response events during execution.
+	WebSocketResponseObserver WebSocketResponseObserver
 	// ThinkingApplier applies validated thinking configuration to provider payloads.
 	ThinkingApplier ThinkingApplier
 	// UsagePlugin receives completed usage records.
@@ -949,6 +951,11 @@ type StreamChunkInterceptor interface {
 	InterceptStreamChunk(context.Context, StreamChunkInterceptRequest) (StreamChunkInterceptResponse, error)
 }
 
+// WebSocketResponseObserver observes upstream WebSocket response events received during execution.
+type WebSocketResponseObserver interface {
+	ObserveWebSocketResponseEvent(context.Context, WebSocketResponseEvent) error
+}
+
 // StreamChunkHeaderInitIndex marks the header-only stream initialization interceptor call.
 const StreamChunkHeaderInitIndex = -1
 
@@ -1103,6 +1110,11 @@ type StreamChunkInterceptRequest struct {
 	Body        []byte
 	// HistoryChunks contains a bounded recent history of chunks already delivered downstream.
 	// The host currently retains at most 64 chunks and 1 MiB total history bytes.
+	// Always preserved on header-init (ChunkIndex == StreamChunkHeaderInitIndex) when non-empty.
+	// On payload chunks (ChunkIndex >= 0):
+	//   - schema_version >= 5: omitted (nil) to avoid per-chunk cloning and serialization
+	//   - schema_version < 5: populated as a fresh clone each call (legacy compatibility)
+	// Callers must treat these slices as read-only; hosts clone before delivery to keep snapshots isolated.
 	HistoryChunks [][]byte
 	// ChunkIndex starts at 0 for payload chunks. StreamChunkHeaderInitIndex marks the header-only initialization call.
 	ChunkIndex int
@@ -1121,6 +1133,22 @@ type StreamChunkInterceptResponse struct {
 	// DropChunk skips delivery of the current payload chunk and prevents it from entering HistoryChunks.
 	// Header updates returned with DropChunk still apply to the interceptor chain state.
 	DropChunk bool
+}
+
+// WebSocketResponseEvent describes an upstream WebSocket response event received during execution.
+type WebSocketResponseEvent struct {
+	RequestID      string
+	TraceID        string
+	SourceFormat   string
+	Model          string
+	RequestedModel string
+	Provider       string
+	AuthID         string
+	AuthLabel      string
+	AuthType       string
+	EventType      string
+	Payload        []byte
+	Metadata       map[string]any
 }
 
 // PayloadResponse returns a transformed raw payload.
