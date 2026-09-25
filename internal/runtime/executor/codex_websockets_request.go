@@ -57,16 +57,14 @@ func applyCodexPromptCacheHeadersWithContext(ctx context.Context, from sdktransl
 
 	if cache.ID != "" {
 		rawJSON = helps.SetStringIfDifferent(rawJSON, "prompt_cache_key", cache.ID)
-		// Local Codex CLI 0.146.0 websocket upgrade uses hyphenated session/thread/window headers.
-		setHeaderCasePreserved(headers, "session-id", cache.ID)
-		setHeaderCasePreserved(headers, "thread-id", cache.ID)
-		setHeaderCasePreserved(headers, "x-codex-window-id", cache.ID+":0")
+		setHeaderCasePreserved(headers, "session_id", cache.ID)
+		headers.Set("Conversation_id", cache.ID)
 	}
 
 	return rawJSON, headers, nil
 }
 
-func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *cliproxyauth.Auth, token string, cfg *config.Config, clientHeaders ...http.Header) http.Header {
+func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *cliproxyauth.Auth, token string, cfg *config.Config, nativeRequest bool, clientHeaders ...http.Header) http.Header {
 	if headers == nil {
 		headers = http.Header{}
 	}
@@ -91,6 +89,9 @@ func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *
 	misc.EnsureHeader(headers, ginHeaders, "x-client-request-id", "")
 	misc.EnsureHeader(headers, ginHeaders, "x-responsesapi-include-timing-metrics", "")
 	misc.EnsureHeader(headers, ginHeaders, "Version", "")
+	if nativeRequest {
+		misc.EnsureHeader(headers, ginHeaders, codexResponsesLiteHeader, "")
+	}
 	if isAPIKey {
 		ensureHeaderWithPriority(headers, ginHeaders, "User-Agent", "", "")
 	} else {
@@ -110,6 +111,17 @@ func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *
 		sessionFallback = uuid.NewString()
 	}
 	ensureCodexWebsocketSessionHeader(headers, ginHeaders, sessionFallback)
+	if nativeRequest && isCodexCloakingDisabled(cfg, auth) {
+		deleteHeaderCaseInsensitive(headers, "session_id")
+		deleteHeaderCaseInsensitive(headers, "conversation_id")
+		for key, values := range ginHeaders {
+			switch strings.ToLower(key) {
+			case "session-id", "session_id", "conversation_id", "thread-id", "x-codex-routing-hint", "x-codex-window-id":
+				deleteHeaderCaseInsensitive(headers, key)
+				headers[key] = append([]string(nil), values...)
+			}
+		}
+	}
 	if originator := strings.TrimSpace(ginHeaders.Get("Originator")); originator != "" {
 		headers.Set("Originator", originator)
 	} else if !isAPIKey {
@@ -119,8 +131,7 @@ func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *
 		if auth != nil && auth.Metadata != nil {
 			if accountID, ok := auth.Metadata["account_id"].(string); ok {
 				if trimmed := strings.TrimSpace(accountID); trimmed != "" {
-					// Local Codex CLI 0.146.0 wire form is lowercase hyphenated.
-					setHeaderCasePreserved(headers, "chatgpt-account-id", trimmed)
+					setHeaderCasePreserved(headers, "ChatGPT-Account-ID", trimmed)
 				}
 			}
 		}
@@ -130,42 +141,11 @@ func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *
 	if auth != nil {
 		attrs = auth.Attributes
 	}
-	util.ApplyCustomHeadersFromAttrs(&http.Request{Header: headers}, attrs, ginHeaders)
-	applyCodexCloakingHeaders(headers, cfg)
-	normalizeCodexWebsocketWireHeaders(headers)
+	req := (&http.Request{Header: headers}).WithContext(ctx)
+	util.ApplyCustomHeadersFromAttrs(req, attrs, ginHeaders)
+	applyCodexCloakingHeaders(headers, cfg, auth)
 
 	return headers
-}
-
-// normalizeCodexWebsocketWireHeaders rewrites known Codex websocket request headers
-// to the lowercase wire form observed from local codex-cli 0.146.0.
-func normalizeCodexWebsocketWireHeaders(headers http.Header) {
-	if headers == nil {
-		return
-	}
-	wireKeys := []string{
-		"authorization",
-		"chatgpt-account-id",
-		"openai-beta",
-		"originator",
-		"user-agent",
-		"version",
-		"x-client-request-id",
-		"x-codex-beta-features",
-		"x-codex-turn-metadata",
-		"x-codex-turn-state",
-		"x-codex-window-id",
-		"x-responsesapi-include-timing-metrics",
-		"session-id",
-		"thread-id",
-	}
-	for _, wireKey := range wireKeys {
-		value := headerValueCaseInsensitive(headers, wireKey)
-		if value == "" {
-			continue
-		}
-		setHeaderCasePreserved(headers, wireKey, value)
-	}
 }
 
 func ensureCodexWebsocketSessionHeader(target http.Header, source http.Header, fallbackValue string) {
@@ -179,21 +159,14 @@ func ensureCodexWebsocketSessionHeader(target http.Header, source http.Header, f
 	if sessionID == "" {
 		sessionID = strings.TrimSpace(fallbackValue)
 	}
-	// Drop legacy casing variants first; EqualFold would also match session-id.
-	for existingKey := range target {
-		normalized := strings.ToLower(strings.TrimSpace(existingKey))
-		if normalized == "session_id" || normalized == "session-id" {
-			delete(target, existingKey)
-		}
-	}
 	if sessionID != "" {
-		// Prefer the local CLI wire form session-id over legacy session_id / Session-Id.
-		target["session-id"] = []string{sessionID}
+		setHeaderCasePreserved(target, "session_id", sessionID)
 	}
+	deleteHeaderCaseInsensitive(target, "Session-Id")
 }
 
 func codexSessionHeaderValue(headers http.Header) string {
-	for _, key := range []string{"session-id", "Session-Id", "Session_id", "session_id"} {
+	for _, key := range []string{"Session-Id", "Session_id", "session_id"} {
 		if value := strings.TrimSpace(headerValueCaseInsensitive(headers, key)); value != "" {
 			return value
 		}
@@ -259,9 +232,18 @@ func setCodexSessionHeaderCasePreserved(headers http.Header, fallbackKey string,
 		return
 	}
 
-	// Local Codex CLI 0.146.0 uses session-id on websocket upgrades.
-	selectedKey := "session-id"
-	if codexSessionHeaderKey(fallbackKey) && strings.Contains(fallbackKey, "-") {
+	selectedKey := ""
+	if _, ok := headers[fallbackKey]; ok && codexSessionHeaderKeyUsesUnderscore(fallbackKey) {
+		selectedKey = fallbackKey
+	} else {
+		for existingKey := range headers {
+			if codexSessionHeaderKeyUsesUnderscore(existingKey) {
+				selectedKey = existingKey
+				break
+			}
+		}
+	}
+	if selectedKey == "" {
 		selectedKey = fallbackKey
 	}
 	for existingKey := range headers {
@@ -275,6 +257,10 @@ func setCodexSessionHeaderCasePreserved(headers http.Header, fallbackKey string,
 func codexSessionHeaderKey(key string) bool {
 	normalized := strings.ToLower(strings.TrimSpace(key))
 	return normalized == "session_id" || normalized == "session-id"
+}
+
+func codexSessionHeaderKeyUsesUnderscore(key string) bool {
+	return strings.ToLower(strings.TrimSpace(key)) == "session_id"
 }
 
 func headerValueCaseInsensitive(headers http.Header, key string) string {

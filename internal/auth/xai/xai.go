@@ -187,11 +187,9 @@ func (a *XAIAuth) WaitForAuthorization(ctx context.Context, deviceCode *DeviceCo
 		tokenEndpoint = strings.TrimSpace(deviceCode.TokenEndpoint)
 	}
 	return &AuthBundle{
-		TokenData:   *tokenData,
-		LastRefresh: time.Now().UTC().Format(time.RFC3339),
-		// Free Grok CLI OAuth must default to the CLI chat-proxy. api.x.ai
-		// returns 402 personal-team-blocked:spending-limit for free-tier tokens.
-		BaseURL:       CLIChatProxyBaseURL,
+		TokenData:     *tokenData,
+		LastRefresh:   time.Now().UTC().Format(time.RFC3339),
+		BaseURL:       DefaultAPIBaseURL,
 		TokenEndpoint: tokenEndpoint,
 	}, nil
 }
@@ -440,7 +438,7 @@ func (a *XAIAuth) CreateTokenStorage(bundle *AuthBundle) *TokenStorage {
 		LastRefresh:   bundle.LastRefresh,
 		Email:         strings.TrimSpace(bundle.TokenData.Email),
 		Subject:       bundle.TokenData.Subject,
-		BaseURL:       firstNonEmpty(bundle.BaseURL, CLIChatProxyBaseURL),
+		BaseURL:       firstNonEmpty(bundle.BaseURL, DefaultAPIBaseURL),
 		RedirectURI:   bundle.RedirectURI,
 		TokenEndpoint: bundle.TokenEndpoint,
 		AuthKind:      "oauth",

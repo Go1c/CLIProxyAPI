@@ -2,17 +2,13 @@ package pluginhost
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
 	"testing"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
-	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 )
 
 func newRouteModelHostWithRecords(records ...capabilityRecord) *Host {
@@ -133,29 +129,6 @@ func TestHostRouteModelAllowsExplicitExecutorPluginTarget(t *testing.T) {
 	}
 }
 
-func TestHostRouteModelSkipsCodexExecutorWhenIdentityConfuseIsActive(t *testing.T) {
-	host := newRouteModelHostWithRecords(capabilityRecord{
-		id: "codex-executor",
-		plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
-			Executor:              &fakeExecutor{identifier: "codex"},
-			ExecutorInputFormats:  []string{"codex"},
-			ExecutorOutputFormats: []string{"codex"},
-			ModelRouter: modelRouterFunc(func(context.Context, pluginapi.ModelRouteRequest) (pluginapi.ModelRouteResponse, error) {
-				return pluginapi.ModelRouteResponse{Handled: true, TargetKind: pluginapi.ModelRouteTargetSelf}, nil
-			}),
-		}},
-	})
-	host.runtimeConfig = &config.Config{
-		Routing: config.RoutingConfig{Strategy: "fill-first"},
-		Codex:   config.CodexConfig{IdentityConfuse: true},
-	}
-
-	resp, ok := host.RouteModel(context.Background(), pluginapi.ModelRouteRequest{SourceFormat: "openai", RequestedModel: "gpt-5.4"})
-	if ok || resp.Handled {
-		t.Fatalf("RouteModel() = %#v, %v; want native fallback", resp, ok)
-	}
-}
-
 func TestHostExecutePluginExecutorByPluginIDPreservesModel(t *testing.T) {
 	var gotReq pluginapi.ExecutorRequest
 	executor := &fakeExecutor{
@@ -186,236 +159,6 @@ func TestHostExecutePluginExecutorByPluginIDPreservesModel(t *testing.T) {
 	}
 	if gotReq.Model != "client-model" {
 		t.Fatalf("executor request model = %q, want client-model", gotReq.Model)
-	}
-}
-
-func TestHostExecutePluginExecutorSelectsOAuthAuth(t *testing.T) {
-	var gotReq pluginapi.ExecutorRequest
-	executor := &fakeExecutor{
-		identifier: "codex",
-		execute: func(ctx context.Context, req pluginapi.ExecutorRequest) (pluginapi.ExecutorResponse, error) {
-			gotReq = req
-			return pluginapi.ExecutorResponse{Payload: []byte("plugin-ok")}, nil
-		},
-	}
-	host := newRouteModelHostWithRecords(capabilityRecord{
-		id: "codex-http2-keepalive",
-		plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
-			Executor:              executor,
-			ExecutorModelScope:    pluginapi.ExecutorModelScopeOAuth,
-			ExecutorInputFormats:  []string{"codex"},
-			ExecutorOutputFormats: []string{"codex"},
-		}},
-	})
-	manager := coreauth.NewManager(nil, nil, nil)
-	manager.RegisterExecutor(&fakeProviderExecutor{provider: "codex"})
-	for _, auth := range []*coreauth.Auth{
-		{
-			ID:       "codex-api-key",
-			Provider: "codex",
-			Attributes: map[string]string{
-				coreauth.AttributeAuthKind: coreauth.AuthKindAPIKey,
-				coreauth.AttributeAPIKey:   "secret",
-			},
-		},
-		{
-			ID:       "codex-oauth",
-			Provider: "codex",
-			Attributes: map[string]string{
-				coreauth.AttributeAuthKind: coreauth.AuthKindOAuth,
-				"proxy_url":                "socks5://user:pass@proxy.example.com:443",
-				"base_url":                 "https://chatgpt.com/backend-api/codex/responses",
-			},
-			Metadata: map[string]any{
-				"access_token": "oauth-token",
-				"account_id":   "account-123",
-			},
-		},
-	} {
-		if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
-			t.Fatalf("Register(%s) error = %v", auth.ID, errRegister)
-		}
-	}
-	host.authManager = manager
-
-	resp, errExecute := host.ExecutePluginExecutor(context.Background(), "codex-http2-keepalive", coreexecutor.Request{
-		Model:   "",
-		Format:  sdktranslator.FormatCodex,
-		Payload: []byte(`{"model":"gpt-5.4"}`),
-	}, coreexecutor.Options{
-		SourceFormat:    sdktranslator.FormatCodex,
-		ResponseFormat:  sdktranslator.FormatCodex,
-		OriginalRequest: []byte(`{"model":"gpt-5.4"}`),
-	})
-	if errExecute != nil {
-		t.Fatalf("ExecutePluginExecutor() error = %v", errExecute)
-	}
-	if string(resp.Payload) != "plugin-ok" {
-		t.Fatalf("payload = %q, want plugin-ok", resp.Payload)
-	}
-	if gotReq.AuthID != "codex-oauth" || gotReq.AuthProvider != "codex" {
-		t.Fatalf("auth fields = %q/%q, want codex oauth auth", gotReq.AuthID, gotReq.AuthProvider)
-	}
-	if gotReq.Model != "" || gotReq.Format != sdktranslator.FormatCodex.String() {
-		t.Fatalf("executor request = %#v, want codex request", gotReq)
-	}
-	var storageJSON map[string]any
-	if errDecode := json.Unmarshal(gotReq.StorageJSON, &storageJSON); errDecode != nil {
-		t.Fatalf("StorageJSON decode error = %v", errDecode)
-	}
-	if storageJSON["access_token"] != "oauth-token" || storageJSON["account_id"] != "account-123" {
-		t.Fatalf("StorageJSON = %#v, want oauth storage", storageJSON)
-	}
-	if gotReq.AuthMetadata["access_token"] != "oauth-token" || gotReq.AuthMetadata["account_id"] != "account-123" {
-		t.Fatalf("AuthMetadata = %#v, want oauth metadata", gotReq.AuthMetadata)
-	}
-	if gotReq.AuthAttributes["proxy_url"] != "socks5://user:pass@proxy.example.com:443" || gotReq.AuthAttributes["base_url"] != "https://chatgpt.com/backend-api/codex/responses" {
-		t.Fatalf("AuthAttributes = %#v, want oauth attributes", gotReq.AuthAttributes)
-	}
-}
-
-func TestHostExecutePluginExecutorReturnsAuthNotFoundWithoutOAuthAuth(t *testing.T) {
-	host := newRouteModelHostWithRecords(capabilityRecord{
-		id: "codex-http2-keepalive",
-		plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
-			Executor:              &fakeExecutor{identifier: "codex"},
-			ExecutorModelScope:    pluginapi.ExecutorModelScopeOAuth,
-			ExecutorInputFormats:  []string{"codex"},
-			ExecutorOutputFormats: []string{"codex"},
-		}},
-	})
-	manager := coreauth.NewManager(nil, nil, nil)
-	manager.RegisterExecutor(&fakeProviderExecutor{provider: "codex"})
-	if _, errRegister := manager.Register(context.Background(), &coreauth.Auth{
-		ID:       "codex-api-key",
-		Provider: "codex",
-		Attributes: map[string]string{
-			coreauth.AttributeAuthKind: coreauth.AuthKindAPIKey,
-			coreauth.AttributeAPIKey:   "secret",
-		},
-	}); errRegister != nil {
-		t.Fatalf("Register(codex-api-key) error = %v", errRegister)
-	}
-	host.authManager = manager
-
-	_, errExecute := host.ExecutePluginExecutor(context.Background(), "codex-http2-keepalive", coreexecutor.Request{
-		Model:   "",
-		Format:  sdktranslator.FormatCodex,
-		Payload: []byte(`{"model":"gpt-5.4"}`),
-	}, coreexecutor.Options{
-		SourceFormat:    sdktranslator.FormatCodex,
-		ResponseFormat:  sdktranslator.FormatCodex,
-		OriginalRequest: []byte(`{"model":"gpt-5.4"}`),
-	})
-	if errExecute == nil {
-		t.Fatal("ExecutePluginExecutor() error = nil, want auth_not_found")
-	}
-	var authErr *coreauth.Error
-	if !errors.As(errExecute, &authErr) || authErr.Code != "auth_not_found" || authErr.HTTPStatus != http.StatusServiceUnavailable {
-		t.Fatalf("ExecutePluginExecutor() error = %#v, want auth_not_found with 503", errExecute)
-	}
-}
-
-func TestHostExecutePluginExecutorUsesRegisteredModelProvider(t *testing.T) {
-	var gotReq pluginapi.ExecutorRequest
-	host := newRouteModelHostWithRecords(capabilityRecord{
-		id: "provider-mismatch",
-		plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
-			Executor: &fakeExecutor{
-				identifier: "wrong-provider",
-				execute: func(_ context.Context, req pluginapi.ExecutorRequest) (pluginapi.ExecutorResponse, error) {
-					gotReq = req
-					return pluginapi.ExecutorResponse{Payload: []byte("ok")}, nil
-				},
-			},
-			ExecutorModelScope: pluginapi.ExecutorModelScopeOAuth,
-		}},
-	})
-	host.modelProviders["provider-mismatch"] = "registered-provider"
-	manager := coreauth.NewManager(nil, nil, nil)
-	manager.RegisterExecutor(&fakeProviderExecutor{provider: "registered-provider"})
-	if _, errRegister := manager.Register(context.Background(), &coreauth.Auth{
-		ID:       "oauth",
-		Provider: "registered-provider",
-		Metadata: map[string]any{"access_token": "token"},
-	}); errRegister != nil {
-		t.Fatalf("Register() error = %v", errRegister)
-	}
-	host.authManager = manager
-
-	if _, errExecute := host.ExecutePluginExecutor(context.Background(), "provider-mismatch", coreexecutor.Request{}, coreexecutor.Options{}); errExecute != nil {
-		t.Fatalf("ExecutePluginExecutor() error = %v", errExecute)
-	}
-	if gotReq.AuthProvider != "registered-provider" || gotReq.AuthID != "oauth" {
-		t.Fatalf("executor auth = %q/%q, want registered-provider/oauth", gotReq.AuthProvider, gotReq.AuthID)
-	}
-}
-
-func TestHostExecutePluginExecutorBothScopeUsesOAuthWhenAvailable(t *testing.T) {
-	var gotReq pluginapi.ExecutorRequest
-	host := newRouteModelHostWithRecords(capabilityRecord{
-		id: "both",
-		plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
-			Executor: &fakeExecutor{
-				identifier: "both-provider",
-				execute: func(_ context.Context, req pluginapi.ExecutorRequest) (pluginapi.ExecutorResponse, error) {
-					gotReq = req
-					return pluginapi.ExecutorResponse{}, nil
-				},
-			},
-			ExecutorModelScope: pluginapi.ExecutorModelScopeBoth,
-		}},
-	})
-	manager := coreauth.NewManager(nil, nil, nil)
-	manager.RegisterExecutor(&fakeProviderExecutor{provider: "both-provider"})
-	if _, errRegister := manager.Register(context.Background(), &coreauth.Auth{
-		ID:       "both-oauth",
-		Provider: "both-provider",
-		Metadata: map[string]any{"access_token": "token"},
-	}); errRegister != nil {
-		t.Fatalf("Register() error = %v", errRegister)
-	}
-	host.authManager = manager
-
-	if _, errExecute := host.ExecutePluginExecutor(context.Background(), "both", coreexecutor.Request{}, coreexecutor.Options{}); errExecute != nil {
-		t.Fatalf("ExecutePluginExecutor() error = %v", errExecute)
-	}
-	if gotReq.AuthID != "both-oauth" {
-		t.Fatalf("AuthID = %q, want both-oauth", gotReq.AuthID)
-	}
-}
-
-func TestHostCountPluginExecutorDoesNotSelectOAuth(t *testing.T) {
-	var gotReq pluginapi.ExecutorRequest
-	host := newRouteModelHostWithRecords(capabilityRecord{
-		id: "count",
-		plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
-			Executor: &fakeExecutor{
-				identifier: "count-provider",
-				countTokens: func(_ context.Context, req pluginapi.ExecutorRequest) (pluginapi.ExecutorResponse, error) {
-					gotReq = req
-					return pluginapi.ExecutorResponse{}, nil
-				},
-			},
-			ExecutorModelScope: pluginapi.ExecutorModelScopeOAuth,
-		}},
-	})
-	manager := coreauth.NewManager(nil, nil, nil)
-	manager.RegisterExecutor(&fakeProviderExecutor{provider: "count-provider"})
-	if _, errRegister := manager.Register(context.Background(), &coreauth.Auth{
-		ID:       "count-oauth",
-		Provider: "count-provider",
-		Metadata: map[string]any{"access_token": "token"},
-	}); errRegister != nil {
-		t.Fatalf("Register() error = %v", errRegister)
-	}
-	host.authManager = manager
-
-	if _, errCount := host.CountPluginExecutor(context.Background(), "count", coreexecutor.Request{}, coreexecutor.Options{}); errCount != nil {
-		t.Fatalf("CountPluginExecutor() error = %v", errCount)
-	}
-	if gotReq.AuthID != "" || gotReq.AuthProvider != "" {
-		t.Fatalf("count auth = %q/%q, want no selected auth", gotReq.AuthID, gotReq.AuthProvider)
 	}
 }
 
@@ -828,7 +571,7 @@ func TestHostRouteModelSkipsExecutorWithUnsupportedFormats(t *testing.T) {
 	}
 }
 
-func TestHostRouteModelSkipsOAuthOnlyExecutorWithoutOAuthAuth(t *testing.T) {
+func TestHostRouteModelSkipsOAuthOnlyExecutorTargets(t *testing.T) {
 	var fallbackCalled bool
 	host := newHostWithRecords(
 		capabilityRecord{
@@ -864,37 +607,7 @@ func TestHostRouteModelSkipsOAuthOnlyExecutorWithoutOAuthAuth(t *testing.T) {
 	if !fallbackCalled {
 		t.Fatal("fallback router was not called after OAuth-only executor target was skipped")
 	}
-	if !ok || !resp.Handled || resp.Target != "fallback" {
+	if !ok || resp.Target != "fallback" {
 		t.Fatalf("RouteModel() = %#v, %v; want fallback executor handled", resp, ok)
-	}
-}
-
-func TestHostRouteModelAllowsOAuthOnlyExecutorWithOAuthAuth(t *testing.T) {
-	host := newRouteModelHostWithRecords(capabilityRecord{
-		id: "oauth-only",
-		plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
-			Executor:              &fakeExecutor{identifier: "oauth-provider"},
-			ExecutorModelScope:    pluginapi.ExecutorModelScopeOAuth,
-			ExecutorInputFormats:  []string{"openai"},
-			ExecutorOutputFormats: []string{"openai"},
-			ModelRouter: modelRouterFunc(func(context.Context, pluginapi.ModelRouteRequest) (pluginapi.ModelRouteResponse, error) {
-				return pluginapi.ModelRouteResponse{Handled: true, TargetKind: pluginapi.ModelRouteTargetSelf}, nil
-			}),
-		}},
-	})
-	manager := coreauth.NewManager(nil, nil, nil)
-	manager.RegisterExecutor(&fakeProviderExecutor{provider: "oauth-provider"})
-	if _, errRegister := manager.Register(context.Background(), &coreauth.Auth{
-		ID:       "oauth",
-		Provider: "oauth-provider",
-		Metadata: map[string]any{"access_token": "token"},
-	}); errRegister != nil {
-		t.Fatalf("Register() error = %v", errRegister)
-	}
-	host.authManager = manager
-
-	resp, ok := host.RouteModel(context.Background(), pluginapi.ModelRouteRequest{RequestedModel: "original-model", SourceFormat: "openai"})
-	if !ok || !resp.Handled || resp.Target != "oauth-only" {
-		t.Fatalf("RouteModel() = %#v, %v; want oauth-only executor handled", resp, ok)
 	}
 }

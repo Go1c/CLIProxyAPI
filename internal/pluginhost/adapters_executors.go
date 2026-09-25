@@ -659,6 +659,7 @@ func (a *executorAdapter) Execute(ctx context.Context, auth *coreauth.Auth, req 
 	if a == nil || a.executor == nil || a.host.isPluginFused(a.pluginID) || !a.host.pluginIdentityCurrent(a.pluginID, a.path, a.version) {
 		return coreexecutor.Response{}, fmt.Errorf("plugin executor %s is unavailable", a.Identifier())
 	}
+
 	var reporter *helps.UsageReporter
 	if auth != nil {
 		modelName := strings.TrimSpace(thinking.ParseSuffix(req.Model).ModelName)
@@ -667,6 +668,7 @@ func (a *executorAdapter) Execute(ctx context.Context, auth *coreauth.Auth, req 
 		}
 		reporter = helps.NewExecutorUsageReporter(ctx, a, modelName, auth)
 	}
+
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			a.host.fusePlugin(a.pluginID, "Executor.Execute", recovered)
@@ -686,25 +688,24 @@ func (a *executorAdapter) Execute(ctx context.Context, auth *coreauth.Auth, req 
 	if errPrepare != nil {
 		return coreexecutor.Response{}, errPrepare
 	}
-	prepared, errPrepare = a.decorateExecutorCall(ctx, auth, req, prepared)
-	if errPrepare != nil {
-		return coreexecutor.Response{}, errPrepare
-	}
 
 	if reporter != nil {
 		reporter.SetTranslatedReasoningEffort(prepared.req.Payload, prepared.inputFormat.String())
 		reporter.StartResponseTTFT()
 	}
+
 	pluginResp, errExecute := a.executor.Execute(ctx, buildExecutorRequest(a.host, a.provider, auth, prepared.req, prepared.opts))
 	if errExecute != nil {
 		return coreexecutor.Response{}, errExecute
 	}
+
 	if reporter != nil {
 		reporter.RecordFirstPacket()
 		detail := helps.ParsePluginExecutorResponseUsage(prepared.outputFormat.String(), pluginResp.Payload)
 		reporter.Publish(ctx, detail)
 		reporter.EnsurePublished(ctx)
 	}
+
 	return coreexecutor.Response{
 		Payload:  a.translateExecutorResponse(ctx, prepared, pluginResp.Payload, false, nil),
 		Metadata: cloneAnyMap(pluginResp.Metadata),
@@ -716,6 +717,7 @@ func (a *executorAdapter) ExecuteStream(ctx context.Context, auth *coreauth.Auth
 	if a == nil || a.executor == nil || a.host.isPluginFused(a.pluginID) || !a.host.pluginIdentityCurrent(a.pluginID, a.path, a.version) {
 		return nil, fmt.Errorf("plugin executor %s is unavailable", a.Identifier())
 	}
+
 	var reporter *helps.UsageReporter
 	if auth != nil {
 		modelName := strings.TrimSpace(thinking.ParseSuffix(req.Model).ModelName)
@@ -724,6 +726,7 @@ func (a *executorAdapter) ExecuteStream(ctx context.Context, auth *coreauth.Auth
 		}
 		reporter = helps.NewExecutorUsageReporter(ctx, a, modelName, auth)
 	}
+
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			a.host.fusePlugin(a.pluginID, "Executor.ExecuteStream", recovered)
@@ -743,14 +746,12 @@ func (a *executorAdapter) ExecuteStream(ctx context.Context, auth *coreauth.Auth
 	if errPrepare != nil {
 		return nil, errPrepare
 	}
-	prepared, errPrepare = a.decorateExecutorCall(ctx, auth, req, prepared)
-	if errPrepare != nil {
-		return nil, errPrepare
-	}
+
 	if reporter != nil {
 		reporter.SetTranslatedReasoningEffort(prepared.req.Payload, prepared.inputFormat.String())
 		reporter.StartResponseTTFT()
 	}
+
 	pluginResp, errExecuteStream := a.executor.ExecuteStream(ctx, buildExecutorRequest(a.host, a.provider, auth, prepared.req, prepared.opts))
 	if errExecuteStream != nil {
 		return nil, errExecuteStream
@@ -928,6 +929,7 @@ func (a *executorAdapter) Refresh(ctx context.Context, auth *coreauth.Auth) (ref
 	if len(data.Attributes) == 0 && auth != nil {
 		data.Attributes = cloneStringMap(auth.Attributes)
 	}
+	preserveFileAuthPriority(&data, auth)
 	if len(data.StorageJSON) == 0 {
 		data.StorageJSON = storageJSONFromAuth(auth)
 	}
@@ -1039,7 +1041,7 @@ func buildExecutorRequest(host *Host, provider string, auth *coreauth.Auth, req 
 		StorageJSON:     storageJSONFromAuth(auth),
 		AuthMetadata:    cloneAnyMap(authMetadata(auth)),
 		AuthAttributes:  authAttributes(auth),
-		HTTPClient:      host.newHTTPClient(auth, provider),
+		HTTPClient:      host.newHTTPClientWithProxy(auth, opts.ProxyURL, provider),
 	}
 }
 

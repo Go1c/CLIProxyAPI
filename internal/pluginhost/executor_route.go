@@ -2,23 +2,20 @@ package pluginhost
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"net/http"
 	"strings"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
-	log "github.com/sirupsen/logrus"
 )
 
 // executorPluginReady reports whether the named plugin can actually execute a
-// request right now: it must declare an executor capability, resolve a
-// non-empty provider identifier, and declare formats compatible with the
-// current request.
+// request right now: it must declare an executor capability AND resolve a
+// non-empty provider identifier (the same requirement enforced by
+// executorAdapterForPlugin at execution time), allow static execution without
+// selected auth, and declare formats compatible with the current request.
 // Routing pre-checks use this so that targets which would fail at execution are
 // treated as unhandled and fall through to lower-priority routers instead of
 // returning handled then 500ing.
@@ -30,9 +27,6 @@ func (h *Host) executorPluginReady(pluginID string, routeReq pluginapi.ModelRout
 	if pluginID == "" {
 		return false
 	}
-	if h.executorPluginBlockedByCodexIdentityConfuse(pluginID) {
-		return false
-	}
 	for _, record := range h.activeRecords() {
 		if record.id != pluginID || h.isPluginFused(record.id) {
 			continue
@@ -41,11 +35,11 @@ func (h *Host) executorPluginReady(pluginID string, routeReq pluginapi.ModelRout
 		if executor == nil {
 			return false
 		}
-		provider, okProvider := h.executorProvider(record, executor)
-		if !okProvider {
+		if !executorScopeAllowsStaticModels(record.plugin.Capabilities) {
 			return false
 		}
-		if normalizedExecutorModelScope(record.plugin.Capabilities) == pluginapi.ExecutorModelScopeOAuth && !h.hasExecutorOAuth(provider) {
+		provider, okProvider := h.executorProvider(record, executor)
+		if !okProvider {
 			return false
 		}
 		adapter := newExecutorAdapterRegistration(h, record, provider, executor).adapter
@@ -65,28 +59,6 @@ func (h *Host) executorPluginReady(pluginID string, routeReq pluginapi.ModelRout
 	return false
 }
 
-func (h *Host) executorPluginBlockedByCodexIdentityConfuse(pluginID string) bool {
-	if h == nil || !helps.CodexIdentityConfuseEnabled(h.currentRuntimeConfig()) {
-		return false
-	}
-	pluginID = strings.TrimSpace(pluginID)
-	for _, record := range h.activeRecords() {
-		if record.id != pluginID || h.isPluginFused(record.id) || record.plugin.Capabilities.Executor == nil {
-			continue
-		}
-		provider, okProvider := h.executorProvider(record, record.plugin.Capabilities.Executor)
-		return okProvider && provider == "codex"
-	}
-	return false
-}
-
-func (h *Host) warnCodexExecutorIdentityConfuseFallback() {
-	if h == nil || !helps.CodexIdentityConfuseEnabled(h.currentRuntimeConfig()) || !h.HasExecutorCandidateProvider("codex") {
-		return
-	}
-	log.WithField("provider", "codex").Warn("pluginhost: Codex executor plugins are disabled while identity-confuse is active; requests will use the native executor")
-}
-
 func (a *executorAdapter) supportsExecutorFormats(req coreexecutor.Request, opts coreexecutor.Options) bool {
 	if a == nil {
 		return false
@@ -103,7 +75,7 @@ func (a *executorAdapter) supportsExecutorFormats(req coreexecutor.Request, opts
 
 // PluginExecutorRequestToFormat reports the executor input format selected for a direct plugin executor route.
 func (h *Host) PluginExecutorRequestToFormat(pluginID string, req coreexecutor.Request, opts coreexecutor.Options) sdktranslator.Format {
-	_, _, adapter, errAdapter := h.executorAdapterRecordForPlugin(pluginID)
+	adapter, errAdapter := h.executorAdapterForPlugin(pluginID)
 	if errAdapter != nil {
 		return ""
 	}
@@ -112,107 +84,56 @@ func (h *Host) PluginExecutorRequestToFormat(pluginID string, req coreexecutor.R
 
 // ExecutePluginExecutor executes a request with the named plugin executor without changing the requested model.
 func (h *Host) ExecutePluginExecutor(ctx context.Context, pluginID string, req coreexecutor.Request, opts coreexecutor.Options) (coreexecutor.Response, error) {
-	record, provider, adapter, errAdapter := h.executorAdapterRecordForPlugin(pluginID)
+	adapter, errAdapter := h.executorAdapterForPlugin(pluginID)
 	if errAdapter != nil {
 		return coreexecutor.Response{}, errAdapter
 	}
-	auth, errAuth := h.executorAuthForRecord(ctx, record, provider, req, opts)
-	if errAuth != nil {
-		return coreexecutor.Response{}, errAuth
-	}
-	return adapter.Execute(ctx, auth, req, opts)
+	return adapter.Execute(ctx, (*coreauth.Auth)(nil), req, opts)
 }
 
 // ExecutePluginExecutorStream executes a streaming request with the named plugin executor without changing the requested model.
 func (h *Host) ExecutePluginExecutorStream(ctx context.Context, pluginID string, req coreexecutor.Request, opts coreexecutor.Options) (*coreexecutor.StreamResult, error) {
-	record, provider, adapter, errAdapter := h.executorAdapterRecordForPlugin(pluginID)
+	adapter, errAdapter := h.executorAdapterForPlugin(pluginID)
 	if errAdapter != nil {
 		return nil, errAdapter
 	}
-	auth, errAuth := h.executorAuthForRecord(ctx, record, provider, req, opts)
-	if errAuth != nil {
-		return nil, errAuth
-	}
-	return adapter.ExecuteStream(ctx, auth, req, opts)
+	return adapter.ExecuteStream(ctx, (*coreauth.Auth)(nil), req, opts)
 }
 
 // CountPluginExecutor executes a count-tokens request with the named plugin executor without changing the requested model.
 func (h *Host) CountPluginExecutor(ctx context.Context, pluginID string, req coreexecutor.Request, opts coreexecutor.Options) (coreexecutor.Response, error) {
-	_, _, adapter, errAdapter := h.executorAdapterRecordForPlugin(pluginID)
+	adapter, errAdapter := h.executorAdapterForPlugin(pluginID)
 	if errAdapter != nil {
 		return coreexecutor.Response{}, errAdapter
 	}
-	// Token estimation must not consume a credential scheduler turn.
-	return adapter.CountTokens(ctx, nil, req, opts)
+	return adapter.CountTokens(ctx, (*coreauth.Auth)(nil), req, opts)
 }
 
-func (h *Host) executorAdapterRecordForPlugin(pluginID string) (capabilityRecord, string, *executorAdapter, error) {
+func (h *Host) executorAdapterForPlugin(pluginID string) (*executorAdapter, error) {
 	if h == nil {
-		return capabilityRecord{}, "", nil, fmt.Errorf("plugin host is unavailable")
+		return nil, fmt.Errorf("plugin host is unavailable")
 	}
 	pluginID = strings.TrimSpace(pluginID)
 	if pluginID == "" {
-		return capabilityRecord{}, "", nil, fmt.Errorf("target executor plugin id is required")
+		return nil, fmt.Errorf("target executor plugin id is required")
 	}
 	for _, record := range h.activeRecords() {
 		if record.id != pluginID {
 			continue
 		}
 		if h.isPluginFused(record.id) {
-			return capabilityRecord{}, "", nil, fmt.Errorf("plugin executor %s is unavailable", pluginID)
+			return nil, fmt.Errorf("plugin executor %s is unavailable", pluginID)
 		}
 		executor := record.plugin.Capabilities.Executor
 		if executor == nil {
-			return capabilityRecord{}, "", nil, fmt.Errorf("plugin %s does not declare an executor", pluginID)
+			return nil, fmt.Errorf("plugin %s does not declare an executor", pluginID)
 		}
 		provider, okProvider := h.executorProvider(record, executor)
 		if !okProvider {
-			return capabilityRecord{}, "", nil, fmt.Errorf("plugin executor %s has no provider identifier", pluginID)
+			return nil, fmt.Errorf("plugin executor %s has no provider identifier", pluginID)
 		}
 		registration := newExecutorAdapterRegistration(h, record, provider, executor)
-		return record, provider, registration.adapter, nil
+		return registration.adapter, nil
 	}
-	return capabilityRecord{}, "", nil, fmt.Errorf("plugin executor %s not found", pluginID)
-}
-
-func (h *Host) executorAuthForRecord(ctx context.Context, record capabilityRecord, provider string, req coreexecutor.Request, opts coreexecutor.Options) (*coreauth.Auth, error) {
-	if h == nil {
-		return nil, fmt.Errorf("plugin host is unavailable")
-	}
-	executor := record.plugin.Capabilities.Executor
-	if executor == nil {
-		return nil, fmt.Errorf("plugin %s does not declare an executor", record.id)
-	}
-	if !executorScopeAllowsOAuthModels(record.plugin.Capabilities) {
-		return nil, nil
-	}
-	if normalizedExecutorModelScope(record.plugin.Capabilities) == pluginapi.ExecutorModelScopeBoth && !h.hasExecutorOAuth(provider) {
-		return nil, nil
-	}
-	if h.authManager == nil {
-		return nil, &coreauth.Error{Code: "auth_not_found", Message: "no oauth auth available", HTTPStatus: http.StatusServiceUnavailable}
-	}
-	provider = strings.ToLower(strings.TrimSpace(provider))
-	selected, errSelect := h.authManager.SelectAuthByKind(ctx, provider, strings.TrimSpace(req.Model), coreauth.AuthKindOAuth, opts)
-	if errSelect != nil {
-		return nil, normalizeExecutorAuthError(errSelect)
-	}
-	if selected == nil {
-		return nil, &coreauth.Error{Code: "auth_not_found", Message: "no oauth auth available", HTTPStatus: http.StatusServiceUnavailable}
-	}
-	return selected, nil
-}
-
-func (h *Host) hasExecutorOAuth(provider string) bool {
-	return h != nil && h.authManager != nil && h.authManager.HasProviderAuthByKind(provider, coreauth.AuthKindOAuth)
-}
-
-func normalizeExecutorAuthError(err error) error {
-	var authErr *coreauth.Error
-	if !errors.As(err, &authErr) || authErr == nil || authErr.Code != "auth_not_found" || authErr.HTTPStatus != 0 {
-		return err
-	}
-	clone := *authErr
-	clone.HTTPStatus = http.StatusServiceUnavailable
-	return &clone
+	return nil, fmt.Errorf("plugin executor %s not found", pluginID)
 }

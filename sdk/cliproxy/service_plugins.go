@@ -6,10 +6,8 @@ import (
 	"sync"
 	"time"
 
-	"fmt"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -34,6 +32,7 @@ type modelRegistrationTask struct {
 	phase    int
 	category string
 	run      func(*openAICompatibilityRegistrationCache)
+	done     func()
 }
 
 type executorRegistrationOptions struct {
@@ -50,20 +49,10 @@ var registerPluginExecutors = func(host *pluginhost.Host, manager *coreauth.Mana
 	host.RegisterExecutors(manager, registry.GetGlobalRegistry())
 }
 
-func codexPluginExecutorRequestDecorator(ctx context.Context, _ *coreauth.Auth, decoration pluginhost.ExecutorRequestDecoration) (pluginhost.ExecutorRequestDecoration, error) {
-	assembly, errAssembly := helps.ApplyCodexCacheAssembly(ctx, decoration.SourceFormat, decoration.Model, decoration.SourcePayload, decoration.Payload, decoration.Headers)
-	if errAssembly != nil {
-		return pluginhost.ExecutorRequestDecoration{}, fmt.Errorf("assemble Codex plugin prompt cache: %w", errAssembly)
-	}
-	decoration.Payload = assembly.Body
-	decoration.Headers = assembly.Headers
-	log.WithFields(log.Fields{
-		"cache_key_present":  assembly.CacheKeyPresent,
-		"cache_key_source":   assembly.Source,
-		"session_header_key": assembly.SessionHeaderKey,
-	}).Debug("codex plugin executor request cache assembly")
-	return decoration, nil
-}
+// modelRegistrationTaskHook, if set, runs after auth-update commits and before
+// model registration workers start. Tests use it to prove registration no longer
+// holds authUpdateMu.
+var modelRegistrationTaskHook func()
 
 // RegisterUsagePlugin registers a usage plugin on the global usage manager.
 // This allows external code to monitor API usage and token consumption.
@@ -175,6 +164,7 @@ func (s *Service) refreshPluginModelRegistrations(ctx context.Context) {
 		return
 	}
 	s.registerModelsForAuthBatch(ctx, s.coreManager.List())
+	s.waitAntigravityProbesContext(ctx)
 }
 
 func (s *Service) registerModelsForAuthBatch(ctx context.Context, auths []*coreauth.Auth) {
@@ -260,12 +250,20 @@ func (s *Service) runModelRegistrationTaskPhase(ctx context.Context, tasks []mod
 			go func() {
 				defer wg.Done()
 				for task := range taskCh {
-					select {
-					case <-ctx.Done():
-						return
-					default:
-					}
-					task.run(compatCache)
+					func(task modelRegistrationTask) {
+						if task.done != nil {
+							defer task.done()
+						}
+						select {
+						case <-ctx.Done():
+							return
+						default:
+						}
+						if modelRegistrationTaskHook != nil {
+							modelRegistrationTaskHook()
+						}
+						task.run(compatCache)
+					}(task)
 				}
 			}()
 		}
@@ -333,7 +331,17 @@ func (s *Service) registerModelRefreshCallback() {
 
 		providerSet := make(map[string]bool, len(changedProviders))
 		for _, p := range changedProviders {
-			providerSet[strings.ToLower(strings.TrimSpace(p))] = true
+			norm := strings.ToLower(strings.TrimSpace(p))
+			if norm != "" {
+				providerSet[norm] = true
+				switch norm {
+				case "kimi", "kimi-ai", "kimi.ai", "kimi.com":
+					providerSet["kimi"] = true
+					providerSet["kimi-ai"] = true
+					providerSet["kimi.ai"] = true
+					providerSet["kimi.com"] = true
+				}
+			}
 		}
 
 		auths := s.coreManager.List()

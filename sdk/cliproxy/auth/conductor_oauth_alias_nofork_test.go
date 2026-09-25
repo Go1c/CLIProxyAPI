@@ -1966,10 +1966,6 @@ func TestManager_NoForkAlias_MarkResultTargetModelNoSecondaryAliasResolution(t *
 
 // Test 21: MarkResult on 500/503/transient errors immediately suspends route alias in registry
 func TestManager_NoForkAlias_MarkResultTransientErrorsSyncSuspendRegistry(t *testing.T) {
-	prevThreshold := transientErrorThreshold.Load()
-	t.Cleanup(func() { transientErrorThreshold.Store(prevThreshold) })
-	SetTransientErrorThreshold(1)
-
 	const (
 		provider    = "antigravity"
 		routeModel  = "[ant]gemini-3.7-flash-transient"

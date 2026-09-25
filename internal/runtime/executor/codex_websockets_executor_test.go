@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -21,6 +23,7 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
+	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 )
 
@@ -231,6 +234,9 @@ func TestCodexWebsocketsExecuteResponsesLiteDoesNotInjectImageGenerationTool(t *
 
 	select {
 	case payload := <-capturedPayload:
+		if instructions := gjson.GetBytes(payload, "instructions"); instructions.Exists() {
+			t.Errorf("unexpected instructions in responses-lite upstream payload: %s", payload)
+		}
 		if tools := gjson.GetBytes(payload, "tools"); tools.Exists() {
 			t.Fatalf("unexpected tools in responses-lite upstream payload: %s", tools.Raw)
 		}
@@ -501,17 +507,17 @@ func TestExistingWebsocketSessionConnRequiresMatchingHealthyConnection(t *testin
 		wsURL:      "ws://example.test/responses",
 	}
 	sess.resetUpstreamDisconnectError(conn)
-	if gotConn, gotCloser := existingWebsocketSessionConn(sess, "auth-a", "ws://example.test/responses"); gotConn != conn || gotCloser != closer {
+	if gotConn, gotCloser := existingWebsocketSessionConn(sess, "auth-a", "ws://example.test/responses", ""); gotConn != conn || gotCloser != closer {
 		t.Fatal("matching healthy websocket session was not reusable")
 	}
-	if got, _ := existingWebsocketSessionConn(sess, "auth-b", "ws://example.test/responses"); got != nil {
+	if got, _ := existingWebsocketSessionConn(sess, "auth-b", "ws://example.test/responses", ""); got != nil {
 		t.Fatal("websocket session matched a different auth")
 	}
-	if got, _ := existingWebsocketSessionConn(sess, "auth-a", "ws://other.test/responses"); got != nil {
+	if got, _ := existingWebsocketSessionConn(sess, "auth-a", "ws://other.test/responses", ""); got != nil {
 		t.Fatal("websocket session matched a different URL")
 	}
 	sess.setUpstreamDisconnectError(conn, errors.New("upstream disconnected"))
-	if got, _ := existingWebsocketSessionConn(sess, "auth-a", "ws://example.test/responses"); got != nil {
+	if got, _ := existingWebsocketSessionConn(sess, "auth-a", "ws://example.test/responses", ""); got != nil {
 		t.Fatal("disconnected websocket session remained reusable")
 	}
 }
@@ -1078,16 +1084,13 @@ func TestCodexWebsocketsUpstreamDisconnectChanSignalsOnInvalidate(t *testing.T) 
 }
 
 func TestApplyCodexWebsocketHeadersDefaultsToCurrentResponsesBeta(t *testing.T) {
-	headers := applyCodexWebsocketHeaders(context.Background(), http.Header{}, nil, "", nil)
+	headers := applyCodexWebsocketHeaders(context.Background(), http.Header{}, nil, "", nil, false)
 
-	if got := headerValueCaseInsensitive(headers, "openai-beta"); got != codexResponsesWebsocketBetaHeaderValue {
-		t.Fatalf("openai-beta = %s, want %s", got, codexResponsesWebsocketBetaHeaderValue)
+	if got := headers.Get("OpenAI-Beta"); got != codexResponsesWebsocketBetaHeaderValue {
+		t.Fatalf("OpenAI-Beta = %s, want %s", got, codexResponsesWebsocketBetaHeaderValue)
 	}
-	if _, ok := headers["openai-beta"]; !ok {
-		t.Fatalf("expected exact openai-beta key, got %#v", headers)
-	}
-	if got := headerValueCaseInsensitive(headers, "user-agent"); got != codexUserAgent {
-		t.Fatalf("user-agent = %s, want %s", got, codexUserAgent)
+	if got := headers.Get("User-Agent"); got != codexUserAgent {
+		t.Fatalf("User-Agent = %s, want %s", got, codexUserAgent)
 	}
 	if !strings.HasPrefix(codexUserAgent, codexOriginator+"/") {
 		t.Fatalf("default Codex User-Agent = %s, want prefix %s/", codexUserAgent, codexOriginator)
@@ -1098,20 +1101,20 @@ func TestApplyCodexWebsocketHeadersDefaultsToCurrentResponsesBeta(t *testing.T) 
 	if !strings.Contains(codexUserAgent, "(codex-tui;") {
 		t.Fatalf("default Codex User-Agent = %s, want codex-tui suffix", codexUserAgent)
 	}
-	if got := headerValueCaseInsensitive(headers, "originator"); got != codexOriginator {
-		t.Fatalf("originator = %s, want %s", got, codexOriginator)
+	if got := headers.Get("Originator"); got != codexOriginator {
+		t.Fatalf("Originator = %s, want %s", got, codexOriginator)
 	}
-	if got := headerValueCaseInsensitive(headers, "version"); got != "" {
-		t.Fatalf("version = %q, want empty", got)
+	if got := headers.Get("Version"); got != "" {
+		t.Fatalf("Version = %q, want empty", got)
 	}
-	if got := headerValueCaseInsensitive(headers, "x-codex-beta-features"); got != "" {
+	if got := headers.Get("x-codex-beta-features"); got != "" {
 		t.Fatalf("x-codex-beta-features = %q, want empty", got)
 	}
-	if got := headerValueCaseInsensitive(headers, "x-codex-turn-metadata"); got != "" {
-		t.Fatalf("x-codex-turn-metadata = %q, want empty", got)
+	if got := headers.Get("X-Codex-Turn-Metadata"); got != "" {
+		t.Fatalf("X-Codex-Turn-Metadata = %q, want empty", got)
 	}
-	if got := headerValueCaseInsensitive(headers, "x-client-request-id"); got != "" {
-		t.Fatalf("x-client-request-id = %q, want empty", got)
+	if got := headers.Get("X-Client-Request-Id"); got != "" {
+		t.Fatalf("X-Client-Request-Id = %q, want empty", got)
 	}
 }
 
@@ -1158,12 +1161,12 @@ func TestApplyCodexWebsocketHeadersDefaultsToCodexCloaking(t *testing.T) {
 			headers.Set("User-Agent", "existing-ua")
 			headers.Set("Originator", "existing-origin")
 
-			headers = applyCodexWebsocketHeaders(ctx, headers, tt.auth, tt.token, cfg)
+			headers = applyCodexWebsocketHeaders(ctx, headers, tt.auth, tt.token, cfg, false)
 
-			if got := headerValueCaseInsensitive(headers, "user-agent"); got != codexUserAgent {
+			if got := headers.Get("User-Agent"); got != codexUserAgent {
 				t.Fatalf("User-Agent = %q, want %q", got, codexUserAgent)
 			}
-			if got := headerValueCaseInsensitive(headers, "originator"); got != codexOriginator {
+			if got := headers.Get("Originator"); got != codexOriginator {
 				t.Fatalf("Originator = %q, want %q", got, codexOriginator)
 			}
 		})
@@ -1183,33 +1186,123 @@ func TestApplyCodexWebsocketHeadersPassesThroughClientIdentityHeadersWhenCloakin
 		"X-Codex-Turn-Metadata": `{"turn_id":"turn-1"}`,
 		"X-Client-Request-Id":   "019d2233-e240-7162-992d-38df0a2a0e0d",
 		"session-id":            "legacy-session",
+		"Thread-Id":             "thread-1",
+		"X-Codex-Routing-Hint":  "route-1",
+		"X-Codex-Window-Id":     "window-1",
 	})
 
-	headers := applyCodexWebsocketHeaders(ctx, http.Header{}, auth, "", cfg)
+	headers := applyCodexWebsocketHeaders(ctx, http.Header{"session_id": {"cache-key"}, "Conversation_id": {"cache-key"}}, auth, "", cfg, true)
 
-	if got := headerValueCaseInsensitive(headers, "originator"); got != "Codex Desktop" {
+	if got := headers.Get("Originator"); got != "Codex Desktop" {
 		t.Fatalf("Originator = %s, want %s", got, "Codex Desktop")
 	}
-	if got := headerValueCaseInsensitive(headers, "user-agent"); got != "codex_cli_rs/0.1.0" {
+	if got := headers.Get("User-Agent"); got != "codex_cli_rs/0.1.0" {
 		t.Fatalf("User-Agent = %s, want %s", got, "codex_cli_rs/0.1.0")
 	}
-	if got := headerValueCaseInsensitive(headers, "version"); got != "0.115.0-alpha.27" {
+	if got := headers.Get("Version"); got != "0.115.0-alpha.27" {
 		t.Fatalf("Version = %s, want %s", got, "0.115.0-alpha.27")
 	}
-	if got := headerValueCaseInsensitive(headers, "x-codex-turn-metadata"); got != `{"turn_id":"turn-1"}` {
+	if got := headers.Get("X-Codex-Turn-Metadata"); got != `{"turn_id":"turn-1"}` {
 		t.Fatalf("X-Codex-Turn-Metadata = %s, want %s", got, `{"turn_id":"turn-1"}`)
 	}
-	if got := headerValueCaseInsensitive(headers, "x-client-request-id"); got != "019d2233-e240-7162-992d-38df0a2a0e0d" {
+	if got := headers.Get("X-Client-Request-Id"); got != "019d2233-e240-7162-992d-38df0a2a0e0d" {
 		t.Fatalf("X-Client-Request-Id = %s, want %s", got, "019d2233-e240-7162-992d-38df0a2a0e0d")
 	}
-	if got := headers["session-id"]; len(got) != 1 || got[0] != "legacy-session" {
-		t.Fatalf("session-id = %#v, want [legacy-session]", got)
+	if got := headerValueCaseInsensitive(headers, "session_id"); got != "" {
+		t.Fatalf("unexpected session_id = %q", got)
 	}
-	if got := headers.Get("Session-Id"); got != "" {
-		t.Fatalf("Session-Id = %s, want empty", got)
+	if got := headerValueCaseInsensitive(headers, "conversation_id"); got != "" {
+		t.Fatalf("unexpected conversation_id = %q", got)
 	}
-	if _, ok := headers["session_id"]; ok {
-		t.Fatalf("legacy session_id key should be normalized away, got %#v", headers)
+	for key, want := range map[string]string{"Session-Id": "legacy-session", "Thread-Id": "thread-1", "X-Codex-Routing-Hint": "route-1", "X-Codex-Window-Id": "window-1"} {
+		if got := headers.Get(key); got != want {
+			t.Errorf("%s = %q, want %q", key, got, want)
+		}
+	}
+}
+
+func TestApplyCodexWebsocketHeadersNativeSessionCombinations(t *testing.T) {
+	cfg := &config.Config{
+		Codex: config.CodexConfig{DisableCodexCloaking: true},
+	}
+	auth := &cliproxyauth.Auth{
+		Provider: "codex",
+		Metadata: map[string]any{"email": "user@example.com"},
+	}
+
+	tests := []struct {
+		name          string
+		clientHeaders map[string]string
+		wantSessionID string
+		wantThreadID  string
+	}{
+		{
+			name: "both session and thread present",
+			clientHeaders: map[string]string{
+				"Session-Id": "sess-both",
+				"Thread-Id":  "thread-both",
+			},
+			wantSessionID: "sess-both",
+			wantThreadID:  "thread-both",
+		},
+		{
+			name: "only session present",
+			clientHeaders: map[string]string{
+				"Session-Id": "sess-only",
+			},
+			wantSessionID: "sess-only",
+			wantThreadID:  "",
+		},
+		{
+			name: "only thread present",
+			clientHeaders: map[string]string{
+				"Thread-Id": "thread-only",
+			},
+			wantSessionID: "",
+			wantThreadID:  "thread-only",
+		},
+		{
+			name:          "neither present",
+			clientHeaders: map[string]string{},
+			wantSessionID: "",
+			wantThreadID:  "",
+		},
+	}
+
+	for _, tt := range tests {
+		for _, withCacheAliases := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/cache_aliases=%t", tt.name, withCacheAliases), func(t *testing.T) {
+				ctx := contextWithGinHeaders(tt.clientHeaders)
+				initialHeaders := http.Header{}
+				if withCacheAliases {
+					initialHeaders = http.Header{"session_id": {"cache-alias"}, "Conversation_id": {"cache-alias"}}
+				}
+				got := applyCodexWebsocketHeaders(ctx, initialHeaders, auth, "", cfg, true)
+
+				if tt.wantSessionID != "" {
+					if val := got.Get("Session-Id"); val != tt.wantSessionID {
+						t.Errorf("Session-Id = %q, want %q", val, tt.wantSessionID)
+					}
+				} else if val := got.Get("Session-Id"); val != "" {
+					t.Errorf("unexpected Session-Id = %q", val)
+				}
+
+				if tt.wantThreadID != "" {
+					if val := got.Get("Thread-Id"); val != tt.wantThreadID {
+						t.Errorf("Thread-Id = %q, want %q", val, tt.wantThreadID)
+					}
+				} else if val := got.Get("Thread-Id"); val != "" {
+					t.Errorf("unexpected Thread-Id = %q", val)
+				}
+
+				if hasSessionAlias := headerValueCaseInsensitive(got, "session_id"); hasSessionAlias != "" {
+					t.Errorf("unexpected synthesized session_id alias = %q", hasSessionAlias)
+				}
+				if hasConversationAlias := headerValueCaseInsensitive(got, "conversation_id"); hasConversationAlias != "" {
+					t.Errorf("unexpected synthesized conversation_id alias = %q", hasConversationAlias)
+				}
+			})
+		}
 	}
 }
 
@@ -1224,16 +1317,13 @@ func TestApplyCodexWebsocketHeadersCanonicalizesLegacyUnderscoreSessionHeader(t 
 		"Session_id": "legacy-underscore-session",
 	})
 
-	headers := applyCodexWebsocketHeaders(ctx, http.Header{}, auth, "", nil)
+	headers := applyCodexWebsocketHeaders(ctx, http.Header{}, auth, "", nil, false)
 
-	if got := headers["session-id"]; len(got) != 1 || got[0] != "legacy-underscore-session" {
-		t.Fatalf("session-id = %#v, want [legacy-underscore-session]", got)
+	if got := headers["session_id"]; len(got) != 1 || got[0] != "legacy-underscore-session" {
+		t.Fatalf("session_id = %#v, want [legacy-underscore-session]", got)
 	}
 	if got := headers.Get("Session-Id"); got != "" {
 		t.Fatalf("Session-Id = %s, want empty", got)
-	}
-	if _, ok := headers["session_id"]; ok {
-		t.Fatalf("legacy session_id key should be normalized away, got %#v", headers)
 	}
 }
 
@@ -1250,19 +1340,16 @@ func TestApplyCodexWebsocketHeadersUsesConfigDefaultsForOAuth(t *testing.T) {
 		Metadata: map[string]any{"email": "user@example.com"},
 	}
 
-	headers := applyCodexWebsocketHeaders(context.Background(), http.Header{}, auth, "", cfg)
+	headers := applyCodexWebsocketHeaders(context.Background(), http.Header{}, auth, "", cfg, false)
 
-	if got := headerValueCaseInsensitive(headers, "user-agent"); got != "my-codex-client/1.0" {
+	if got := headers.Get("User-Agent"); got != "my-codex-client/1.0" {
 		t.Fatalf("User-Agent = %s, want %s", got, "my-codex-client/1.0")
 	}
-	if got := headerValueCaseInsensitive(headers, "x-codex-beta-features"); got != "feature-a,feature-b" {
+	if got := headers.Get("x-codex-beta-features"); got != "feature-a,feature-b" {
 		t.Fatalf("x-codex-beta-features = %s, want %s", got, "feature-a,feature-b")
 	}
-	if got := headerValueCaseInsensitive(headers, "openai-beta"); got != codexResponsesWebsocketBetaHeaderValue {
-		t.Fatalf("openai-beta = %s, want %s", got, codexResponsesWebsocketBetaHeaderValue)
-	}
-	if _, ok := headers["openai-beta"]; !ok {
-		t.Fatalf("expected exact openai-beta key, got %#v", headers)
+	if got := headers.Get("OpenAI-Beta"); got != codexResponsesWebsocketBetaHeaderValue {
+		t.Fatalf("OpenAI-Beta = %s, want %s", got, codexResponsesWebsocketBetaHeaderValue)
 	}
 }
 
@@ -1286,12 +1373,12 @@ func TestApplyCodexWebsocketHeadersPrefersExistingHeadersOverClientAndConfig(t *
 	headers.Set("User-Agent", "existing-ua")
 	headers.Set("X-Codex-Beta-Features", "existing-beta")
 
-	got := applyCodexWebsocketHeaders(ctx, headers, auth, "", cfg)
+	got := applyCodexWebsocketHeaders(ctx, headers, auth, "", cfg, false)
 
-	if gotVal := headerValueCaseInsensitive(got, "user-agent"); gotVal != "existing-ua" {
+	if gotVal := got.Get("User-Agent"); gotVal != "existing-ua" {
 		t.Fatalf("User-Agent = %s, want %s", gotVal, "existing-ua")
 	}
-	if gotVal := headerValueCaseInsensitive(got, "x-codex-beta-features"); gotVal != "existing-beta" {
+	if gotVal := got.Get("x-codex-beta-features"); gotVal != "existing-beta" {
 		t.Fatalf("x-codex-beta-features = %s, want %s", gotVal, "existing-beta")
 	}
 }
@@ -1313,12 +1400,12 @@ func TestApplyCodexWebsocketHeadersConfigUserAgentOverridesClientHeader(t *testi
 		"X-Codex-Beta-Features": "client-beta",
 	})
 
-	headers := applyCodexWebsocketHeaders(ctx, http.Header{}, auth, "", cfg)
+	headers := applyCodexWebsocketHeaders(ctx, http.Header{}, auth, "", cfg, false)
 
-	if got := headerValueCaseInsensitive(headers, "user-agent"); got != "config-ua" {
+	if got := headers.Get("User-Agent"); got != "config-ua" {
 		t.Fatalf("User-Agent = %s, want %s", got, "config-ua")
 	}
-	if got := headerValueCaseInsensitive(headers, "x-codex-beta-features"); got != "client-beta" {
+	if got := headers.Get("x-codex-beta-features"); got != "client-beta" {
 		t.Fatalf("x-codex-beta-features = %s, want %s", got, "client-beta")
 	}
 }
@@ -1336,15 +1423,15 @@ func TestApplyCodexWebsocketHeadersIgnoresConfigForAPIKeyAuth(t *testing.T) {
 		Attributes: map[string]string{"api_key": "sk-test"},
 	}
 
-	headers := applyCodexWebsocketHeaders(context.Background(), http.Header{}, auth, "sk-test", cfg)
+	headers := applyCodexWebsocketHeaders(context.Background(), http.Header{}, auth, "sk-test", cfg, false)
 
-	if got := headerValueCaseInsensitive(headers, "user-agent"); got != "" {
+	if got := headers.Get("User-Agent"); got != "" {
 		t.Fatalf("User-Agent = %s, want empty", got)
 	}
 	if got := headers.Get("x-codex-beta-features"); got != "" {
 		t.Fatalf("x-codex-beta-features = %q, want empty", got)
 	}
-	if got := headerValueCaseInsensitive(headers, "originator"); got != "" {
+	if got := headers.Get("Originator"); got != "" {
 		t.Fatalf("Originator = %s, want empty", got)
 	}
 }
@@ -1353,12 +1440,12 @@ func TestApplyCodexWebsocketHeadersPreservesExplicitAPIKeyUserAgent(t *testing.T
 	auth := &cliproxyauth.Auth{Provider: "codex", Attributes: map[string]string{"api_key": "sk-test"}}
 	ctx := contextWithGinHeaders(map[string]string{"User-Agent": "api-key-client/1.0", "Originator": "explicit-origin"})
 
-	headers := applyCodexWebsocketHeaders(ctx, http.Header{}, auth, "sk-test", nil)
+	headers := applyCodexWebsocketHeaders(ctx, http.Header{}, auth, "sk-test", nil, false)
 
-	if got := headerValueCaseInsensitive(headers, "user-agent"); got != "api-key-client/1.0" {
+	if got := headers.Get("User-Agent"); got != "api-key-client/1.0" {
 		t.Fatalf("User-Agent = %s, want api-key-client/1.0", got)
 	}
-	if got := headerValueCaseInsensitive(headers, "originator"); got != "explicit-origin" {
+	if got := headers.Get("Originator"); got != "explicit-origin" {
 		t.Fatalf("Originator = %s, want explicit-origin", got)
 	}
 }
@@ -1366,17 +1453,17 @@ func TestApplyCodexWebsocketHeadersPreservesExplicitAPIKeyUserAgent(t *testing.T
 func TestApplyCodexWebsocketHeadersUsesCanonicalAccountHeader(t *testing.T) {
 	auth := &cliproxyauth.Auth{Provider: "codex", Metadata: map[string]any{"account_id": "acct-1"}}
 
-	headers := applyCodexWebsocketHeaders(context.Background(), http.Header{}, auth, "", nil)
+	headers := applyCodexWebsocketHeaders(context.Background(), http.Header{}, auth, "", nil, false)
 
-	if got := headerValueCaseInsensitive(headers, "chatgpt-account-id"); got != "acct-1" {
-		t.Fatalf("chatgpt-account-id = %s, want acct-1", got)
+	if got := headerValueCaseInsensitive(headers, "ChatGPT-Account-ID"); got != "acct-1" {
+		t.Fatalf("ChatGPT-Account-ID = %s, want acct-1", got)
 	}
-	values, ok := headers["chatgpt-account-id"]
+	values, ok := headers["ChatGPT-Account-ID"]
 	if !ok {
-		t.Fatalf("expected exact chatgpt-account-id key, got %#v", headers)
+		t.Fatalf("expected exact ChatGPT-Account-ID key, got %#v", headers)
 	}
 	if len(values) != 1 || values[0] != "acct-1" {
-		t.Fatalf("chatgpt-account-id values = %#v, want [acct-1]", values)
+		t.Fatalf("ChatGPT-Account-ID values = %#v, want [acct-1]", values)
 	}
 }
 
@@ -1385,20 +1472,14 @@ func TestApplyCodexPromptCacheHeadersSetsSessionIDAndLegacyConversation(t *testi
 
 	_, headers := applyCodexPromptCacheHeaders("openai-response", req, []byte(`{"model":"gpt-5-codex"}`))
 
-	if got := headers["session-id"]; len(got) != 1 || got[0] != "cache-1" {
-		t.Fatalf("session-id = %#v, want [cache-1]", got)
+	if got := headers["session_id"]; len(got) != 1 || got[0] != "cache-1" {
+		t.Fatalf("session_id = %#v, want [cache-1]", got)
 	}
 	if got := headers.Get("Session-Id"); got != "" {
 		t.Fatalf("Session-Id = %s, want empty", got)
 	}
-	if got := headers["thread-id"]; len(got) != 1 || got[0] != "cache-1" {
-		t.Fatalf("thread-id = %#v, want [cache-1]", got)
-	}
-	if got := headers["x-codex-window-id"]; len(got) != 1 || got[0] != "cache-1:0" {
-		t.Fatalf("x-codex-window-id = %#v, want [cache-1:0]", got)
-	}
-	if got := headers.Get("Conversation_id"); got != "" {
-		t.Fatalf("Conversation_id = %s, want empty (not used by local CLI 0.146.0 websocket)", got)
+	if got := headers.Get("Conversation_id"); got != "cache-1" {
+		t.Fatalf("Conversation_id = %s, want cache-1", got)
 	}
 }
 
@@ -1415,14 +1496,11 @@ func TestApplyCodexPromptCacheHeadersUsesDerivedSessionUUID(t *testing.T) {
 	if _, errParse := uuid.Parse(cacheKey); errParse != nil {
 		t.Fatalf("prompt_cache_key %q is not a UUID: %v", cacheKey, errParse)
 	}
-	if got := headers["session-id"]; len(got) != 1 || got[0] != cacheKey {
-		t.Fatalf("session-id = %#v, want [%q]", got, cacheKey)
+	if got := headers["session_id"]; len(got) != 1 || got[0] != cacheKey {
+		t.Fatalf("session_id = %#v, want [%q]", got, cacheKey)
 	}
-	if got := headers["thread-id"]; len(got) != 1 || got[0] != cacheKey {
-		t.Fatalf("thread-id = %#v, want [%q]", got, cacheKey)
-	}
-	if got := headers["x-codex-window-id"]; len(got) != 1 || got[0] != cacheKey+":0" {
-		t.Fatalf("x-codex-window-id = %#v, want [%q]", got, cacheKey+":0")
+	if got := headers.Get("Conversation_id"); got != cacheKey {
+		t.Fatalf("Conversation_id = %q, want %q", got, cacheKey)
 	}
 }
 
@@ -1481,11 +1559,11 @@ func TestApplyCodexPromptCacheHeadersClaudeUsesClaudeCodeSessionID(t *testing.T)
 	if secondKey != firstKey {
 		t.Fatalf("same Claude Code session_id produced different websocket prompt_cache_key: first=%q second=%q", firstKey, secondKey)
 	}
-	if got := firstHeaders["session-id"]; len(got) != 1 || got[0] != firstKey {
-		t.Fatalf("first session-id = %#v, want [%q]", got, firstKey)
+	if got := firstHeaders["session_id"]; len(got) != 1 || got[0] != firstKey {
+		t.Fatalf("first session_id = %#v, want [%q]", got, firstKey)
 	}
-	if got := secondHeaders["session-id"]; len(got) != 1 || got[0] != firstKey {
-		t.Fatalf("second session-id = %#v, want [%q]", got, firstKey)
+	if got := secondHeaders["session_id"]; len(got) != 1 || got[0] != firstKey {
+		t.Fatalf("second session_id = %#v, want [%q]", got, firstKey)
 	}
 }
 
@@ -1500,14 +1578,14 @@ func TestApplyCodexPromptCacheHeadersClaudeRejectsBareUserID(t *testing.T) {
 	if got := gjson.GetBytes(body, "prompt_cache_key").String(); got != "" {
 		t.Fatalf("bare metadata.user_id must not create websocket prompt_cache_key, got %q; body=%s", got, string(body))
 	}
-	if got := headers["session-id"]; len(got) != 0 {
-		t.Fatalf("bare metadata.user_id must not create websocket session-id, got %#v", got)
+	if got := headers["session_id"]; len(got) != 0 {
+		t.Fatalf("bare metadata.user_id must not create websocket session_id, got %#v", got)
 	}
 	if got := headers.Get("Session-Id"); got != "" {
 		t.Fatalf("bare metadata.user_id must not create websocket Session-Id, got %q", got)
 	}
-	if got := headers["thread-id"]; len(got) != 0 {
-		t.Fatalf("bare metadata.user_id must not create websocket thread-id, got %#v", got)
+	if got := headers.Get("Conversation_id"); got != "" {
+		t.Fatalf("bare metadata.user_id must not create websocket Conversation_id, got %q", got)
 	}
 }
 
@@ -1528,7 +1606,7 @@ func TestApplyCodexWebsocketHeadersIdentityConfuseRemapsPromptCacheKey(t *testin
 		"X-Codex-Turn-Metadata": `{"prompt_cache_key":"cache-ws-1","turn_id":"turn-ws-1","window_id":"cache-ws-1:0"}`,
 		"X-Client-Request-Id":   "client-request-1",
 	})
-	headers = applyCodexWebsocketHeaders(ctx, headers, auth, "oauth-token", cfg)
+	headers = applyCodexWebsocketHeaders(ctx, headers, auth, "oauth-token", cfg, false)
 	applyCodexIdentityConfuseHeaders(headers, &identityState)
 
 	expectedPromptCacheKey := codexIdentityConfuseUUID("auth-ws-1", "prompt-cache", "cache-ws-1")
@@ -1536,30 +1614,33 @@ func TestApplyCodexWebsocketHeadersIdentityConfuseRemapsPromptCacheKey(t *testin
 	if gotKey := gjson.GetBytes(body, "prompt_cache_key").String(); gotKey != expectedPromptCacheKey {
 		t.Fatalf("prompt_cache_key = %q, want %q", gotKey, expectedPromptCacheKey)
 	}
-	if gotSession := headers["session-id"]; len(gotSession) != 1 || gotSession[0] != expectedPromptCacheKey {
-		t.Fatalf("session-id = %#v, want [%q]", gotSession, expectedPromptCacheKey)
+	if gotSession := headers["session_id"]; len(gotSession) != 1 || gotSession[0] != expectedPromptCacheKey {
+		t.Fatalf("session_id = %#v, want [%q]", gotSession, expectedPromptCacheKey)
 	}
 	if gotCanonicalSession := headers.Get("Session-Id"); gotCanonicalSession != "" {
 		t.Fatalf("Session-Id = %q, want empty", gotCanonicalSession)
 	}
-	if gotRequestID := headerValueCaseInsensitive(headers, "x-client-request-id"); gotRequestID != expectedPromptCacheKey {
-		t.Fatalf("x-client-request-id = %q, want %q", gotRequestID, expectedPromptCacheKey)
+	if gotRequestID := headers.Get("X-Client-Request-Id"); gotRequestID != expectedPromptCacheKey {
+		t.Fatalf("X-Client-Request-Id = %q, want %q", gotRequestID, expectedPromptCacheKey)
 	}
-	if gotThreadID := headerValueCaseInsensitive(headers, "thread-id"); gotThreadID != expectedPromptCacheKey {
-		t.Fatalf("thread-id = %q, want %q", gotThreadID, expectedPromptCacheKey)
+	if gotThreadID := headers.Get("Thread-Id"); gotThreadID != expectedPromptCacheKey {
+		t.Fatalf("Thread-Id = %q, want %q", gotThreadID, expectedPromptCacheKey)
 	}
-	if gotWindowID := headerValueCaseInsensitive(headers, "x-codex-window-id"); gotWindowID != expectedPromptCacheKey+":0" {
-		t.Fatalf("x-codex-window-id = %q, want %q", gotWindowID, expectedPromptCacheKey+":0")
+	if gotConversation := headers.Get("Conversation_id"); gotConversation != expectedPromptCacheKey {
+		t.Fatalf("Conversation_id = %q, want %q", gotConversation, expectedPromptCacheKey)
 	}
-	gotMetadata := headerValueCaseInsensitive(headers, "x-codex-turn-metadata")
+	if gotWindowID := headers.Get("X-Codex-Window-Id"); gotWindowID != expectedPromptCacheKey+":0" {
+		t.Fatalf("X-Codex-Window-Id = %q, want %q", gotWindowID, expectedPromptCacheKey+":0")
+	}
+	gotMetadata := headers.Get("X-Codex-Turn-Metadata")
 	if gotMetadataPromptCacheKey := gjson.Get(gotMetadata, "prompt_cache_key").String(); gotMetadataPromptCacheKey != expectedPromptCacheKey {
-		t.Fatalf("x-codex-turn-metadata.prompt_cache_key = %q, want %q", gotMetadataPromptCacheKey, expectedPromptCacheKey)
+		t.Fatalf("X-Codex-Turn-Metadata.prompt_cache_key = %q, want %q", gotMetadataPromptCacheKey, expectedPromptCacheKey)
 	}
 	if gotMetadataTurnID := gjson.Get(gotMetadata, "turn_id").String(); gotMetadataTurnID != expectedTurnID {
-		t.Fatalf("x-codex-turn-metadata.turn_id = %q, want %q", gotMetadataTurnID, expectedTurnID)
+		t.Fatalf("X-Codex-Turn-Metadata.turn_id = %q, want %q", gotMetadataTurnID, expectedTurnID)
 	}
 	if gotMetadataWindowID := gjson.Get(gotMetadata, "window_id").String(); gotMetadataWindowID != expectedPromptCacheKey+":0" {
-		t.Fatalf("x-codex-turn-metadata.window_id = %q, want %q", gotMetadataWindowID, expectedPromptCacheKey+":0")
+		t.Fatalf("X-Codex-Turn-Metadata.window_id = %q, want %q", gotMetadataWindowID, expectedPromptCacheKey+":0")
 	}
 	expectedInstallationID := codexIdentityConfuseUUID("auth-ws-1", "installation", "install-ws-1")
 	if gotInstallationID := gjson.GetBytes(body, "client_metadata.x-codex-installation-id").String(); gotInstallationID != expectedInstallationID {
@@ -1821,7 +1902,7 @@ func TestApplyCodexWebsocketHeaders_EmptyAPIKey_OmitsAuthorizationAndOAuthHeader
 			BetaFeatures: "oauth-beta",
 		},
 	}
-	headers := applyCodexWebsocketHeaders(context.Background(), nil, auth, "", cfg)
+	headers := applyCodexWebsocketHeaders(context.Background(), nil, auth, "", cfg, false)
 	if got := headers.Get("Authorization"); got != "" {
 		t.Fatalf("Authorization = %q, want empty for empty API key", got)
 	}
@@ -1840,7 +1921,7 @@ func TestApplyCodexWebsocketHeaders_EmptyAPIKey_OmitsAuthorizationAndOAuthHeader
 }
 
 func TestApplyModelHeaderOverridesFromModelConfig(t *testing.T) {
-	const wantUA = "codex-tui/0.144.0 (Mac OS 26.5.1; arm64) iTerm.app/3.6.11 (codex-tui; 0.144.0)"
+	const wantUA = "codex-tui/0.154.0 (Mac OS 26.5.2; arm64) iTerm.app/3.6.11 (codex-tui; 0.154.0)"
 	req, err := http.NewRequest(http.MethodPost, "https://example.com/responses", nil)
 	if err != nil {
 		t.Fatalf("NewRequest() error = %v", err)
@@ -1893,10 +1974,10 @@ func TestApplyModelHeaderOverridesMultipleHeaders(t *testing.T) {
 
 	applyModelHeaderOverrides(headers, "test-override-headers-model")
 
-	if got := headerValueCaseInsensitive(headers, "user-agent"); got != "custom-ua/1.0" {
+	if got := headers.Get("User-Agent"); got != "custom-ua/1.0" {
 		t.Fatalf("User-Agent = %q, want custom-ua/1.0", got)
 	}
-	if got := headerValueCaseInsensitive(headers, "originator"); got != "custom-origin" {
+	if got := headers.Get("Originator"); got != "custom-origin" {
 		t.Fatalf("Originator = %q, want custom-origin", got)
 	}
 	if got := headers.Get("X-Test-Header"); got != "forced-value" {
@@ -1917,6 +1998,7 @@ func TestApplyCodexHeadersPassesThroughClientIdentityHeaders(t *testing.T) {
 		"Originator":            "Codex Desktop",
 		"Version":               "0.115.0-alpha.27",
 		"X-Codex-Turn-Metadata": `{"turn_id":"turn-1"}`,
+		"X-Codex-Turn-State":    "opaque-turn-state",
 		"X-Client-Request-Id":   "019d2233-e240-7162-992d-38df0a2a0e0d",
 	}))
 
@@ -1931,6 +2013,9 @@ func TestApplyCodexHeadersPassesThroughClientIdentityHeaders(t *testing.T) {
 	}
 	if got := req.Header.Get("X-Codex-Turn-Metadata"); got != `{"turn_id":"turn-1"}` {
 		t.Fatalf("X-Codex-Turn-Metadata = %s, want %s", got, `{"turn_id":"turn-1"}`)
+	}
+	if got := req.Header.Get("X-Codex-Turn-State"); got != "opaque-turn-state" {
+		t.Fatalf("X-Codex-Turn-State = %q, want %q", got, "opaque-turn-state")
 	}
 	if got := req.Header.Get("X-Client-Request-Id"); got != "019d2233-e240-7162-992d-38df0a2a0e0d" {
 		t.Fatalf("X-Client-Request-Id = %s, want %s", got, "019d2233-e240-7162-992d-38df0a2a0e0d")
@@ -1950,6 +2035,9 @@ func TestApplyCodexHeadersDoesNotInjectClientOnlyHeadersByDefault(t *testing.T) 
 	}
 	if got := req.Header.Get("X-Codex-Turn-Metadata"); got != "" {
 		t.Fatalf("X-Codex-Turn-Metadata = %q, want empty", got)
+	}
+	if got := req.Header.Get("X-Codex-Turn-State"); got != "" {
+		t.Fatalf("X-Codex-Turn-State = %q, want empty", got)
 	}
 	if got := req.Header.Get("X-Client-Request-Id"); got != "" {
 		t.Fatalf("X-Client-Request-Id = %q, want empty", got)
@@ -1972,6 +2060,7 @@ func TestNewProxyAwareWebsocketDialerDirectDisablesProxy(t *testing.T) {
 	t.Parallel()
 
 	dialer := newProxyAwareWebsocketDialer(
+		context.Background(),
 		&config.Config{SDKConfig: sdkconfig.SDKConfig{ProxyURL: "http://global-proxy.example.com:8080"}},
 		&cliproxyauth.Auth{ProxyURL: "direct"},
 	)
@@ -2535,5 +2624,783 @@ func TestCodexWebsocketsExecuteStreamHandshakeUsageLimitReachedSetsRetryAfter(t 
 	}
 	if got := *retryable.RetryAfter(); got != 120*time.Second {
 		t.Fatalf("RetryAfter = %v, want 120s", got)
+	}
+}
+
+func TestCodexWebsocketZeroTokenIncompleteReleasesSessionRequestLock(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, errUpgrade := upgrader.Upgrade(w, r, nil)
+		if errUpgrade != nil {
+			t.Errorf("upgrade websocket: %v", errUpgrade)
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		if _, _, errRead := conn.ReadMessage(); errRead != nil {
+			return
+		}
+		terminal := []byte(`{"type":"response.incomplete","response":{"id":"resp_1","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[],"usage":{"input_tokens":10,"output_tokens":0,"total_tokens":10}}}`)
+		_ = conn.WriteMessage(websocket.TextMessage, terminal)
+	}))
+	defer server.Close()
+
+	exec := NewCodexWebsocketsExecutor(&config.Config{
+		Codex: config.CodexConfig{
+			StreamBootstrapBuffering: true,
+		},
+		SDKConfig: config.SDKConfig{
+			DisableImageGeneration: config.DisableImageGenerationAll,
+		},
+	})
+	exec.store = &codexWebsocketSessionStore{sessions: make(map[string]*codexWebsocketSession)}
+	auth := &cliproxyauth.Auth{ID: "auth-a", Provider: "codex", Attributes: map[string]string{"api_key": "sk-test", "base_url": server.URL}}
+	req := cliproxyexecutor.Request{Model: "gpt-5-codex", Payload: []byte(`{"model":"gpt-5-codex","input":[{"type":"message","role":"user","content":"hello"}]}`)}
+	opts := cliproxyexecutor.Options{
+		SourceFormat:   sdktranslator.FromString("openai-response"),
+		ResponseFormat: sdktranslator.FromString("openai-response"),
+		Metadata: map[string]any{
+			cliproxyexecutor.ExecutionSessionMetadataKey: "zero-token-session",
+		},
+	}
+
+	result, errExecute := exec.ExecuteStream(context.Background(), auth, req, opts)
+	if errExecute == nil && result != nil {
+		for chunk := range result.Chunks {
+			_ = chunk
+		}
+	}
+
+	sess := exec.getOrCreateSession("zero-token-session")
+	acquired := make(chan struct{})
+	go func() {
+		sess.reqMu.Lock()
+		defer sess.reqMu.Unlock()
+		close(acquired)
+	}()
+	select {
+	case <-acquired:
+	case <-time.After(time.Second):
+		t.Fatal("failed to acquire session request lock after zero-token incomplete failure")
+	}
+}
+
+func TestCodexWebsockets_PingHandlerDoesNotBlockOnWriteMu(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	serverConnCh := make(chan *websocket.Conn, 1)
+	pongReceived := make(chan string, 1)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade websocket: %v", err)
+			return
+		}
+		conn.SetPongHandler(func(appData string) error {
+			pongReceived <- appData
+			return nil
+		})
+		serverConnCh <- conn
+		for {
+			if _, _, errRead := conn.ReadMessage(); errRead != nil {
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	clientConn, _, errDial := websocket.DefaultDialer.Dial(wsURL, nil)
+	if errDial != nil {
+		t.Fatalf("dial websocket failed: %v", errDial)
+	}
+	defer func() { _ = clientConn.Close() }()
+
+	serverConn := <-serverConnCh
+	defer func() { _ = serverConn.Close() }()
+
+	sess := &codexWebsocketSession{sessionID: "test-keepalive"}
+	sess.configureConn(clientConn)
+
+	// Start client read loop so it processes control frames.
+	go func() {
+		for {
+			if _, _, errRead := clientConn.ReadMessage(); errRead != nil {
+				return
+			}
+		}
+	}()
+
+	// Simulate an active application message write holding writeMu.
+	sess.writeMu.Lock()
+	defer sess.writeMu.Unlock()
+
+	// Upstream sends a keepalive ping while writeMu is held.
+	errPing := serverConn.WriteControl(websocket.PingMessage, []byte("keepalive-ping"), time.Now().Add(time.Second))
+	if errPing != nil {
+		t.Fatalf("failed to send ping: %v", errPing)
+	}
+
+	// Pong must be received promptly without being starved by writeMu.
+	select {
+	case got := <-pongReceived:
+		if got != "keepalive-ping" {
+			t.Fatalf("unexpected pong payload: got %q, want keepalive-ping", got)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("pong response was blocked/starved while writeMu was held")
+	}
+}
+
+func TestCodexWebsockets_KeepalivePingDuringUpload_WithSession(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	serverPongCh := make(chan string, 1)
+	inWriteHook := make(chan struct{})
+	pongDeliveredDuringWrite := make(chan struct{})
+
+	testWebsocketWritePayloadHook = func(conn *websocket.Conn) {
+		close(inWriteHook)
+		// Wait until server confirms pong was received before allowing write to finish.
+		select {
+		case <-pongDeliveredDuringWrite:
+		case <-time.After(2 * time.Second):
+			t.Error("timed out waiting for pong delivery while payload write was held in hook")
+		}
+	}
+	defer func() { testWebsocketWritePayloadHook = nil }()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade websocket: %v", err)
+			return
+		}
+		defer func() { _ = conn.Close() }()
+
+		conn.SetPongHandler(func(appData string) error {
+			serverPongCh <- appData
+			return nil
+		})
+
+		// Start server reader loop so server processes control frames.
+		readErrCh := make(chan error, 1)
+		go func() {
+			for {
+				if _, _, errRead := conn.ReadMessage(); errRead != nil {
+					readErrCh <- errRead
+					return
+				}
+			}
+		}()
+
+		// Wait until client has entered writeMessage and is actively holding writeMu.
+		select {
+		case <-inWriteHook:
+		case <-time.After(2 * time.Second):
+			t.Errorf("timed out waiting for client write hook")
+			return
+		}
+
+		// Upstream sends Ping WHILE client payload write is in progress holding writeMu.
+		_ = conn.WriteControl(websocket.PingMessage, []byte("session-ping"), time.Now().Add(time.Second))
+
+		// Server asserts Pong arrives while client write is still blocked in the hook.
+		select {
+		case got := <-serverPongCh:
+			if got != "session-ping" {
+				t.Errorf("unexpected pong payload: got %q, want session-ping", got)
+			}
+			close(pongDeliveredDuringWrite)
+		case <-time.After(2 * time.Second):
+			t.Errorf("pong was not received while payload write was in progress")
+			return
+		}
+
+		// Now send terminal response.
+		respPayload := []byte(`{"type":"response.completed","response":{"id":"resp-1","status":"completed","output":[]}}`)
+		_ = conn.WriteMessage(websocket.TextMessage, respPayload)
+	}))
+	defer server.Close()
+
+	exec := NewCodexWebsocketsExecutor(&config.Config{
+		SDKConfig: config.SDKConfig{
+			DisableImageGeneration: config.DisableImageGenerationAll,
+		},
+	})
+	auth := &cliproxyauth.Auth{ID: "auth-session-ping", Attributes: map[string]string{"api_key": "sk-test", "base_url": server.URL}}
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5.6-sol",
+		Payload: []byte(`{"model":"gpt-5.6-sol","input":[{"type":"message","role":"user","content":"ping test"}]}`),
+	}
+	opts := cliproxyexecutor.Options{
+		SourceFormat:   sdktranslator.FromString("openai-response"),
+		ResponseFormat: sdktranslator.FromString("openai-response"),
+		Metadata: map[string]any{
+			cliproxyexecutor.ExecutionSessionMetadataKey: "session-ping-test",
+		},
+	}
+
+	result, errStream := exec.ExecuteStream(context.Background(), auth, req, opts)
+	if errStream != nil {
+		t.Fatalf("ExecuteStream() failed: %v", errStream)
+	}
+
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("chunk error: %v", chunk.Err)
+		}
+	}
+}
+
+func TestCodexWebsockets_KeepalivePingDuringUpload_Sessionless(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	serverPongCh := make(chan string, 1)
+	inWriteHook := make(chan struct{})
+	pongDeliveredDuringWrite := make(chan struct{})
+
+	testWebsocketWritePayloadHook = func(conn *websocket.Conn) {
+		close(inWriteHook)
+		select {
+		case <-pongDeliveredDuringWrite:
+		case <-time.After(2 * time.Second):
+			t.Error("timed out waiting for pong delivery while payload write was held in hook")
+		}
+	}
+	defer func() { testWebsocketWritePayloadHook = nil }()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade websocket: %v", err)
+			return
+		}
+		defer func() { _ = conn.Close() }()
+
+		conn.SetPongHandler(func(appData string) error {
+			serverPongCh <- appData
+			return nil
+		})
+
+		go func() {
+			for {
+				if _, _, errRead := conn.ReadMessage(); errRead != nil {
+					return
+				}
+			}
+		}()
+
+		// Wait until client has entered writeMessage on sessionless path.
+		select {
+		case <-inWriteHook:
+		case <-time.After(2 * time.Second):
+			t.Errorf("timed out waiting for client write hook")
+			return
+		}
+
+		// Upstream sends Ping WHILE client payload write is in progress.
+		_ = conn.WriteControl(websocket.PingMessage, []byte("sessionless-ping"), time.Now().Add(time.Second))
+
+		// Server asserts Pong arrives while client write is still in progress.
+		select {
+		case got := <-serverPongCh:
+			if got != "sessionless-ping" {
+				t.Errorf("unexpected pong payload: got %q, want sessionless-ping", got)
+			}
+			close(pongDeliveredDuringWrite)
+		case <-time.After(2 * time.Second):
+			t.Errorf("pong was not received while payload write was in progress on sessionless connection")
+			return
+		}
+
+		respPayload := []byte(`{"type":"response.completed","response":{"id":"resp-1","status":"completed","output":[]}}`)
+		_ = conn.WriteMessage(websocket.TextMessage, respPayload)
+	}))
+	defer server.Close()
+
+	exec := NewCodexWebsocketsExecutor(&config.Config{
+		SDKConfig: config.SDKConfig{
+			DisableImageGeneration: config.DisableImageGenerationAll,
+		},
+	})
+	auth := &cliproxyauth.Auth{ID: "auth-sessionless-ping", Attributes: map[string]string{"api_key": "sk-test", "base_url": server.URL}}
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5.6-sol",
+		Payload: []byte(`{"model":"gpt-5.6-sol","input":[{"type":"message","role":"user","content":"ping test sessionless"}]}`),
+	}
+	opts := cliproxyexecutor.Options{
+		SourceFormat:   sdktranslator.FromString("openai-response"),
+		ResponseFormat: sdktranslator.FromString("openai-response"),
+	}
+
+	result, errStream := exec.ExecuteStream(context.Background(), auth, req, opts)
+	if errStream != nil {
+		t.Fatalf("ExecuteStream() failed: %v", errStream)
+	}
+
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("chunk error: %v", chunk.Err)
+		}
+	}
+}
+
+func TestCodexWebsockets_KeepalivePingDuringUpload_NonstreamSessionless(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	serverPongCh := make(chan string, 1)
+	inWriteHook := make(chan struct{})
+	pongDeliveredDuringWrite := make(chan struct{})
+
+	testWebsocketWritePayloadHook = func(conn *websocket.Conn) {
+		close(inWriteHook)
+		select {
+		case <-pongDeliveredDuringWrite:
+		case <-time.After(2 * time.Second):
+			t.Error("timed out waiting for pong delivery while nonstream payload write was held in hook")
+		}
+	}
+	defer func() { testWebsocketWritePayloadHook = nil }()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade websocket: %v", err)
+			return
+		}
+		defer func() { _ = conn.Close() }()
+
+		conn.SetPongHandler(func(appData string) error {
+			serverPongCh <- appData
+			return nil
+		})
+
+		go func() {
+			for {
+				if _, _, errRead := conn.ReadMessage(); errRead != nil {
+					return
+				}
+			}
+		}()
+
+		// Wait until client has entered writeMessage on nonstream path.
+		select {
+		case <-inWriteHook:
+		case <-time.After(2 * time.Second):
+			t.Errorf("timed out waiting for client write hook")
+			return
+		}
+
+		// Upstream sends Ping WHILE client payload write is in progress.
+		_ = conn.WriteControl(websocket.PingMessage, []byte("nonstream-sessionless-ping"), time.Now().Add(time.Second))
+
+		// Server asserts Pong arrives while client write is still in progress.
+		select {
+		case got := <-serverPongCh:
+			if got != "nonstream-sessionless-ping" {
+				t.Errorf("unexpected pong payload: got %q, want nonstream-sessionless-ping", got)
+			}
+			close(pongDeliveredDuringWrite)
+		case <-time.After(2 * time.Second):
+			t.Errorf("pong was not received while payload write was in progress on nonstream sessionless connection")
+			return
+		}
+
+		respPayload := []byte(`{"type":"response.completed","response":{"id":"resp-1","status":"completed","output":[]}}`)
+		_ = conn.WriteMessage(websocket.TextMessage, respPayload)
+	}))
+	defer server.Close()
+
+	exec := NewCodexWebsocketsExecutor(&config.Config{
+		SDKConfig: config.SDKConfig{
+			DisableImageGeneration: config.DisableImageGenerationAll,
+		},
+	})
+	auth := &cliproxyauth.Auth{ID: "auth-nonstream-ping", Attributes: map[string]string{"api_key": "sk-test", "base_url": server.URL}}
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5.6-sol",
+		Payload: []byte(`{"model":"gpt-5.6-sol","input":[{"type":"message","role":"user","content":"ping test nonstream"}]}`),
+	}
+	opts := cliproxyexecutor.Options{
+		SourceFormat:   sdktranslator.FromString("openai-response"),
+		ResponseFormat: sdktranslator.FromString("openai-response"),
+	}
+
+	resp, errExec := exec.Execute(context.Background(), auth, req, opts)
+	if errExec != nil {
+		t.Fatalf("Execute() failed: %v", errExec)
+	}
+	if len(resp.Payload) == 0 {
+		t.Fatal("Execute() returned empty payload")
+	}
+}
+
+func TestCodexWebsockets_SessionlessBufferingImmediateTerminalClosesConnection(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	serverClosed := make(chan struct{})
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade websocket: %v", err)
+			return
+		}
+		defer func() {
+			_ = conn.Close()
+			close(serverClosed)
+		}()
+
+		// Read client request.
+		if _, _, errRead := conn.ReadMessage(); errRead != nil {
+			return
+		}
+
+		// Send immediate terminal event while buffering is enabled.
+		respPayload := []byte(`{"type":"response.completed","response":{"id":"resp-1","status":"completed","output":[]}}`)
+		_ = conn.WriteMessage(websocket.TextMessage, respPayload)
+
+		// Wait until client closes connection.
+		for {
+			if _, _, errRead := conn.ReadMessage(); errRead != nil {
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	exec := NewCodexWebsocketsExecutor(&config.Config{
+		Codex: config.CodexConfig{
+			StreamBootstrapBuffering: true,
+		},
+		SDKConfig: config.SDKConfig{
+			DisableImageGeneration: config.DisableImageGenerationAll,
+		},
+	})
+	auth := &cliproxyauth.Auth{ID: "auth-buffering-close", Attributes: map[string]string{"api_key": "sk-test", "base_url": server.URL}}
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5.6-sol",
+		Payload: []byte(`{"model":"gpt-5.6-sol","input":[{"type":"message","role":"user","content":"buffering close test"}]}`),
+	}
+	opts := cliproxyexecutor.Options{
+		SourceFormat:   sdktranslator.FromString("openai-response"),
+		ResponseFormat: sdktranslator.FromString("openai-response"),
+		// Sessionless
+	}
+
+	result, errStream := exec.ExecuteStream(context.Background(), auth, req, opts)
+	if errStream != nil {
+		t.Fatalf("ExecuteStream() failed: %v", errStream)
+	}
+
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("chunk error: %v", chunk.Err)
+		}
+	}
+
+	// Server connection must be closed by client immediately upon terminal buffering.
+	select {
+	case <-serverClosed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("sessionless connection was not closed after immediate terminal buffering")
+	}
+}
+
+func TestCodexWebsockets_LastEventAndTerminalTracking(t *testing.T) {
+	conn1 := &websocket.Conn{}
+	conn2 := &websocket.Conn{}
+	sess := &codexWebsocketSession{sessionID: "track-session"}
+
+	// Initially empty
+	sess.resetUpstreamDisconnectError(conn1)
+	if got := sess.getLastEventType(conn1); got != "" {
+		t.Fatalf("initial lastEventType = %q, want empty", got)
+	}
+
+	// Non-terminal event
+	sess.setLastEventType(conn1, "response.output_item.added")
+	if got := sess.getLastEventType(conn1); got != "response.output_item.added" {
+		t.Fatalf("lastEventType = %q, want response.output_item.added", got)
+	}
+	if isTerminalEvent(sess.getLastEventType(conn1)) {
+		t.Fatalf("output_item.added should not be terminal")
+	}
+
+	// Terminal event
+	sess.setLastEventType(conn1, "response.completed")
+	if got := sess.getLastEventType(conn1); got != "response.completed" {
+		t.Fatalf("lastEventType = %q, want response.completed", got)
+	}
+	if !isTerminalEvent(sess.getLastEventType(conn1)) {
+		t.Fatalf("response.completed must be terminal")
+	}
+
+	// Reset for new connection resets tracking
+	sess.resetUpstreamDisconnectError(conn2)
+	if got := sess.getLastEventType(conn2); got != "" {
+		t.Fatalf("reconnected lastEventType = %q, want empty", got)
+	}
+	// Old conn should not match
+	if got := sess.getLastEventType(conn1); got != "" {
+		t.Fatalf("stale conn lastEventType = %q, want empty", got)
+	}
+}
+
+func TestCodexWebsockets_ChunkedWriteAllowsPongInterleaving(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	serverPongCh := make(chan string, 1)
+	pongReceivedBeforeReadComplete := make(chan struct{})
+
+	firstChunkReadOnServer := make(chan struct{})
+	allowRemainingChunks := make(chan struct{})
+
+	testWebsocketWriteChunkHook = func(chunkIndex int, totalChunks int) {
+		if chunkIndex == 1 {
+			// Chunk 0 was sent to the network. Now wait until server confirms it has
+			// received chunk 0 and sent a keepalive Ping:
+			select {
+			case <-firstChunkReadOnServer:
+			case <-time.After(5 * time.Second):
+			}
+			select {
+			case <-allowRemainingChunks:
+			case <-time.After(5 * time.Second):
+			}
+		}
+	}
+	defer func() { testWebsocketWriteChunkHook = nil }()
+
+	// Large message that spans multiple 32KB chunks (128KB total).
+	largeContent := strings.Repeat("A", 128*1024)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade websocket: %v", err)
+			return
+		}
+		defer func() { _ = conn.Close() }()
+
+		conn.SetPongHandler(func(appData string) error {
+			serverPongCh <- appData
+			return nil
+		})
+
+		// Read the first chunk of data using NextReader, proving receipt of partial message on the wire.
+		msgType, reader, errNext := conn.NextReader()
+		if errNext != nil {
+			t.Errorf("server NextReader error: %v", errNext)
+			return
+		}
+		if msgType != websocket.TextMessage {
+			t.Errorf("unexpected msgType: %d", msgType)
+			return
+		}
+
+		firstChunk := make([]byte, 8192)
+		n, errRead := io.ReadFull(reader, firstChunk)
+		if errRead != nil || n < 8192 {
+			t.Errorf("failed reading first chunk from wire: n=%d err=%v", n, errRead)
+			return
+		}
+
+		// Server confirmed reading chunk 0 from the wire!
+		close(firstChunkReadOnServer)
+
+		// Server injects keepalive Ping while client is paused between chunks.
+		_ = conn.WriteControl(websocket.PingMessage, []byte("chunked-interleaved-ping"), time.Now().Add(time.Second))
+
+		// Goroutine to read reader so Gorilla processes the interleaved Pong frame.
+		readDone := make(chan struct{})
+		var totalMsg []byte
+		var readErr error
+		go func() {
+			rest, errRest := io.ReadAll(reader)
+			readErr = errRest
+			totalMsg = append(firstChunk, rest...)
+			close(readDone)
+		}()
+
+		// Server asserts Pong is received while remaining chunks are still paused.
+		select {
+		case got := <-serverPongCh:
+			if got != "chunked-interleaved-ping" {
+				t.Errorf("unexpected pong: got %q, want chunked-interleaved-ping", got)
+			}
+			close(pongReceivedBeforeReadComplete)
+			close(allowRemainingChunks)
+		case <-time.After(2 * time.Second):
+			t.Errorf("pong was not received while client was paused between chunks")
+			close(allowRemainingChunks)
+			return
+		}
+
+		// Wait for read to finish now that allowRemainingChunks was closed.
+		select {
+		case <-readDone:
+			if readErr != nil {
+				t.Errorf("server ReadAll rest error: %v", readErr)
+				return
+			}
+		case <-time.After(2 * time.Second):
+			t.Errorf("timed out reading remaining message frames")
+			return
+		}
+
+		if len(totalMsg) < 128*1024 {
+			t.Errorf("total received payload too short: %d bytes", len(totalMsg))
+			return
+		}
+
+		// Send terminal response.
+		respPayload := []byte(`{"type":"response.completed","response":{"id":"resp-1","status":"completed","output":[]}}`)
+		_ = conn.WriteMessage(websocket.TextMessage, respPayload)
+	}))
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	clientConn, _, errDial := websocket.DefaultDialer.Dial(wsURL, nil)
+	if errDial != nil {
+		t.Fatalf("dial error: %v", errDial)
+	}
+	defer func() { _ = clientConn.Close() }()
+
+	sess := &codexWebsocketSession{sessionID: "session-chunked-test"}
+	sess.configureConn(clientConn)
+	_ = sess.activate(clientConn)
+	exec := NewCodexWebsocketsExecutor(&config.Config{})
+	go exec.readUpstreamLoop(sess, clientConn)
+
+	// Write 128KB message through production sess.writeMessage path:
+	payload := []byte(largeContent)
+	errWrite := sess.writeMessage(clientConn, websocket.TextMessage, payload)
+	if errWrite != nil {
+		t.Fatalf("writeMessage failed: %v", errWrite)
+	}
+
+	select {
+	case <-pongReceivedBeforeReadComplete:
+	case <-time.After(2 * time.Second):
+		t.Fatal("pong was not received before message read completed")
+	}
+}
+
+func TestCodexWebsockets_PingLoggingRedacted(t *testing.T) {
+	origOut := log.StandardLogger().Out
+	origLevel := log.GetLevel()
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	log.SetLevel(log.DebugLevel)
+	defer func() {
+		log.SetOutput(origOut)
+		log.SetLevel(origLevel)
+	}()
+
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade websocket: %v", err)
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		for {
+			if _, _, errRead := conn.ReadMessage(); errRead != nil {
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	clientConn, _, errDial := websocket.DefaultDialer.Dial(wsURL, nil)
+	if errDial != nil {
+		t.Fatalf("dial websocket failed: %v", errDial)
+	}
+	defer func() { _ = clientConn.Close() }()
+
+	sess := &codexWebsocketSession{sessionID: "redact-session"}
+	sess.configureConn(clientConn)
+
+	sensitiveData := "SUPER-SECRET-PAYLOAD-12345"
+	pingHandler := clientConn.PingHandler()
+	if pingHandler == nil {
+		t.Fatal("pingHandler is nil")
+	}
+	_ = pingHandler(sensitiveData)
+
+	logOutput := buf.String()
+	if strings.Contains(logOutput, sensitiveData) {
+		t.Fatalf("log output leaked sensitive ping payload: %s", logOutput)
+	}
+	if !strings.Contains(logOutput, "ping_bytes=") {
+		t.Fatalf("log output missing ping_bytes: %s", logOutput)
+	}
+}
+
+func TestCodexWebsockets_SendErrorLogsSessionObject(t *testing.T) {
+	origOut := log.StandardLogger().Out
+	origLevel := log.GetLevel()
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	log.SetLevel(log.DebugLevel)
+	defer func() {
+		log.SetOutput(origOut)
+		log.SetLevel(origLevel)
+	}()
+
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade websocket: %v", err)
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		for {
+			if _, _, errRead := conn.ReadMessage(); errRead != nil {
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	// Deterministically cause send error by expiring write deadline right before writing.
+	testWebsocketWritePayloadHook = func(conn *websocket.Conn) {
+		_ = conn.SetWriteDeadline(time.Now().Add(-time.Second))
+	}
+	defer func() { testWebsocketWritePayloadHook = nil }()
+
+	exec := NewCodexWebsocketsExecutor(&config.Config{
+		SDKConfig: config.SDKConfig{
+			DisableImageGeneration: config.DisableImageGenerationAll,
+		},
+	})
+	auth := &cliproxyauth.Auth{ID: "auth-send-fail", Attributes: map[string]string{"api_key": "sk-test", "base_url": server.URL}}
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5.6-sol",
+		Payload: []byte(`{"model":"gpt-5.6-sol","input":[{"type":"message","role":"user","content":"send fail"}]}`),
+	}
+	opts := cliproxyexecutor.Options{
+		SourceFormat:   sdktranslator.FromString("openai-response"),
+		ResponseFormat: sdktranslator.FromString("openai-response"),
+		// Sessionless -> ephemeral
+	}
+
+	result, err := exec.ExecuteStream(context.Background(), auth, req, opts)
+	if err == nil && result != nil {
+		for chunk := range result.Chunks {
+			if chunk.Err != nil {
+				err = chunk.Err
+			}
+		}
+	}
+	if err == nil {
+		t.Fatal("expected ExecuteStream to fail when connection is closed before send")
+	}
+
+	logOutput := buf.String()
+	if !strings.Contains(logOutput, "session_object=ephemeral") {
+		t.Fatalf("expected session_object=ephemeral in log output, got: %s", logOutput)
+	}
+	if !strings.Contains(logOutput, "reason=send_error") {
+		t.Fatalf("expected reason=send_error in log output, got: %s", logOutput)
 	}
 }

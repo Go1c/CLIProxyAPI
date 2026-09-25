@@ -6,12 +6,11 @@ package config
 
 // SDKConfig represents the application's configuration, loaded from a YAML file.
 type SDKConfig struct {
+	// CodexResponseSteering mirrors the provider-wide runtime setting for API handlers.
+	CodexResponseSteering bool `yaml:"-" json:"-"`
+
 	// ProxyURL is the URL of an optional proxy server to use for outbound requests.
 	ProxyURL string `yaml:"proxy-url" json:"proxy-url"`
-
-	// CodexProxyRequired rejects direct Codex OAuth traffic and credentials with
-	// missing, explicit-direct, or invalid proxy settings.
-	CodexProxyRequired bool `yaml:"codex-proxy-required" json:"codex-proxy-required"`
 
 	// DisableImageGeneration controls whether the built-in image_generation tool is injected/allowed.
 	//

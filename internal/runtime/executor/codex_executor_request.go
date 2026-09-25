@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -23,13 +24,10 @@ import (
 )
 
 const (
-	codexUserAgent             = "codex-tui/0.146.0 (Mac OS 26.5.2; arm64) Orca/1.4.178 (codex-tui; 0.146.0)"
+	codexUserAgent             = "codex-tui/0.154.0 (Mac OS 26.5.2; arm64) iTerm.app/3.6.11 (codex-tui; 0.154.0)"
 	codexOriginator            = "codex-tui"
-	codexDefaultVersion        = "0.146.0"
-	codexDefaultBetaFeatures   = "remote_compaction_v2"
 	codexDefaultImageToolModel = "gpt-image-2"
 	codexResponsesLiteHeader   = "X-OpenAI-Internal-Codex-Responses-Lite"
-	codexResponsesLiteMetadata = "client_metadata.ws_request_header_x_openai_internal_codex_responses_lite"
 )
 
 var dataTag = []byte("data:")
@@ -82,10 +80,7 @@ func (e *CodexExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth
 	if err := e.PrepareRequest(httpReq, auth); err != nil {
 		return nil, err
 	}
-	httpClient, errClient := helps.NewCodexRustlsHTTPClient(ctx, e.cfg, auth)
-	if errClient != nil {
-		return nil, errClient
-	}
+	httpClient := helps.NewUtlsHTTPClient(ctx, e.cfg, auth, 0)
 	return httpClient.Do(httpReq)
 }
 
@@ -156,12 +151,7 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Form
 		return nil, nil, codexIdentityConfuseState{}, err
 	}
 	if cache.ID != "" {
-		// Match local Codex CLI 0.146.0 HTTP Responses headers (Session-Id / Thread-Id /
-		// X-Client-Request-Id / X-Codex-Window-Id share the session UUID).
 		httpReq.Header.Set("Session-Id", cache.ID)
-		httpReq.Header.Set("Thread-Id", cache.ID)
-		httpReq.Header.Set("X-Client-Request-Id", cache.ID)
-		httpReq.Header.Set("X-Codex-Window-Id", cache.ID+":0")
 	}
 	return httpReq, rawJSON, identityState, nil
 }
@@ -200,29 +190,10 @@ func applyCodexIdentityConfuseHeaders(headers http.Header, state *codexIdentityC
 		return
 	}
 
-	if rawTurnMetadata := strings.TrimSpace(headerValueCaseInsensitive(headers, "x-codex-turn-metadata")); rawTurnMetadata != "" {
-		// Prefer existing wire key casing (HTTP: X-Codex-Turn-Metadata, WS: x-codex-turn-metadata).
-		metaKey := "X-Codex-Turn-Metadata"
-		for existingKey := range headers {
-			if strings.EqualFold(existingKey, metaKey) {
-				metaKey = existingKey
-				break
-			}
-		}
-		setHeaderCasePreserved(headers, metaKey, applyCodexTurnMetadataIdentityConfuse(rawTurnMetadata, state))
+	if rawTurnMetadata := strings.TrimSpace(headers.Get("X-Codex-Turn-Metadata")); rawTurnMetadata != "" {
+		headers.Set("X-Codex-Turn-Metadata", applyCodexTurnMetadataIdentityConfuse(rawTurnMetadata, state))
 	}
 	if state.promptCacheKey == "" {
-		return
-	}
-
-	// Local Codex CLI 0.146.0 uses MIME-style names on HTTP and lowercase on websocket upgrades.
-	wsWire := headersHaveCodexWebsocketWireForm(headers)
-	if wsWire {
-		setCodexSessionHeaderCasePreserved(headers, "session-id", state.promptCacheKey)
-		setHeaderCasePreserved(headers, "x-client-request-id", state.promptCacheKey)
-		setHeaderCasePreserved(headers, "thread-id", state.promptCacheKey)
-		setHeaderCasePreserved(headers, "x-codex-window-id", state.promptCacheKey+":0")
-		normalizeCodexWebsocketWireHeaders(headers)
 		return
 	}
 
@@ -230,25 +201,9 @@ func applyCodexIdentityConfuseHeaders(headers http.Header, state *codexIdentityC
 	if headerValueCaseInsensitive(headers, "Conversation_id") != "" {
 		setHeaderCasePreserved(headers, "Conversation_id", state.promptCacheKey)
 	}
-	setHeaderCasePreserved(headers, "X-Client-Request-Id", state.promptCacheKey)
-	setHeaderCasePreserved(headers, "Thread-Id", state.promptCacheKey)
-	setHeaderCasePreserved(headers, "X-Codex-Window-Id", state.promptCacheKey+":0")
-}
-
-func headersHaveCodexWebsocketWireForm(headers http.Header) bool {
-	if headers == nil {
-		return false
-	}
-	if _, ok := headers["session-id"]; ok {
-		return true
-	}
-	if _, ok := headers["openai-beta"]; ok {
-		return true
-	}
-	if _, ok := headers["thread-id"]; ok {
-		return true
-	}
-	return false
+	headers.Set("X-Client-Request-Id", state.promptCacheKey)
+	headers.Set("Thread-Id", state.promptCacheKey)
+	headers.Set("X-Codex-Window-Id", state.promptCacheKey+":0")
 }
 
 func applyCodexTurnMetadataIdentityConfuse(rawTurnMetadata string, state *codexIdentityConfuseState) string {
@@ -377,6 +332,7 @@ func applyCodexHeadersFromSources(r *http.Request, auth *cliproxyauth.Auth, toke
 	}
 	misc.EnsureHeader(r.Header, ginHeaders, "Version", "")
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Codex-Turn-Metadata", "")
+	misc.EnsureHeader(r.Header, ginHeaders, "X-Codex-Turn-State", "")
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Client-Request-Id", "")
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Codex-Window-Id", "")
 	misc.EnsureHeader(r.Header, ginHeaders, "Thread-Id", "")
@@ -402,9 +358,7 @@ func applyCodexHeadersFromSources(r *http.Request, auth *cliproxyauth.Auth, toke
 	if !isAPIKey {
 		if auth != nil && auth.Metadata != nil {
 			if accountID, ok := auth.Metadata["account_id"].(string); ok {
-				// Match local Codex CLI 0.146.0 wire form (lowercase). net/http may
-				// re-canonicalize on the wire for HTTP/1.1; case is preserved for H2/WS maps.
-				setHeaderCasePreserved(r.Header, "chatgpt-account-id", accountID)
+				r.Header.Set("Chatgpt-Account-Id", accountID)
 			}
 		}
 	}
@@ -413,25 +367,90 @@ func applyCodexHeadersFromSources(r *http.Request, auth *cliproxyauth.Auth, toke
 		attrs = auth.Attributes
 	}
 	util.ApplyCustomHeadersFromAttrs(r, attrs, ginHeaders)
-	applyCodexCloakingHeaders(r.Header, cfg)
+	applyCodexCloakingHeaders(r.Header, cfg, auth)
 }
 
-func applyCodexCloakingHeaders(headers http.Header, cfg *config.Config) {
-	if headers == nil || cfg == nil || cfg.Codex.DisableCodexCloaking {
+const codexRoutingHintHeader = "X-Codex-Routing-Hint"
+
+// applyCodexRoutingHint sends the routing hint native Codex attaches to every
+// ChatGPT-backend Responses request: "model=<slug>" plus ";tier=<service_tier>"
+// when the body requests a tier (openai/codex rust-v0.155.0,
+// codex-rs/core/src/client.rs build_routing_hint_header). Without it, a
+// translated request carries service_tier=priority only in the body. Whether
+// the backend needs the header to grant priority is undocumented.
+//
+// The model is the resolved model written to the upstream body, while the tier
+// is read from the final body so payload rules cannot make the hint stale. A
+// hint forwarded by a native client names its original model and is replaced.
+// Operator configuration keeps precedence: when an auth "header:" rule for the
+// hint resolves to a value (static, or a "$Header" reference the request
+// carries), that value is sent, and callers apply models.json override_header
+// afterwards. A rule that resolves to nothing falls back to the derived hint.
+// API-key requests are not touched, matching native Codex, which sends no hint
+// to API-key providers.
+func applyCodexRoutingHint(ctx context.Context, headers http.Header, auth *cliproxyauth.Auth, baseModel string, upstreamBody []byte, clientHeaders http.Header) {
+	if codexAuthUsesAPIKey(auth) {
+		return
+	}
+	deleteHeaderCaseInsensitive(headers, codexRoutingHintHeader)
+	if operatorHint := codexOperatorHeaderValue(ctx, auth, clientHeaders, codexRoutingHintHeader); operatorHint != "" {
+		headers.Set(codexRoutingHintHeader, operatorHint)
+		return
+	}
+	model := strings.TrimSpace(baseModel)
+	if model == "" {
+		return
+	}
+	hint := "model=" + model
+	if tier := gjson.GetBytes(upstreamBody, "service_tier"); tier.Type == gjson.String {
+		if value := strings.TrimSpace(tier.String()); value != "" {
+			hint += ";tier=" + value
+		}
+	}
+	headers.Set(codexRoutingHintHeader, hint)
+}
+
+// codexOperatorHeaderValue returns the value the auth's "header:" rules
+// resolve to for name, using the same resolver that applied them to the
+// request, so dynamic references that resolve to nothing report "".
+func codexOperatorHeaderValue(ctx context.Context, auth *cliproxyauth.Auth, clientHeaders http.Header, name string) string {
+	if auth == nil || len(auth.Attributes) == 0 {
+		return ""
+	}
+	resolved := (&http.Request{Header: http.Header{}}).WithContext(ctx)
+	util.ApplyCustomHeadersFromAttrs(resolved, auth.Attributes, clientHeaders)
+	return strings.TrimSpace(resolved.Header.Get(name))
+}
+
+func isCodexCloakingDisabled(cfg *config.Config, auth *cliproxyauth.Auth) bool {
+	if auth != nil && len(auth.Attributes) > 0 {
+		if val, ok := auth.Attributes[cliproxyauth.AttributeCodexDisableCloaking]; ok {
+			if parsed, errParse := strconv.ParseBool(strings.TrimSpace(val)); errParse == nil {
+				return parsed
+			}
+		}
+	}
+	if entry := resolveCodexKeyConfig(cfg, auth); entry != nil && entry.DisableCodexCloaking != nil {
+		return *entry.DisableCodexCloaking
+	}
+	if cfg != nil && cfg.Codex.DisableCodexCloaking {
+		return true
+	}
+	return false
+}
+
+func applyCodexCloakingHeaders(headers http.Header, cfg *config.Config, auth *cliproxyauth.Auth) {
+	if headers == nil || cfg == nil || isCodexCloakingDisabled(cfg, auth) {
 		return
 	}
 	headers.Set("User-Agent", codexUserAgent)
 	headers.Set("Originator", codexOriginator)
-	if strings.TrimSpace(headers.Get("Version")) == "" {
-		headers.Set("Version", codexDefaultVersion)
-	}
-	if strings.TrimSpace(headers.Get("X-Codex-Beta-Features")) == "" && strings.TrimSpace(headers.Get("x-codex-beta-features")) == "" {
-		headers.Set("X-Codex-Beta-Features", codexDefaultBetaFeatures)
-		headers.Set("x-codex-beta-features", codexDefaultBetaFeatures)
-	}
 }
 
-func normalizeCodexInstructions(body []byte) []byte {
+func normalizeCodexInstructions(body []byte, nativeRequest ...bool) []byte {
+	if len(nativeRequest) > 0 && nativeRequest[0] {
+		return body
+	}
 	instructions := gjson.GetBytes(body, "instructions")
 	if !instructions.Exists() || instructions.Type == gjson.Null {
 		body, _ = sjson.SetBytes(body, "instructions", "")
@@ -473,20 +492,8 @@ func isImageGenerationFunctionTool(tool gjson.Result) bool {
 	return false
 }
 
-func isCodexResponsesLiteRequest(body []byte, headers http.Header) bool {
-	if strings.EqualFold(strings.TrimSpace(headers.Get(codexResponsesLiteHeader)), "true") {
-		return true
-	}
-	// Codex Desktop mirrors websocket-only request headers into client_metadata.
-	value := gjson.GetBytes(body, codexResponsesLiteMetadata)
-	if !value.Exists() {
-		return false
-	}
-	return value.Type == gjson.True || value.Type == gjson.String && strings.EqualFold(strings.TrimSpace(value.String()), "true")
-}
-
 func ensureImageGenerationTool(body []byte, baseModel string, auth *cliproxyauth.Auth, headers http.Header) []byte {
-	if isCodexResponsesLiteRequest(body, headers) {
+	if util.IsCodexResponsesLiteRequest(body, headers) {
 		return body
 	}
 	if strings.HasSuffix(baseModel, "spark") {
@@ -511,7 +518,7 @@ func ensureImageGenerationTool(body []byte, baseModel string, auth *cliproxyauth
 }
 
 func normalizeCodexParallelToolCalls(body []byte, headers http.Header) []byte {
-	if isCodexResponsesLiteRequest(body, headers) {
+	if util.IsCodexResponsesLiteRequest(body, headers) {
 		body = helps.SetBoolIfDifferent(body, "parallel_tool_calls", false)
 		return body
 	}

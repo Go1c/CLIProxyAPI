@@ -11,12 +11,7 @@ import (
 func TestManagerMarkResultUsesCredentialCoolingPrecedence(t *testing.T) {
 	previousGlobal := quotaCooldownDisabled.Load()
 	quotaCooldownDisabled.Store(false)
-	prevThreshold := transientErrorThreshold.Load()
-	SetTransientErrorThreshold(1)
-	t.Cleanup(func() {
-		quotaCooldownDisabled.Store(previousGlobal)
-		transientErrorThreshold.Store(prevThreshold)
-	})
+	t.Cleanup(func() { quotaCooldownDisabled.Store(previousGlobal) })
 
 	disabled := true
 	enabled := false

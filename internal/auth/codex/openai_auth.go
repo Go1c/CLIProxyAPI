@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/sync/singleflight"
@@ -49,20 +48,17 @@ func NewCodexAuth(cfg *config.Config) *CodexAuth {
 // proxyURL takes precedence over cfg.ProxyURL when non-empty.
 func NewCodexAuthWithProxyURL(cfg *config.Config, proxyURL string) *CodexAuth {
 	effectiveProxyURL := strings.TrimSpace(proxyURL)
-	if effectiveProxyURL == "" && cfg != nil {
-		effectiveProxyURL = strings.TrimSpace(cfg.ProxyURL)
-	}
-	httpClient, errClient := helps.NewCodexOAuthHTTPClient(cfg, effectiveProxyURL)
-	if errClient != nil {
-		log.Warnf("codex auth: fingerprint client unavailable, falling back to standard transport: %v", errClient)
-		var sdkCfg config.SDKConfig
-		if cfg != nil {
-			sdkCfg = cfg.SDKConfig
+	var sdkCfg config.SDKConfig
+	if cfg != nil {
+		sdkCfg = cfg.SDKConfig
+		if effectiveProxyURL == "" {
+			effectiveProxyURL = strings.TrimSpace(cfg.ProxyURL)
 		}
-		sdkCfg.ProxyURL = effectiveProxyURL
-		httpClient = util.SetProxy(&sdkCfg, &http.Client{})
 	}
-	return &CodexAuth{httpClient: httpClient}
+	sdkCfg.ProxyURL = effectiveProxyURL
+	return &CodexAuth{
+		httpClient: util.SetProxy(&sdkCfg, &http.Client{}),
+	}
 }
 
 // GenerateAuthURL creates the OAuth authorization URL with PKCE (Proof Key for Code Exchange).

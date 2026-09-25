@@ -281,10 +281,6 @@ func TestManagerClaudeStreamTailCancellationIsAvailabilityNeutral(t *testing.T) 
 }
 
 func TestManagerClaudeUpstreamFailureStillCoolsCredential(t *testing.T) {
-	prevThreshold := transientErrorThreshold.Load()
-	SetTransientErrorThreshold(1)
-	t.Cleanup(func() { transientErrorThreshold.Store(prevThreshold) })
-
 	executor := &claudeCancellationTestExecutor{
 		executeFn: func(context.Context, *Auth) (cliproxyexecutor.Response, error) {
 			return cliproxyexecutor.Response{}, &Error{HTTPStatus: http.StatusInternalServerError, Message: "upstream failure"}
