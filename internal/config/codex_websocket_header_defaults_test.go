@@ -54,17 +54,17 @@ func TestLoadConfigOptional_CodexHeaderDefaultsUsesRepositoryDefaults(t *testing
 		t.Fatalf("LoadConfigOptional() error = %v", err)
 	}
 
-	if got := cfg.CodexHeaderDefaults.UserAgent; got != DefaultCodexHeaderUserAgent {
-		t.Fatalf("UserAgent = %q, want %q", got, DefaultCodexHeaderUserAgent)
+	if got := cfg.CodexHeaderDefaults.UserAgent; got != "" {
+		t.Fatalf("UserAgent = %q, want empty (v8 keeps header defaults unset unless configured)", got)
 	}
-	if got := cfg.CodexHeaderDefaults.Originator; got != DefaultCodexHeaderOriginator {
-		t.Fatalf("Originator = %q, want %q", got, DefaultCodexHeaderOriginator)
+	if got := cfg.CodexHeaderDefaults.Originator; got != "" {
+		t.Fatalf("Originator = %q, want empty", got)
 	}
-	if got := cfg.CodexHeaderDefaults.Version; got != DefaultCodexHeaderVersion {
-		t.Fatalf("Version = %q, want %q", got, DefaultCodexHeaderVersion)
+	if got := cfg.CodexHeaderDefaults.Version; got != "" {
+		t.Fatalf("Version = %q, want empty", got)
 	}
-	if got := cfg.CodexHeaderDefaults.BetaFeatures; got != DefaultCodexHeaderBetaFeatures {
-		t.Fatalf("BetaFeatures = %q, want %q", got, DefaultCodexHeaderBetaFeatures)
+	if got := cfg.CodexHeaderDefaults.BetaFeatures; got != "" {
+		t.Fatalf("BetaFeatures = %q, want empty", got)
 	}
 }
 
@@ -75,7 +75,6 @@ func TestLoadConfigOptional_CodexIdentityConfuse(t *testing.T) {
 codex:
   identity-confuse: true
   disable-codex-cloaking: true
-  optimize-multi-agent-v2: true
 `)
 	if err := os.WriteFile(configPath, configYAML, 0o600); err != nil {
 		t.Fatalf("failed to write config: %v", err)
@@ -92,7 +91,58 @@ codex:
 	if !cfg.Codex.DisableCodexCloaking {
 		t.Fatal("DisableCodexCloaking = false, want true")
 	}
-	if !cfg.Codex.OptimizeMultiAgentV2 {
+}
+
+func TestLoadConfigOptional_CodexOptions(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	configYAML := []byte(`
+codex:
+  disable-codex-cloaking: true
+  optimize-multi-agent-v2: true
+`)
+	if err := os.WriteFile(configPath, configYAML, 0o600); err != nil {
+		t.Fatalf("failed to write config: %v", err)
+	}
+
+	cfg, err := LoadConfigOptional(configPath, false)
+	if err != nil {
+		t.Fatalf("LoadConfigOptional() error = %v", err)
+	}
+
+	if !cfg.Codex.DisableCodexCloaking {
+		t.Fatal("DisableCodexCloaking = false, want true")
+	}
+	if !cfg.Client.Codex.OptimizeMultiAgentV2 {
 		t.Fatalf("OptimizeMultiAgentV2 = false, want true")
+	}
+}
+
+func TestLoadConfigOptional_CodexModelLevelCooling(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	configYAML := []byte(`
+codex:
+  model-level-cooling: true
+`)
+	if err := os.WriteFile(configPath, configYAML, 0o600); err != nil {
+		t.Fatalf("failed to write config: %v", err)
+	}
+
+	cfg, err := LoadConfigOptional(configPath, false)
+	if err != nil {
+		t.Fatalf("LoadConfigOptional() error = %v", err)
+	}
+
+	if !cfg.Codex.ModelLevelCooling {
+		t.Fatalf("ModelLevelCooling = false, want true")
+	}
+
+	defaultCfg, errDefault := ParseConfigBytes([]byte(`{}`))
+	if errDefault != nil {
+		t.Fatalf("ParseConfigBytes() error = %v", errDefault)
+	}
+	if defaultCfg.Codex.ModelLevelCooling {
+		t.Fatalf("default ModelLevelCooling = true, want false")
 	}
 }

@@ -4,8 +4,8 @@ import (
 	"strings"
 	"time"
 
-	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/proxyutil"
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/proxyutil"
 )
 
 const (

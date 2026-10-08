@@ -6,7 +6,8 @@ import (
 	"strings"
 	"time"
 
-	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
+	coreusage "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
 )
 
 const homeResultExecutorType = "home-result"
@@ -45,11 +46,14 @@ func (m *Manager) reportHomeUnauthorized(ctx context.Context, auth *Auth, provid
 	if alias == "" {
 		alias = model
 	}
+	clientMeta := logging.GetClientRequestMetadata(ctx)
 	coreusage.PublishRecord(ctx, coreusage.Record{
 		Provider:          provider,
 		ExecutorType:      homeResultExecutorType,
 		Model:             model,
 		Alias:             alias,
+		SessionID:         clientMeta.SessionID,
+		ParentSessionID:   clientMeta.ParentSessionID,
 		AuthID:            auth.ID,
 		AuthIndex:         authIndex,
 		AccessTokenSHA256: accessTokenSHA256,

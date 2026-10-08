@@ -7,13 +7,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
-	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
-	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	coreexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	coreusage "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 )
 
 type testUsageCapturePlugin struct {
@@ -832,5 +833,115 @@ func TestObservePluginExecutorStreamTTFT_Antigravity(t *testing.T) {
 	helps.ObservePluginExecutorStreamTTFT("antigravity", reporter, antigravityChunk)
 	if !reporter.IsTTFTSet() {
 		t.Errorf("ObservePluginExecutorStreamTTFT for antigravity should set TTFT on token event")
+	}
+}
+
+type capturingUsagePlugin struct {
+	captured chan pluginapi.UsageRecord
+}
+
+func (p *capturingUsagePlugin) HandleUsage(_ context.Context, record pluginapi.UsageRecord) {
+	p.captured <- record
+}
+
+func TestUsageAdapterRecoversSessionHierarchyFromContext(t *testing.T) {
+	plugin := &capturingUsagePlugin{captured: make(chan pluginapi.UsageRecord, 1)}
+	host := newHostWithRecords(capabilityRecord{
+		id: "usage-session",
+		plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
+			UsagePlugin: plugin,
+		}},
+	})
+	adapter := &usageAdapter{
+		host:     host,
+		pluginID: "usage-session",
+	}
+
+	ctx := logging.WithClientRequestMetadata(context.Background(), logging.ClientRequestMetadata{
+		SessionID:       "sess-ctx-1",
+		ParentSessionID: "parent-ctx-1",
+	})
+
+	// 1. Record has empty session fields, should recover from context
+	adapter.HandleUsage(ctx, coreusage.Record{
+		Provider: "test-provider",
+		Model:    "test-model",
+	})
+	rec := <-plugin.captured
+	if rec.SessionID != "sess-ctx-1" || rec.ParentSessionID != "parent-ctx-1" {
+		t.Fatalf("recovered session = (%q, %q), want (sess-ctx-1, parent-ctx-1)", rec.SessionID, rec.ParentSessionID)
+	}
+
+	// 2. Self-referential loop protection in context
+	ctxLoop := logging.WithClientRequestMetadata(context.Background(), logging.ClientRequestMetadata{
+		SessionID:       "loop-sess",
+		ParentSessionID: "loop-sess",
+	})
+	adapter.HandleUsage(ctxLoop, coreusage.Record{
+		Provider: "test-provider",
+		Model:    "test-model",
+	})
+	recLoop := <-plugin.captured
+	if recLoop.SessionID != "loop-sess" || recLoop.ParentSessionID != "" {
+		t.Fatalf("loop protection = (%q, %q), want (loop-sess, empty)", recLoop.SessionID, recLoop.ParentSessionID)
+	}
+}
+
+func TestExecutorAdapterExecuteAttributesResponsesUsageToSelectedAuth(t *testing.T) {
+	plugin := newTestUsageCapturePlugin("plugin-provider-responses")
+	registerTestUsagePlugin(t, "test-executor-adapter-responses-auth-usage", plugin)
+
+	executorRecord := normalizeTestCapabilityRecord(capabilityRecord{id: "executor-plugin-responses"})
+	host := newHostWithRecords(executorRecord)
+
+	exec := &fakeExecutor{
+		identifier: "plugin-provider-responses",
+		execute: func(ctx context.Context, req pluginapi.ExecutorRequest) (pluginapi.ExecutorResponse, error) {
+			return pluginapi.ExecutorResponse{
+				Payload: []byte(`{"id":"resp_1","object":"response","service_tier":"default","usage":{"input_tokens":34,"output_tokens":499,"total_tokens":533}}`),
+			}, nil
+		},
+	}
+
+	adapter := newExecutorAdapterForRecordForTest(host, executorRecord, exec,
+		[]sdktranslator.Format{sdktranslator.FormatOpenAIResponse},
+		[]sdktranslator.Format{sdktranslator.FormatOpenAIResponse},
+	)
+	adapter.provider = "plugin-provider-responses"
+
+	auth := &coreauth.Auth{
+		ID:         "auth-responses-1",
+		Provider:   "plugin-provider-responses",
+		FileName:   "auth-responses-1.json",
+		Attributes: map[string]string{"type": "oauth"},
+	}
+	req := coreexecutor.Request{
+		Model:   "deepseek/deepseek-v4.1-flash",
+		Payload: []byte(`{"model":"deepseek/deepseek-v4.1-flash","input":"Write me a poem"}`),
+	}
+	opts := coreexecutor.Options{
+		Stream:         false,
+		SourceFormat:   sdktranslator.FormatOpenAIResponse,
+		ResponseFormat: sdktranslator.FormatOpenAIResponse,
+	}
+
+	ctx := coreusage.WithStream(context.Background(), false)
+	resp, errExecute := adapter.Execute(ctx, auth, req, opts)
+	if errExecute != nil {
+		t.Fatalf("adapter.Execute returned unexpected error: %v", errExecute)
+	}
+	if len(resp.Payload) == 0 {
+		t.Fatal("adapter.Execute returned empty payload")
+	}
+
+	rec := plugin.waitRecord(t, 200*time.Millisecond)
+	if rec.AuthID != auth.ID {
+		t.Errorf("AuthID = %q, want %q", rec.AuthID, auth.ID)
+	}
+	if rec.Stream {
+		t.Errorf("Stream = true, want false")
+	}
+	if rec.Detail.InputTokens != 34 || rec.Detail.OutputTokens != 499 || rec.Detail.TotalTokens != 533 {
+		t.Errorf("usage = %+v, want input=34 output=499 total=533", rec.Detail)
 	}
 }
