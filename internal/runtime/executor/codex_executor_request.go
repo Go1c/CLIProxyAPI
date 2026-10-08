@@ -10,22 +10,24 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
-	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/misc"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
 
 const (
-	codexUserAgent             = "codex-tui/0.154.0 (Mac OS 26.5.2; arm64) iTerm.app/3.6.11 (codex-tui; 0.154.0)"
+	codexUserAgent             = "codex-tui/0.146.0 (Mac OS 26.5.2; arm64) Orca/1.4.178 (codex-tui; 0.146.0)"
 	codexOriginator            = "codex-tui"
+	codexDefaultVersion        = "0.146.0"
+	codexDefaultBetaFeatures   = "remote_compaction_v2"
 	codexDefaultImageToolModel = "gpt-image-2"
 	codexResponsesLiteHeader   = "X-OpenAI-Internal-Codex-Responses-Lite"
 )
@@ -33,20 +35,28 @@ const (
 var dataTag = []byte("data:")
 
 func translateCodexRequestPair(from, to sdktranslator.Format, model string, originalPayload, payload []byte, stream bool, preserveEmptyThinkingBlocks ...bool) ([]byte, []byte) {
+	original, body, _, _ := translateCodexRequestPairWithUpdateIntent(from, to, model, originalPayload, payload, stream, preserveEmptyThinkingBlocks...)
+	return original, body
+}
+
+func translateCodexRequestPairWithUpdateIntent(from, to sdktranslator.Format, model string, originalPayload, payload []byte, stream bool, preserveEmptyThinkingBlocks ...bool) ([]byte, []byte, bool, error) {
 	isCompat := len(preserveEmptyThinkingBlocks) > 0 && preserveEmptyThinkingBlocks[0]
-	translate := func(raw []byte) []byte {
+	ctx := context.Background()
+	translate := func(raw []byte) ([]byte, bool, error) {
 		if isCompat && from == sdktranslator.FormatClaude && to == sdktranslator.FormatCodex {
-			return helps.TranslateRequestWithAPIKeyModelCompatibility(context.Background(), nil, nil, from, to, model, raw, stream, true)
+			body, err := helps.TranslateRequestReturningError(ctx, nil, nil, from, to, model, raw, stream, true)
+			return body, false, err
 		}
-		return sdktranslator.TranslateRequest(from, to, model, raw, stream)
+		translated := sdktranslator.TranslateRequestEnvelope(ctx, from, to, sdktranslator.RequestEnvelope{Format: from, Model: model, Stream: stream, Body: raw})
+		return translated.Body, translated.ConfigurationUpdatesChanged, translated.Err
 	}
 	if bytes.Equal(originalPayload, payload) {
-		body := translate(payload)
-		return body, body
+		body, changed, err := translate(payload)
+		return body, body, changed, err
 	}
-	originalTranslated := translate(originalPayload)
-	body := translate(payload)
-	return originalTranslated, body
+	originalTranslated, _, _ := translate(originalPayload)
+	body, changed, err := translate(payload)
+	return originalTranslated, body, changed, err
 }
 
 // PrepareRequest injects Codex credentials into the outgoing HTTP request.
@@ -80,24 +90,14 @@ func (e *CodexExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth
 	if err := e.PrepareRequest(httpReq, auth); err != nil {
 		return nil, err
 	}
-	httpClient := helps.NewUtlsHTTPClient(ctx, e.cfg, auth, 0)
+	httpClient, errClient := helps.NewCodexRustlsHTTPClient(ctx, e.cfg, auth)
+	if errClient != nil {
+		return nil, errClient
+	}
 	return httpClient.Do(httpReq)
 }
 
-type codexIdentityConfuseState struct {
-	enabled                bool
-	authID                 string
-	originalPromptCacheKey string
-	promptCacheKey         string
-	turnIDs                []codexIdentityReplacement
-}
-
-type codexIdentityReplacement struct {
-	original string
-	confused string
-}
-
-func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Format, url string, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, userPayload []byte, rawJSON []byte, headerSets ...http.Header) (*http.Request, []byte, codexIdentityConfuseState, error) {
+func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Format, url string, req cliproxyexecutor.Request, rawJSON []byte, headerSets ...http.Header) (*http.Request, []byte, error) {
 	var headers http.Header
 	if len(headerSets) > 0 {
 		headers = headerSets[0]
@@ -110,7 +110,7 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Form
 		}
 		cached, ok, errCache := helps.ClaudeCodePromptCache(ctx, modelName, req.Payload, headers)
 		if errCache != nil {
-			return nil, nil, codexIdentityConfuseState{}, errCache
+			return nil, nil, errCache
 		}
 		if ok {
 			cache = cached
@@ -141,19 +141,33 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Form
 		rawJSON = helps.SetStringIfDifferent(rawJSON, "prompt_cache_key", cache.ID)
 	}
 	rawJSON = helps.SanitizeCodexInputItemIDs(rawJSON)
-	var identityState codexIdentityConfuseState
-	rawJSON, identityState = applyCodexIdentityConfuseBody(e.cfg, auth, userPayload, rawJSON)
-	if identityState.promptCacheKey != "" {
-		cache.ID = identityState.promptCacheKey
-	}
+	rawJSON = helps.FinalizePayload(ctx, rawJSON)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(rawJSON))
 	if err != nil {
-		return nil, nil, codexIdentityConfuseState{}, err
+		return nil, nil, err
 	}
 	if cache.ID != "" {
+		// Match local Codex CLI 0.146.0 HTTP Responses headers (Session-Id / Thread-Id /
+		// X-Client-Request-Id / X-Codex-Window-Id share the session UUID).
 		httpReq.Header.Set("Session-Id", cache.ID)
+		httpReq.Header.Set("Thread-Id", cache.ID)
+		httpReq.Header.Set("X-Client-Request-Id", cache.ID)
+		httpReq.Header.Set("X-Codex-Window-Id", cache.ID+":0")
 	}
-	return httpReq, rawJSON, identityState, nil
+	return httpReq, rawJSON, nil
+}
+
+type codexIdentityConfuseState struct {
+	enabled                bool
+	authID                 string
+	originalPromptCacheKey string
+	promptCacheKey         string
+	turnIDs                []codexIdentityReplacement
+}
+
+type codexIdentityReplacement struct {
+	original string
+	confused string
 }
 
 func applyCodexIdentityConfuseBody(cfg *config.Config, auth *cliproxyauth.Auth, userPayload []byte, rawJSON []byte) ([]byte, codexIdentityConfuseState) {
@@ -190,10 +204,28 @@ func applyCodexIdentityConfuseHeaders(headers http.Header, state *codexIdentityC
 		return
 	}
 
-	if rawTurnMetadata := strings.TrimSpace(headers.Get("X-Codex-Turn-Metadata")); rawTurnMetadata != "" {
-		headers.Set("X-Codex-Turn-Metadata", applyCodexTurnMetadataIdentityConfuse(rawTurnMetadata, state))
+	if rawTurnMetadata := strings.TrimSpace(headerValueCaseInsensitive(headers, "x-codex-turn-metadata")); rawTurnMetadata != "" {
+		// Prefer existing wire key casing (HTTP: X-Codex-Turn-Metadata, WS: x-codex-turn-metadata).
+		metaKey := "X-Codex-Turn-Metadata"
+		for existingKey := range headers {
+			if strings.EqualFold(existingKey, metaKey) {
+				metaKey = existingKey
+				break
+			}
+		}
+		setHeaderCasePreserved(headers, metaKey, applyCodexTurnMetadataIdentityConfuse(rawTurnMetadata, state))
 	}
 	if state.promptCacheKey == "" {
+		return
+	}
+
+	// Local Codex CLI 0.146.0 uses MIME-style names on HTTP and lowercase on websocket upgrades.
+	wsWire := headersHaveCodexWebsocketWireForm(headers)
+	if wsWire {
+		setCodexSessionHeaderCasePreserved(headers, "session-id", state.promptCacheKey)
+		setHeaderCasePreserved(headers, "x-client-request-id", state.promptCacheKey)
+		setHeaderCasePreserved(headers, "thread-id", state.promptCacheKey)
+		setHeaderCasePreserved(headers, "x-codex-window-id", state.promptCacheKey+":0")
 		return
 	}
 
@@ -201,9 +233,25 @@ func applyCodexIdentityConfuseHeaders(headers http.Header, state *codexIdentityC
 	if headerValueCaseInsensitive(headers, "Conversation_id") != "" {
 		setHeaderCasePreserved(headers, "Conversation_id", state.promptCacheKey)
 	}
-	headers.Set("X-Client-Request-Id", state.promptCacheKey)
-	headers.Set("Thread-Id", state.promptCacheKey)
-	headers.Set("X-Codex-Window-Id", state.promptCacheKey+":0")
+	setHeaderCasePreserved(headers, "X-Client-Request-Id", state.promptCacheKey)
+	setHeaderCasePreserved(headers, "Thread-Id", state.promptCacheKey)
+	setHeaderCasePreserved(headers, "X-Codex-Window-Id", state.promptCacheKey+":0")
+}
+
+func headersHaveCodexWebsocketWireForm(headers http.Header) bool {
+	if headers == nil {
+		return false
+	}
+	if _, ok := headers["session-id"]; ok {
+		return true
+	}
+	if _, ok := headers["openai-beta"]; ok {
+		return true
+	}
+	if _, ok := headers["thread-id"]; ok {
+		return true
+	}
+	return false
 }
 
 func applyCodexTurnMetadataIdentityConfuse(rawTurnMetadata string, state *codexIdentityConfuseState) string {
@@ -358,7 +406,9 @@ func applyCodexHeadersFromSources(r *http.Request, auth *cliproxyauth.Auth, toke
 	if !isAPIKey {
 		if auth != nil && auth.Metadata != nil {
 			if accountID, ok := auth.Metadata["account_id"].(string); ok {
-				r.Header.Set("Chatgpt-Account-Id", accountID)
+				// Match local Codex CLI 0.146.0 wire form (lowercase). net/http may
+				// re-canonicalize on the wire for HTTP/1.1; case is preserved for H2/WS maps.
+				setHeaderCasePreserved(r.Header, "chatgpt-account-id", accountID)
 			}
 		}
 	}
@@ -423,6 +473,9 @@ func codexOperatorHeaderValue(ctx context.Context, auth *cliproxyauth.Auth, clie
 }
 
 func isCodexCloakingDisabled(cfg *config.Config, auth *cliproxyauth.Auth) bool {
+	if auth != nil && auth.AuthKind() == cliproxyauth.AuthKindAPIKey {
+		cfg = cfg.ForAPIKey()
+	}
 	if auth != nil && len(auth.Attributes) > 0 {
 		if val, ok := auth.Attributes[cliproxyauth.AttributeCodexDisableCloaking]; ok {
 			if parsed, errParse := strconv.ParseBool(strings.TrimSpace(val)); errParse == nil {
@@ -445,6 +498,13 @@ func applyCodexCloakingHeaders(headers http.Header, cfg *config.Config, auth *cl
 	}
 	headers.Set("User-Agent", codexUserAgent)
 	headers.Set("Originator", codexOriginator)
+	if strings.TrimSpace(headers.Get("Version")) == "" {
+		headers.Set("Version", codexDefaultVersion)
+	}
+	if strings.TrimSpace(headers.Get("X-Codex-Beta-Features")) == "" && strings.TrimSpace(headers.Get("x-codex-beta-features")) == "" {
+		headers.Set("X-Codex-Beta-Features", codexDefaultBetaFeatures)
+		headers.Set("x-codex-beta-features", codexDefaultBetaFeatures)
+	}
 }
 
 func normalizeCodexInstructions(body []byte, nativeRequest ...bool) []byte {

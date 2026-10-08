@@ -104,7 +104,12 @@ func TestManager_MarkResult_HTTPStatusWithLifecycleTextStillCooldowns(t *testing
 
 	prevTransient := transientErrorCooldownSeconds.Load()
 	SetTransientErrorCooldownSeconds(5)
-	t.Cleanup(func() { transientErrorCooldownSeconds.Store(prevTransient) })
+	prevThreshold := transientErrorThreshold.Load()
+	SetTransientErrorThreshold(1)
+	t.Cleanup(func() {
+		transientErrorCooldownSeconds.Store(prevTransient)
+		transientErrorThreshold.Store(prevThreshold)
+	})
 
 	cases := []struct {
 		name       string
@@ -167,7 +172,12 @@ func TestManager_MarkResult_NonLifecycleStillCooldowns(t *testing.T) {
 
 	prevTransient := transientErrorCooldownSeconds.Load()
 	SetTransientErrorCooldownSeconds(5)
-	t.Cleanup(func() { transientErrorCooldownSeconds.Store(prevTransient) })
+	prevThreshold := transientErrorThreshold.Load()
+	SetTransientErrorThreshold(1)
+	t.Cleanup(func() {
+		transientErrorCooldownSeconds.Store(prevTransient)
+		transientErrorThreshold.Store(prevThreshold)
+	})
 
 	m := NewManager(nil, nil, nil)
 	auth := &Auth{ID: "auth-still-cools", Provider: "codex"}

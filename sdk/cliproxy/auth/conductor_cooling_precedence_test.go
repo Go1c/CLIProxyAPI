@@ -5,13 +5,18 @@ import (
 	"net/http"
 	"testing"
 
-	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 )
 
 func TestManagerMarkResultUsesCredentialCoolingPrecedence(t *testing.T) {
 	previousGlobal := quotaCooldownDisabled.Load()
 	quotaCooldownDisabled.Store(false)
-	t.Cleanup(func() { quotaCooldownDisabled.Store(previousGlobal) })
+	prevThreshold := transientErrorThreshold.Load()
+	SetTransientErrorThreshold(1)
+	t.Cleanup(func() {
+		quotaCooldownDisabled.Store(previousGlobal)
+		transientErrorThreshold.Store(prevThreshold)
+	})
 
 	disabled := true
 	enabled := false

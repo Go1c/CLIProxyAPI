@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 )
 
 type recordingCooldownStateStore struct {
@@ -225,6 +225,10 @@ func TestFileCooldownStateStore_ConcurrentSave(t *testing.T) {
 }
 
 func TestManager_MarkResult_PersistsCooldownOnlyWhenStateChanges(t *testing.T) {
+	prevThreshold := transientErrorThreshold.Load()
+	SetTransientErrorThreshold(1)
+	t.Cleanup(func() { transientErrorThreshold.Store(prevThreshold) })
+
 	store := &recordingCooldownStateStore{}
 	manager := NewManager(nil, nil, nil)
 	manager.SetCooldownStateStore(store)

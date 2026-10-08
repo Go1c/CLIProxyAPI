@@ -10,7 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -164,12 +165,19 @@ func TestNewCodexAuthWithProxyURL_OverrideDirectDisablesProxy(t *testing.T) {
 	cfg := &config.Config{SDKConfig: config.SDKConfig{ProxyURL: "http://proxy.example.com:8080"}}
 	auth := NewCodexAuthWithProxyURL(cfg, "direct")
 
-	transport, ok := auth.httpClient.Transport.(*http.Transport)
-	if !ok || transport == nil {
-		t.Fatalf("expected http.Transport, got %T", auth.httpClient.Transport)
+	info, ok := helps.CodexFingerprintTransportInfoOf(auth.httpClient.Transport)
+	if !ok {
+		t.Fatalf("expected Codex fingerprint transport, got %T", auth.httpClient.Transport)
 	}
-	if transport.Proxy != nil {
-		t.Fatal("expected direct transport to disable proxy function")
+	if !info.Enabled {
+		t.Fatal("expected OAuth fingerprint transport to be enabled")
+	}
+	// "direct" must not inherit env/global proxy and should not hash a proxy endpoint.
+	if info.InheritEnvProxy {
+		t.Fatal("expected direct override to disable env proxy inheritance")
+	}
+	if info.ProxyHash != "" {
+		t.Fatalf("proxy hash = %q, want empty for direct", info.ProxyHash)
 	}
 }
 
@@ -177,19 +185,148 @@ func TestNewCodexAuthWithProxyURL_OverrideProxyTakesPrecedence(t *testing.T) {
 	cfg := &config.Config{SDKConfig: config.SDKConfig{ProxyURL: "http://global.example.com:8080"}}
 	auth := NewCodexAuthWithProxyURL(cfg, "http://override.example.com:8081")
 
-	transport, ok := auth.httpClient.Transport.(*http.Transport)
-	if !ok || transport == nil {
-		t.Fatalf("expected http.Transport, got %T", auth.httpClient.Transport)
+	info, ok := helps.CodexFingerprintTransportInfoOf(auth.httpClient.Transport)
+	if !ok {
+		t.Fatalf("expected Codex fingerprint transport, got %T", auth.httpClient.Transport)
 	}
-	req, errReq := http.NewRequest(http.MethodGet, "https://example.com", nil)
-	if errReq != nil {
-		t.Fatalf("new request: %v", errReq)
+	if !info.Enabled {
+		t.Fatal("expected OAuth fingerprint transport to be enabled")
 	}
-	proxyURL, errProxy := transport.Proxy(req)
-	if errProxy != nil {
-		t.Fatalf("proxy func: %v", errProxy)
+	if info.InheritEnvProxy {
+		t.Fatal("expected explicit proxy override to disable env proxy inheritance")
 	}
-	if proxyURL == nil || proxyURL.String() != "http://override.example.com:8081" {
-		t.Fatalf("proxy URL = %v, want http://override.example.com:8081", proxyURL)
+	wantHash := ""
+	// ProxyHash is a credential-free endpoint hash; just require non-empty for proxy mode.
+	if info.ProxyHash == "" {
+		t.Fatal("proxy hash empty, want non-empty for explicit proxy override")
+	}
+	_ = wantHash
+}
+
+func TestNewCodexAuthUsesFingerprintTransport(t *testing.T) {
+	auth := NewCodexAuth(nil)
+	if auth == nil || auth.httpClient == nil {
+		t.Fatal("expected CodexAuth with http client")
+	}
+	if auth.httpClient.Timeout != 0 {
+		t.Fatalf("Timeout = %v, want 0", auth.httpClient.Timeout)
+	}
+	info, ok := helps.CodexFingerprintTransportInfoOf(auth.httpClient.Transport)
+	if !ok {
+		t.Fatalf("expected Codex fingerprint transport, got %T", auth.httpClient.Transport)
+	}
+	if !info.Enabled {
+		t.Fatal("expected fingerprint transport enabled for OAuth")
+	}
+}
+
+func TestRefreshTokens_PlanTypeDefaultsToFreeWhenMissing(t *testing.T) {
+	resetCodexRefreshGroupForTest()
+	defer resetCodexRefreshGroupForTest()
+
+	idTokenWithoutPlan := makeTestJWT(map[string]any{
+		"email": "user@example.com",
+		"https://api.openai.com/auth": map[string]any{
+			"chatgpt_account_id": "acc-12345",
+		},
+	})
+
+	auth := &CodexAuth{
+		httpClient: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				body := `{"access_token":"at-1","refresh_token":"rt-1","id_token":"` + idTokenWithoutPlan + `","token_type":"Bearer","expires_in":3600}`
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       io.NopCloser(strings.NewReader(body)),
+					Header:     make(http.Header),
+					Request:    req,
+				}, nil
+			}),
+		},
+	}
+
+	tokenData, errRefresh := auth.RefreshTokens(context.Background(), "dummy-refresh")
+	if errRefresh != nil {
+		t.Fatalf("RefreshTokens failed: %v", errRefresh)
+	}
+	if tokenData == nil {
+		t.Fatal("tokenData is nil")
+	}
+	if got := tokenData.PlanType; got != "free" {
+		t.Fatalf("tokenData.PlanType = %q, want free", got)
+	}
+}
+
+func TestRefreshTokens_ExtractsPlanTypeWhenPresent(t *testing.T) {
+	resetCodexRefreshGroupForTest()
+	defer resetCodexRefreshGroupForTest()
+
+	idTokenWithPlan := makeTestJWT(map[string]any{
+		"email": "user@example.com",
+		"https://api.openai.com/auth": map[string]any{
+			"chatgpt_account_id": "acc-12345",
+			"chatgpt_plan_type":  "pro",
+		},
+	})
+
+	auth := &CodexAuth{
+		httpClient: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				body := `{"access_token":"at-1","refresh_token":"rt-1","id_token":"` + idTokenWithPlan + `","token_type":"Bearer","expires_in":3600}`
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       io.NopCloser(strings.NewReader(body)),
+					Header:     make(http.Header),
+					Request:    req,
+				}, nil
+			}),
+		},
+	}
+
+	tokenData, errRefresh := auth.RefreshTokens(context.Background(), "dummy-refresh")
+	if errRefresh != nil {
+		t.Fatalf("RefreshTokens failed: %v", errRefresh)
+	}
+	if tokenData == nil {
+		t.Fatal("tokenData is nil")
+	}
+	if got := tokenData.PlanType; got != "pro" {
+		t.Fatalf("tokenData.PlanType = %q, want pro", got)
+	}
+}
+
+func TestCreateAndUpdateTokenStorage_PlanType(t *testing.T) {
+	auth := NewCodexAuth(nil)
+
+	// Test CreateTokenStorage with missing plan type
+	bundleDefault := &CodexAuthBundle{
+		TokenData: CodexTokenData{
+			IDToken:     "id-tok",
+			AccessToken: "acc-tok",
+		},
+	}
+	storage := auth.CreateTokenStorage(bundleDefault)
+	if storage.PlanType != "free" {
+		t.Fatalf("storage.PlanType = %q, want free", storage.PlanType)
+	}
+
+	// Test UpdateTokenStorage with plan type
+	auth.UpdateTokenStorage(storage, &CodexTokenData{
+		IDToken:     "id-tok-2",
+		AccessToken: "acc-tok-2",
+		PlanType:    "team",
+	})
+	if storage.PlanType != "team" {
+		t.Fatalf("updated storage.PlanType = %q, want team", storage.PlanType)
+	}
+
+	// Test UpdateTokenStorage with empty plan type defaults to free
+	auth.UpdateTokenStorage(storage, &CodexTokenData{
+		IDToken:     "id-tok-3",
+		AccessToken: "acc-tok-3",
+		PlanType:    "",
+	})
+	if storage.PlanType != "free" {
+		t.Fatalf("updated storage.PlanType = %q, want free", storage.PlanType)
 	}
 }

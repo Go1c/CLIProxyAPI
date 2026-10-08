@@ -6,14 +6,16 @@ import (
 	"sync"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
-	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
-	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
-	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginhost"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	sdkaccess "github.com/router-for-me/CLIProxyAPI/v8/sdk/access"
+	sdkAuth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
+	"fmt"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -49,10 +51,30 @@ var registerPluginExecutors = func(host *pluginhost.Host, manager *coreauth.Mana
 	host.RegisterExecutors(manager, registry.GetGlobalRegistry())
 }
 
+func codexPluginExecutorRequestDecorator(ctx context.Context, _ *coreauth.Auth, decoration pluginhost.ExecutorRequestDecoration) (pluginhost.ExecutorRequestDecoration, error) {
+	assembly, errAssembly := helps.ApplyCodexCacheAssembly(ctx, decoration.SourceFormat, decoration.Model, decoration.SourcePayload, decoration.Payload, decoration.Headers)
+	if errAssembly != nil {
+		return pluginhost.ExecutorRequestDecoration{}, fmt.Errorf("assemble Codex plugin prompt cache: %w", errAssembly)
+	}
+	decoration.Payload = assembly.Body
+	decoration.Headers = assembly.Headers
+	log.WithFields(log.Fields{
+		"cache_key_present":  assembly.CacheKeyPresent,
+		"cache_key_source":   assembly.Source,
+		"session_header_key": assembly.SessionHeaderKey,
+	}).Debug("codex plugin executor request cache assembly")
+	return decoration, nil
+}
+
 // modelRegistrationTaskHook, if set, runs after auth-update commits and before
 // model registration workers start. Tests use it to prove registration no longer
 // holds authUpdateMu.
 var modelRegistrationTaskHook func()
+
+// modelRegistrationTaskPostRunHook, if set, runs synchronously inside model registration
+// tasks after completeModelRegistrationForAuthWithCache completes. Tests use it to inject
+// concurrent auth updates before batch registration finishes.
+var modelRegistrationTaskPostRunHook func(authID string)
 
 // RegisterUsagePlugin registers a usage plugin on the global usage manager.
 // This allows external code to monitor API usage and token consumption.
@@ -163,14 +185,16 @@ func (s *Service) refreshPluginModelRegistrations(ctx context.Context) {
 	if s == nil || s.pluginHost == nil || s.coreManager == nil {
 		return
 	}
+	// Native capability probes publish and refresh their scheduler entries
+	// asynchronously; startup and config updates must not wait for network I/O.
 	s.registerModelsForAuthBatch(ctx, s.coreManager.List())
-	s.waitAntigravityProbesContext(ctx)
 }
 
 func (s *Service) registerModelsForAuthBatch(ctx context.Context, auths []*coreauth.Auth) {
 	if s == nil || s.coreManager == nil || len(auths) == 0 {
 		return
 	}
+	var registeredGen sync.Map
 	tasks := make([]modelRegistrationTask, 0, len(auths))
 	for _, auth := range auths {
 		if auth == nil {
@@ -181,11 +205,31 @@ func (s *Service) registerModelsForAuthBatch(ctx context.Context, auths []*corea
 			phase:    modelRegistrationPhase(authForRegistration),
 			category: modelRegistrationCategory(authForRegistration),
 			run: func(compatCache *openAICompatibilityRegistrationCache) {
-				s.completeModelRegistrationForAuthWithCache(ctx, authForRegistration, compatCache)
+				gen := s.completeModelRegistrationForAuthWithCache(ctx, authForRegistration, compatCache)
+				registeredGen.Store(authForRegistration.ID, gen)
+				if modelRegistrationTaskPostRunHook != nil {
+					modelRegistrationTaskPostRunHook(authForRegistration.ID)
+				}
 			},
 		})
 	}
 	s.runModelRegistrationTasks(ctx, tasks)
+	if ctx != nil && ctx.Err() != nil {
+		return
+	}
+
+	compatCache := s.newOpenAICompatibilityRegistrationCache()
+	for _, latest := range s.coreManager.List() {
+		if latest == nil || latest.ID == "" {
+			continue
+		}
+		lastGenVal, loaded := registeredGen.Load(latest.ID)
+		lastGen, _ := lastGenVal.(uint64)
+		if !loaded || latest.Generation != lastGen {
+			s.ensureExecutorsForAuthWithContext(ctx, latest, false)
+			s.completeModelRegistrationForAuthWithCache(ctx, latest, compatCache)
+		}
+	}
 }
 
 func (s *Service) runModelRegistrationTasks(ctx context.Context, tasks []modelRegistrationTask) {

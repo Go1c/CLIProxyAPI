@@ -11,10 +11,10 @@ import (
 	"testing"
 	"time"
 
-	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
-	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	coreusage "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
 )
 
 type noForkAliasTestExecutor struct {
@@ -1966,6 +1966,10 @@ func TestManager_NoForkAlias_MarkResultTargetModelNoSecondaryAliasResolution(t *
 
 // Test 21: MarkResult on 500/503/transient errors immediately suspends route alias in registry
 func TestManager_NoForkAlias_MarkResultTransientErrorsSyncSuspendRegistry(t *testing.T) {
+	prevThreshold := transientErrorThreshold.Load()
+	t.Cleanup(func() { transientErrorThreshold.Store(prevThreshold) })
+	SetTransientErrorThreshold(1)
+
 	const (
 		provider    = "antigravity"
 		routeModel  = "[ant]gemini-3.7-flash-transient"

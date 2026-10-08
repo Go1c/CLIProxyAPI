@@ -6,9 +6,9 @@ import (
 	"strings"
 	"time"
 
-	xaiauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/xai"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	xaiauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/xai"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -61,8 +61,11 @@ func (e *XAIExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*cl
 	if tokenEndpoint != "" {
 		auth.Metadata["token_endpoint"] = tokenEndpoint
 	}
+	// OAuth refresh must not invent api.x.ai: free CLI tokens get 402 spending-limit
+	// there. Prefer the CLI chat-proxy so HTTP chat, attributes, and websocket
+	// base resolution stay aligned with free Grok CLI credentials.
 	if xaiMetadataString(auth.Metadata, "base_url") == "" {
-		auth.Metadata["base_url"] = xaiauth.DefaultAPIBaseURL
+		auth.Metadata["base_url"] = xaiauth.CLIChatProxyBaseURL
 	}
 	auth.Metadata["last_refresh"] = time.Now().UTC().Format(time.RFC3339)
 	if auth.Attributes == nil {
@@ -70,7 +73,12 @@ func (e *XAIExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*cl
 	}
 	auth.Attributes["auth_kind"] = "oauth"
 	if strings.TrimSpace(auth.Attributes["base_url"]) == "" {
-		auth.Attributes["base_url"] = xaiauth.DefaultAPIBaseURL
+		// Prefer metadata when present (CPA imports keep base_url only in metadata).
+		if metaBase := xaiMetadataString(auth.Metadata, "base_url"); metaBase != "" {
+			auth.Attributes["base_url"] = metaBase
+		} else {
+			auth.Attributes["base_url"] = xaiauth.CLIChatProxyBaseURL
+		}
 	}
 	return auth, nil
 }

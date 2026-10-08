@@ -11,10 +11,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/proxyutil"
 )
 
 func (m *Manager) SetPluginScheduler(scheduler PluginScheduler) {
@@ -213,6 +214,8 @@ func (m *Manager) ReconcileRegistryModelStates(ctx context.Context, authID strin
 		cooldownStateChanged bool
 	)
 
+	releaseMutation := m.lockAuthMutation(authID)
+	defer releaseMutation()
 	m.mu.Lock()
 	auth, ok := m.auths[authID]
 	if ok && auth != nil {
@@ -347,7 +350,7 @@ func (m *Manager) ReconcileRegistryModelStates(ctx context.Context, authID strin
 					}
 					auth.Generation++
 					auth.UpdatedAt = now
-					if errPersist := m.persist(context.Background(), auth); errPersist != nil {
+					if errPersist := m.persistLocked(context.Background(), auth); errPersist != nil {
 						logEntryWithRequestID(ctx).WithField("auth_id", auth.ID).Warnf("failed to persist auth changes during model state reconciliation: %v", errPersist)
 					}
 				}
@@ -361,6 +364,7 @@ func (m *Manager) ReconcileRegistryModelStates(ctx context.Context, authID strin
 		}
 	}
 	m.mu.Unlock()
+	releaseMutation()
 
 	if snapshot == nil {
 		return
@@ -971,6 +975,17 @@ func (m *Manager) pickViaPluginScheduler(ctx context.Context, scheduler PluginSc
 	if !handled || !resp.Handled {
 		return nil, false, nil
 	}
+	if resp.Reject {
+		rejectCode := strings.TrimSpace(resp.RejectCode)
+		if rejectCode == "" {
+			rejectCode = "auth_unavailable"
+		}
+		rejectMessage := strings.TrimSpace(resp.RejectReason)
+		if rejectMessage == "" {
+			rejectMessage = "scheduler rejected candidate selection"
+		}
+		return nil, true, &Error{Code: rejectCode, Message: rejectMessage}
+	}
 	if selected := pickSchedulerAuthByID(candidates, resp.AuthID); selected != nil {
 		return selected, true, nil
 	}
@@ -1066,6 +1081,30 @@ func (m *Manager) HasProviderAuth(provider string) bool {
 			continue
 		}
 		if canonicalSchedulingProvider(auth.Provider) == targetKey {
+			return true
+		}
+	}
+	return false
+}
+
+// HasProviderAuthByKind reports whether the provider has a non-disabled credential
+// of the requested auth kind (for example oauth or apikey).
+func (m *Manager) HasProviderAuthByKind(provider, kind string) bool {
+	if m == nil {
+		return false
+	}
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	kind = normalizeAuthKind(kind)
+	if provider == "" || kind == "" {
+		return false
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, auth := range m.auths {
+		if auth == nil || auth.Disabled || auth.Status == StatusDisabled {
+			continue
+		}
+		if strings.ToLower(strings.TrimSpace(auth.Provider)) == provider && auth.AuthKind() == kind {
 			return true
 		}
 	}
@@ -1329,6 +1368,12 @@ func (m *Manager) shouldRetryAfterErrorWithAttempted(ctx context.Context, opts c
 	}
 	var homeBusy *HomeConcurrencyBusyError
 	if errors.As(err, &homeBusy) && homeBusy != nil {
+		return 0, false
+	}
+	// Proxy-aware execution already performs the single permitted cross-proxy
+	// failover inside execute*MixedOnce. Do not reset its tried set by entering
+	// the outer cooldown retry loop.
+	if _, proxyFailure := proxyutil.AsError(err); proxyFailure {
 		return 0, false
 	}
 	status := statusCodeFromError(err)
@@ -1750,7 +1795,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		if !eligibility.allows(candidate) {
 			continue
 		}
-		if _, used := tried[candidate.ID]; used {
+		if authAttempted(tried, candidate) {
 			continue
 		}
 		if modelKey != "" && !m.authSupportsRouteModel(registryRef, candidate, model) {
@@ -1989,7 +2034,7 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 			if !eligibility.allows(candidate) {
 				continue
 			}
-			if _, used := tried[candidate.ID]; used {
+			if authAttempted(tried, candidate) {
 				continue
 			}
 			if m.routeAwareSelectionRequired(candidate, model) {
@@ -2081,7 +2126,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		if _, ok := providerSet[providerKey]; !ok {
 			continue
 		}
-		if _, used := tried[candidate.ID]; used {
+		if authAttempted(tried, candidate) {
 			continue
 		}
 		if _, ok := m.executorLocked(providerKey); !ok {
@@ -2188,7 +2233,7 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 			if !eligibility.allows(candidate) {
 				continue
 			}
-			if _, used := tried[candidate.ID]; used {
+			if authAttempted(tried, candidate) {
 				continue
 			}
 			if m.routeAwareSelectionRequired(candidate, model) {

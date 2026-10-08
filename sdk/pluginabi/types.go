@@ -104,12 +104,15 @@ const (
 	MethodHostModelStreamClose   = "host.model.stream_close"
 	MethodHostStreamEmit         = "host.stream.emit"
 	MethodHostStreamClose        = "host.stream.close"
+	MethodHostContextWait        = "host.context.wait"
 	MethodHostLog                = "host.log"
 	MethodHostAuthList           = "host.auth.list"
 	MethodHostAuthGet            = "host.auth.get"
 	MethodHostAuthGetRuntime     = "host.auth.get_runtime"
 	MethodHostAuthSave           = "host.auth.save"
 	MethodHostAffinityLookup     = "host.affinity.lookup"
+
+	MethodHostRoutingResetCooldown = "host.routing.reset_cooldown"
 )
 
 type Envelope struct {
@@ -125,6 +128,10 @@ type Error struct {
 	// HTTPStatus is the HTTP status code (e.g. 401, 403, 429) to surface to the client.
 	// When omitted or 0, CPA defaults to HTTP 500 (internal_server_error).
 	HTTPStatus int `json:"http_status,omitempty"`
+	// RetryAfterSeconds is an optional provider retry hint (for example usage
+	// limit resets_in_seconds / resets_at). Hosts that understand this field can
+	// apply credential cooldown without re-parsing the message body.
+	RetryAfterSeconds *float64 `json:"retry_after_seconds,omitempty"`
 }
 
 // Error implements the error interface for Error.

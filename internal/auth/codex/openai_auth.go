@@ -14,8 +14,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/sync/singleflight"
 )
@@ -48,17 +49,22 @@ func NewCodexAuth(cfg *config.Config) *CodexAuth {
 // proxyURL takes precedence over cfg.ProxyURL when non-empty.
 func NewCodexAuthWithProxyURL(cfg *config.Config, proxyURL string) *CodexAuth {
 	effectiveProxyURL := strings.TrimSpace(proxyURL)
-	var sdkCfg config.SDKConfig
-	if cfg != nil {
-		sdkCfg = cfg.SDKConfig
-		if effectiveProxyURL == "" {
-			effectiveProxyURL = strings.TrimSpace(cfg.ProxyURL)
+	if effectiveProxyURL == "" && cfg != nil {
+		effectiveProxyURL = strings.TrimSpace(cfg.ProxyURL)
+	}
+	httpClient, errClient := helps.NewCodexOAuthHTTPClient(cfg, effectiveProxyURL)
+	if errClient != nil || defaultTransportInsecure() {
+		if errClient != nil {
+			log.Warnf("codex auth: fingerprint client unavailable, falling back to standard transport: %v", errClient)
 		}
+		var sdkCfg config.SDKConfig
+		if cfg != nil {
+			sdkCfg = cfg.SDKConfig
+		}
+		sdkCfg.ProxyURL = effectiveProxyURL
+		httpClient = util.SetProxy(&sdkCfg, &http.Client{})
 	}
-	sdkCfg.ProxyURL = effectiveProxyURL
-	return &CodexAuth{
-		httpClient: util.SetProxy(&sdkCfg, &http.Client{}),
-	}
+	return &CodexAuth{httpClient: httpClient}
 }
 
 // GenerateAuthURL creates the OAuth authorization URL with PKCE (Proof Key for Code Exchange).
@@ -160,9 +166,11 @@ func (o *CodexAuth) ExchangeCodeForTokensWithRedirect(ctx context.Context, code,
 
 	accountID := ""
 	email := ""
+	planType := DefaultPlanType
 	if claims != nil {
 		accountID = claims.GetAccountID()
 		email = claims.GetUserEmail()
+		planType = claims.GetPlanType()
 	}
 
 	// Create token data
@@ -172,6 +180,7 @@ func (o *CodexAuth) ExchangeCodeForTokensWithRedirect(ctx context.Context, code,
 		RefreshToken: tokenResp.RefreshToken,
 		AccountID:    accountID,
 		Email:        email,
+		PlanType:     planType,
 		Expire:       time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second).Format(time.RFC3339),
 	}
 
@@ -265,9 +274,11 @@ func (o *CodexAuth) refreshTokensSingleFlight(ctx context.Context, refreshToken 
 
 	accountID := ""
 	email := ""
+	planType := DefaultPlanType
 	if claims != nil {
 		accountID = claims.GetAccountID()
 		email = claims.Email
+		planType = claims.GetPlanType()
 	}
 
 	return &CodexTokenData{
@@ -276,6 +287,7 @@ func (o *CodexAuth) refreshTokensSingleFlight(ctx context.Context, refreshToken 
 		RefreshToken: tokenResp.RefreshToken,
 		AccountID:    accountID,
 		Email:        email,
+		PlanType:     planType,
 		Expire:       time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second).Format(time.RFC3339),
 	}, nil
 }
@@ -283,6 +295,10 @@ func (o *CodexAuth) refreshTokensSingleFlight(ctx context.Context, refreshToken 
 // CreateTokenStorage creates a new CodexTokenStorage from a CodexAuthBundle.
 // It populates the storage struct with token data, user information, and timestamps.
 func (o *CodexAuth) CreateTokenStorage(bundle *CodexAuthBundle) *CodexTokenStorage {
+	planType := DefaultPlanType
+	if bundle != nil && strings.TrimSpace(bundle.TokenData.PlanType) != "" {
+		planType = strings.TrimSpace(bundle.TokenData.PlanType)
+	}
 	storage := &CodexTokenStorage{
 		IDToken:      bundle.TokenData.IDToken,
 		AccessToken:  bundle.TokenData.AccessToken,
@@ -291,6 +307,7 @@ func (o *CodexAuth) CreateTokenStorage(bundle *CodexAuthBundle) *CodexTokenStora
 		LastRefresh:  bundle.LastRefresh,
 		Email:        bundle.TokenData.Email,
 		Expire:       bundle.TokenData.Expire,
+		PlanType:     planType,
 	}
 
 	return storage
@@ -339,6 +356,9 @@ func isNonRetryableRefreshErr(err error) bool {
 // UpdateTokenStorage updates an existing CodexTokenStorage with new token data.
 // This is typically called after a successful token refresh to persist the new credentials.
 func (o *CodexAuth) UpdateTokenStorage(storage *CodexTokenStorage, tokenData *CodexTokenData) {
+	if storage == nil || tokenData == nil {
+		return
+	}
 	storage.IDToken = tokenData.IDToken
 	storage.AccessToken = tokenData.AccessToken
 	storage.RefreshToken = tokenData.RefreshToken
@@ -346,4 +366,18 @@ func (o *CodexAuth) UpdateTokenStorage(storage *CodexTokenStorage, tokenData *Co
 	storage.LastRefresh = time.Now().Format(time.RFC3339)
 	storage.Email = tokenData.Email
 	storage.Expire = tokenData.Expire
+	planType := DefaultPlanType
+	if strings.TrimSpace(tokenData.PlanType) != "" {
+		planType = strings.TrimSpace(tokenData.PlanType)
+	}
+	storage.PlanType = planType
+}
+
+// defaultTransportInsecure reports whether the global http.DefaultTransport
+// override carries InsecureSkipVerify (test harnesses swap DefaultTransport to
+// trust self-signed mock servers). The fingerprint client bypasses
+// http.DefaultTransport, so honor the override and use the standard transport.
+func defaultTransportInsecure() bool {
+	t, ok := http.DefaultTransport.(*http.Transport)
+	return ok && t != nil && t.TLSClientConfig != nil && t.TLSClientConfig.InsecureSkipVerify
 }

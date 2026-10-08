@@ -94,6 +94,9 @@ func TestMethodNamesAreStable(t *testing.T) {
 	if MethodHostModelStreamClose != "host.model.stream_close" {
 		t.Fatalf("MethodHostModelStreamClose = %q", MethodHostModelStreamClose)
 	}
+	if MethodHostContextWait != "host.context.wait" {
+		t.Fatalf("MethodHostContextWait = %q", MethodHostContextWait)
+	}
 	if MethodHostAuthList != "host.auth.list" {
 		t.Fatalf("MethodHostAuthList = %q", MethodHostAuthList)
 	}
@@ -108,6 +111,9 @@ func TestMethodNamesAreStable(t *testing.T) {
 	}
 	if MethodHostAffinityLookup != "host.affinity.lookup" {
 		t.Fatalf("MethodHostAffinityLookup = %q", MethodHostAffinityLookup)
+	}
+	if MethodHostRoutingResetCooldown != "host.routing.reset_cooldown" {
+		t.Fatalf("MethodHostRoutingResetCooldown = %q", MethodHostRoutingResetCooldown)
 	}
 	if MethodExecutorExecuteStream != "executor.execute_stream" {
 		t.Fatalf("MethodExecutorExecuteStream = %q", MethodExecutorExecuteStream)

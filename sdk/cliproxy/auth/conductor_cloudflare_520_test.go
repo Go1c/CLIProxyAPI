@@ -35,6 +35,10 @@ func TestIsCloudflareChallengeErrorMessage_ExcludesOriginErrors(t *testing.T) {
 }
 
 func TestManager_MarkResult_Cloudflare520OriginError_NotTreatedAsChallenge(t *testing.T) {
+
+	SetTransientErrorThreshold(1)
+	t.Cleanup(func() { SetTransientErrorThreshold(0) })
+
 	m := NewManager(nil, nil, nil)
 	auth := &Auth{
 		ID:       "auth-test-520",
@@ -89,12 +93,16 @@ func TestManager_MarkResult_Cloudflare520OriginError_NotTreatedAsChallenge(t *te
 		t.Fatalf("expected model to be marked unavailable during transient cooldown")
 	}
 	diff := time.Until(state.NextRetryAfter)
-	if diff < 45*time.Second || diff > 75*time.Second {
-		t.Fatalf("expected default transient cooldown of ~60s, got %v", diff)
+	if diff < 10*time.Second || diff > 20*time.Second {
+		t.Fatalf("expected default transient cooldown of ~15s (go1c fork baseline), got %v", diff)
 	}
 }
 
 func TestManager_MarkResult_Cloudflare520_CustomTransientCooldown(t *testing.T) {
+
+	SetTransientErrorThreshold(1)
+	t.Cleanup(func() { SetTransientErrorThreshold(0) })
+
 	prevTransient := transientErrorCooldownSeconds.Load()
 	transientErrorCooldownSeconds.Store(5)
 	t.Cleanup(func() { transientErrorCooldownSeconds.Store(prevTransient) })
@@ -221,6 +229,10 @@ func TestManager_MarkResult_Cloudflare520_DisableCoolingAuth(t *testing.T) {
 }
 
 func TestManager_MarkResult_Cloudflare520_WithRetryAfterHint(t *testing.T) {
+
+	SetTransientErrorThreshold(1)
+	t.Cleanup(func() { SetTransientErrorThreshold(0) })
+
 	m := NewManager(nil, nil, nil)
 	auth := &Auth{
 		ID:       "auth-test-520-hint",
@@ -346,6 +358,10 @@ func TestManager_MarkResult_AuthLevelCloudflare520_DisabledTransientCooldown_Ign
 }
 
 func TestManager_MarkResult_HTTP503_TransientCooldown_RespectsDisabledAndHint(t *testing.T) {
+
+	SetTransientErrorThreshold(1)
+	t.Cleanup(func() { SetTransientErrorThreshold(0) })
+
 	// 1. When disabled (-1), 503 with RetryAfter hint must NOT apply cooldown.
 	{
 		prevTransient := transientErrorCooldownSeconds.Load()
@@ -435,6 +451,10 @@ func TestManager_MarkResult_HTTP503_TransientCooldown_RespectsDisabledAndHint(t 
 }
 
 func TestManager_MarkResult_AuthLevelCloudflare520_SetsTransientError(t *testing.T) {
+
+	SetTransientErrorThreshold(1)
+	t.Cleanup(func() { SetTransientErrorThreshold(0) })
+
 	m := NewManager(nil, nil, nil)
 	auth := &Auth{
 		ID:       "auth-test-520-authlevel",
@@ -476,8 +496,8 @@ func TestManager_MarkResult_AuthLevelCloudflare520_SetsTransientError(t *testing
 		t.Fatalf("expected auth to be marked unavailable during transient cooldown")
 	}
 	diff := time.Until(updated.NextRetryAfter)
-	if diff < 45*time.Second || diff > 75*time.Second {
-		t.Fatalf("expected default transient cooldown of ~60s, got %v", diff)
+	if diff < 10*time.Second || diff > 20*time.Second {
+		t.Fatalf("expected default transient cooldown of ~15s (go1c fork baseline), got %v", diff)
 	}
 }
 

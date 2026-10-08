@@ -11,13 +11,13 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
-	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	coreexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 )
 
 type executorManager interface {
@@ -411,7 +411,16 @@ func (a *executorAdapter) prepareExecutorCall(req coreexecutor.Request, opts cor
 	nativeReq := req
 	nativeOpts := opts
 	if inputRequested != "" && inputRequested != inputFormat {
-		nativeReq.Payload = sdktranslator.TranslateRequest(inputRequested, inputFormat, req.Model, req.Payload, opts.Stream)
+		translated := sdktranslator.TranslateRequestEnvelope(context.Background(), inputRequested, inputFormat, sdktranslator.RequestEnvelope{
+			Format: inputRequested,
+			Model:  req.Model,
+			Stream: opts.Stream,
+			Body:   req.Payload,
+		})
+		if translated.Err != nil {
+			return preparedExecutorCall{}, translated.Err
+		}
+		nativeReq.Payload = translated.Body
 	}
 	nativeReq.Format = outputFormat
 	nativeOpts.SourceFormat = inputFormat
@@ -659,7 +668,6 @@ func (a *executorAdapter) Execute(ctx context.Context, auth *coreauth.Auth, req 
 	if a == nil || a.executor == nil || a.host.isPluginFused(a.pluginID) || !a.host.pluginIdentityCurrent(a.pluginID, a.path, a.version) {
 		return coreexecutor.Response{}, fmt.Errorf("plugin executor %s is unavailable", a.Identifier())
 	}
-
 	var reporter *helps.UsageReporter
 	if auth != nil {
 		modelName := strings.TrimSpace(thinking.ParseSuffix(req.Model).ModelName)
@@ -668,7 +676,6 @@ func (a *executorAdapter) Execute(ctx context.Context, auth *coreauth.Auth, req 
 		}
 		reporter = helps.NewExecutorUsageReporter(ctx, a, modelName, auth)
 	}
-
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			a.host.fusePlugin(a.pluginID, "Executor.Execute", recovered)
@@ -688,24 +695,25 @@ func (a *executorAdapter) Execute(ctx context.Context, auth *coreauth.Auth, req 
 	if errPrepare != nil {
 		return coreexecutor.Response{}, errPrepare
 	}
+	prepared, errPrepare = a.decorateExecutorCall(ctx, auth, req, prepared)
+	if errPrepare != nil {
+		return coreexecutor.Response{}, errPrepare
+	}
 
 	if reporter != nil {
 		reporter.SetTranslatedReasoningEffort(prepared.req.Payload, prepared.inputFormat.String())
 		reporter.StartResponseTTFT()
 	}
-
 	pluginResp, errExecute := a.executor.Execute(ctx, buildExecutorRequest(a.host, a.provider, auth, prepared.req, prepared.opts))
 	if errExecute != nil {
 		return coreexecutor.Response{}, errExecute
 	}
-
 	if reporter != nil {
 		reporter.RecordFirstPacket()
 		detail := helps.ParsePluginExecutorResponseUsage(prepared.outputFormat.String(), pluginResp.Payload)
 		reporter.Publish(ctx, detail)
 		reporter.EnsurePublished(ctx)
 	}
-
 	return coreexecutor.Response{
 		Payload:  a.translateExecutorResponse(ctx, prepared, pluginResp.Payload, false, nil),
 		Metadata: cloneAnyMap(pluginResp.Metadata),
@@ -717,7 +725,6 @@ func (a *executorAdapter) ExecuteStream(ctx context.Context, auth *coreauth.Auth
 	if a == nil || a.executor == nil || a.host.isPluginFused(a.pluginID) || !a.host.pluginIdentityCurrent(a.pluginID, a.path, a.version) {
 		return nil, fmt.Errorf("plugin executor %s is unavailable", a.Identifier())
 	}
-
 	var reporter *helps.UsageReporter
 	if auth != nil {
 		modelName := strings.TrimSpace(thinking.ParseSuffix(req.Model).ModelName)
@@ -726,7 +733,6 @@ func (a *executorAdapter) ExecuteStream(ctx context.Context, auth *coreauth.Auth
 		}
 		reporter = helps.NewExecutorUsageReporter(ctx, a, modelName, auth)
 	}
-
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			a.host.fusePlugin(a.pluginID, "Executor.ExecuteStream", recovered)
@@ -746,12 +752,14 @@ func (a *executorAdapter) ExecuteStream(ctx context.Context, auth *coreauth.Auth
 	if errPrepare != nil {
 		return nil, errPrepare
 	}
-
+	prepared, errPrepare = a.decorateExecutorCall(ctx, auth, req, prepared)
+	if errPrepare != nil {
+		return nil, errPrepare
+	}
 	if reporter != nil {
 		reporter.SetTranslatedReasoningEffort(prepared.req.Payload, prepared.inputFormat.String())
 		reporter.StartResponseTTFT()
 	}
-
 	pluginResp, errExecuteStream := a.executor.ExecuteStream(ctx, buildExecutorRequest(a.host, a.provider, auth, prepared.req, prepared.opts))
 	if errExecuteStream != nil {
 		return nil, errExecuteStream
@@ -926,8 +934,18 @@ func (a *executorAdapter) Refresh(ctx context.Context, auth *coreauth.Auth) (ref
 	if len(data.Metadata) == 0 && auth != nil {
 		data.Metadata = cloneAnyMap(auth.Metadata)
 	}
-	if len(data.Attributes) == 0 && auth != nil {
-		data.Attributes = cloneStringMap(auth.Attributes)
+	if len(data.Attributes) == 0 {
+		if auth != nil {
+			data.Attributes = cloneStringMap(auth.Attributes)
+		}
+	} else if auth != nil {
+		attributes := cloneStringMap(data.Attributes)
+		for key, value := range auth.Attributes {
+			if _, exists := attributes[key]; !exists {
+				attributes[key] = value
+			}
+		}
+		data.Attributes = attributes
 	}
 	preserveFileAuthPriority(&data, auth)
 	if len(data.StorageJSON) == 0 {
@@ -939,7 +957,11 @@ func (a *executorAdapter) Refresh(ctx context.Context, auth *coreauth.Auth) (ref
 	if !pluginResp.NextRefreshAfter.IsZero() {
 		data.NextRefreshAfter = pluginResp.NextRefreshAfter
 	}
-	next := a.host.AuthDataToCoreAuth(data, "", data.FileName)
+	path := ""
+	if auth != nil && auth.Attributes != nil {
+		path = auth.Attributes[coreauth.AttributePath]
+	}
+	next := a.host.AuthDataToCoreAuth(data, path, data.FileName)
 	if next == nil {
 		return nil, fmt.Errorf("plugin executor %s refresh returned invalid auth data", a.Identifier())
 	}

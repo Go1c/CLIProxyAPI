@@ -1,0 +1,17 @@
+{
+  "name": "codex-http2-keepalive",
+  "version": "0.1.0",
+  "description": "Codex HTTP/2 keepalive plugin",
+  "author": {
+    "name": "Local developer"
+  },
+  "interface": {
+    "displayName": "Codex HTTP/2 Keepalive",
+    "shortDescription": "Use Codex HTTP/2 keepalive for Codex OAuth requests.",
+    "longDescription": "Codex HTTP/2 keepalive keeps Codex upstream connections warm with plugin-owned pooling and HTTP/2 liveness pings.",
+    "developerName": "Local developer",
+    "category": "Productivity",
+    "capabilities": [],
+    "defaultPrompt": "Help me use Codex Http2 Keepalive."
+  }
+}

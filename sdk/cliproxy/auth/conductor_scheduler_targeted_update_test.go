@@ -7,11 +7,15 @@ import (
 	"testing"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 )
 
 func TestManager_MarkResult_TargetedModelShardUpdate(t *testing.T) {
+
+	SetTransientErrorThreshold(1)
+	t.Cleanup(func() { SetTransientErrorThreshold(0) })
+
 	manager := NewManager(nil, &RoundRobinSelector{}, nil)
 	reg := registry.GetGlobalRegistry()
 	authID := "auth-targeted-test"
@@ -306,6 +310,10 @@ func TestScheduler_MarkResult_OutOfOrderCrossModelUpdates(t *testing.T) {
 }
 
 func TestScheduler_MarkResult_EmptyModelShardUpdated(t *testing.T) {
+
+	SetTransientErrorThreshold(1)
+	t.Cleanup(func() { SetTransientErrorThreshold(0) })
+
 	manager := NewManager(nil, &RoundRobinSelector{}, nil)
 	reg := registry.GetGlobalRegistry()
 	authID := "auth-empty-shard-test"

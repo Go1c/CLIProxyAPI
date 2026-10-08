@@ -13,13 +13,13 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/clienterror"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -1459,6 +1459,38 @@ func TestHostLogCallbackRestoresRegisteredRequestContext(t *testing.T) {
 	got := out.String()
 	if !strings.Contains(got, "plugin callback message") || !strings.Contains(got, "request_id=request-123") {
 		t.Fatalf("log output = %q, want message and request_id field", got)
+	}
+}
+
+func TestHostContextWaitReportsRequestCancellation(t *testing.T) {
+	host := New()
+	ctx, cancel := context.WithCancel(context.Background())
+	callbackID, closeCallback := host.openCallbackContext(ctx)
+	defer closeCallback()
+	rawReq, errMarshal := json.Marshal(rpcHostContextWaitRequest{HostCallbackID: callbackID})
+	if errMarshal != nil {
+		t.Fatalf("marshal context wait request: %v", errMarshal)
+	}
+	result := make(chan rpcHostContextWaitResponse, 1)
+	go func() {
+		rawResp, errCall := host.callFromPlugin(context.Background(), pluginabi.MethodHostContextWait, rawReq)
+		if errCall != nil {
+			return
+		}
+		resp, errDecode := decodeRPCEnvelope[rpcHostContextWaitResponse](rawResp)
+		if errDecode == nil {
+			result <- resp
+		}
+	}()
+
+	cancel()
+	select {
+	case resp := <-result:
+		if !resp.Canceled {
+			t.Fatal("Canceled = false, want true")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("context wait did not return after request cancellation")
 	}
 }
 

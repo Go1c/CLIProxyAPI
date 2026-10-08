@@ -15,17 +15,20 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/clienterror"
-	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	internallogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	internallogging "github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/proxyutil"
 )
 
 var quotaCooldownDisabled atomic.Bool
 
 var transientErrorCooldownSeconds atomic.Int64
+
+var transientErrorThreshold atomic.Int64
 
 // SetQuotaCooldownDisabled toggles auth/model cooldown scheduling globally.
 func SetQuotaCooldownDisabled(disable bool) {
@@ -33,9 +36,26 @@ func SetQuotaCooldownDisabled(disable bool) {
 }
 
 // SetTransientErrorCooldownSeconds configures cooldowns for 408/500/502/503/504.
-// 0 keeps the legacy default; negative values disable transient error cooldowns.
+// 0 keeps the default cooldown (15s). Negative values disable transient error cooldowns.
 func SetTransientErrorCooldownSeconds(seconds int) {
 	transientErrorCooldownSeconds.Store(int64(seconds))
+}
+
+// SetTransientErrorThreshold configures how many consecutive transient failures
+// (408/500/502/503/504) are required before a credential is cooled down.
+// 0 keeps the default (2). Use 1 for the legacy single-failure behavior.
+// Shared upstream capacity errors (server_is_overloaded / capacity_exhausted)
+// cool immediately, matching upstream overload failover.
+func SetTransientErrorThreshold(n int) {
+	transientErrorThreshold.Store(int64(n))
+}
+
+func transientErrorFailureThreshold() int64 {
+	n := transientErrorThreshold.Load()
+	if n <= 0 {
+		return transientErrorThresholdDefault
+	}
+	return n
 }
 
 // QuotaCooldownDisabledForAuth returns whether cooling is disabled for the auth under global settings.
@@ -123,6 +143,48 @@ func recoverableFailureRetryAfterWithHint(now time.Time, retryAfter *time.Durati
 	return now.Add(time.Duration(seconds) * time.Second)
 }
 
+// nextTransientErrorCooldownAfterFailure advances the consecutive-failure counter and,
+// once the threshold is reached, returns a cooldown deadline.
+//
+// Shared upstream capacity errors cool immediately so retry rounds can rotate
+// to other credentials. Generic 408/500/502/503/504 still require consecutive
+// failures. When cooling is disabled, the counter is left unchanged and no
+// deadline is scheduled.
+func nextTransientErrorCooldownAfterFailure(failCount int, disableCooling bool, now time.Time, resultErr *Error, retryAfter *time.Duration) (time.Time, int) {
+	if disableCooling {
+		return time.Time{}, failCount
+	}
+	if isSharedUpstreamCapacityError(resultErr) {
+		return recoverableFailureRetryAfterWithHint(now, retryAfter, false), 0
+	}
+	failCount++
+	if int64(failCount) < transientErrorFailureThreshold() {
+		return time.Time{}, failCount
+	}
+	return recoverableFailureRetryAfterWithHint(now, retryAfter, false), 0
+}
+
+// isSharedUpstreamCapacityError reports whether the failure is an upstream-wide capacity
+// signal (e.g. server_is_overloaded) rather than a credential-local fault.
+func isSharedUpstreamCapacityError(err *Error) bool {
+	if err == nil {
+		return false
+	}
+	switch statusCodeFromResult(err) {
+	case http.StatusRequestTimeout, http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+	default:
+		return false
+	}
+	combined := strings.ToLower(strings.TrimSpace(err.Code) + " " + strings.TrimSpace(err.Message))
+	if combined == "" {
+		return false
+	}
+	return strings.Contains(combined, "server_is_overloaded") ||
+		strings.Contains(combined, "overloaded_error") ||
+		strings.Contains(combined, "model_capacity_exhausted") ||
+		strings.Contains(combined, "capacity_exhausted")
+}
+
 // SetConfig updates the runtime config snapshot used by request-time helpers.
 // Callers should provide the latest config on reload so per-credential alias mapping stays in sync.
 func (m *Manager) SetConfig(cfg *internalconfig.Config) {
@@ -161,6 +223,23 @@ func (m *Manager) setConfigSnapshotLocked(cfg *internalconfig.Config) bool {
 		m.homeSessionAliases.clear()
 	}
 	m.runtimeConfig.Store(cfg)
+	// Refresh Codex proxy runtime attributes against the latest global proxy /
+	// codex-proxy-required settings so selection and management probes stay consistent.
+	m.mu.Lock()
+	proxySnapshots := make([]*Auth, 0, len(m.auths))
+	for _, auth := range m.auths {
+		if auth == nil {
+			continue
+		}
+		m.normalizeCodexProxyRuntime(auth, cfg)
+		proxySnapshots = append(proxySnapshots, auth.Clone())
+	}
+	m.mu.Unlock()
+	if m.scheduler != nil {
+		for _, auth := range proxySnapshots {
+			m.scheduler.upsertAuth(auth)
+		}
+	}
 	clearedCooldowns := m.clearDisabledCooldownStates(cfg)
 	if clearedCooldowns && oldCooldownStore != nil {
 		m.mu.Lock()
@@ -357,7 +436,7 @@ func (m *Manager) restoreCooldownRecordLocked(record CooldownStateRecord, now ti
 		return false
 	}
 	auth := m.auths[authID]
-	if auth == nil || auth.Disabled || auth.Status == StatusDisabled || m.cooldownDisabledForAuth(auth) {
+	if auth == nil || auth.Disabled || auth.Status == StatusDisabled || m.cooldownDisabledForAuth(auth) || hasUnauthorizedAuthFailure(auth) {
 		return false
 	}
 	updatedAt := record.UpdatedAt
@@ -404,6 +483,9 @@ func (m *Manager) restoreCooldownRecordLocked(record CooldownStateRecord, now ti
 
 func clearCooldownStateForAuth(auth *Auth, now time.Time) bool {
 	if auth == nil {
+		return false
+	}
+	if hasUnauthorizedAuthFailure(auth) {
 		return false
 	}
 	changed := false
@@ -472,6 +554,8 @@ func (m *Manager) ResetQuota(ctx context.Context, authID string) (*Auth, []strin
 	registeredModels := modelsForRegisteredAuth(authID)
 	cooldownStateChanged := false
 
+	releaseMutation := m.lockAuthMutation(authID)
+	defer releaseMutation()
 	m.mu.Lock()
 	auth, ok := m.auths[authID]
 	if !ok || auth == nil {
@@ -508,9 +592,11 @@ func (m *Manager) ResetQuota(ctx context.Context, authID string) (*Auth, []strin
 	models = dedupeStrings(models)
 
 	if !auth.Disabled && auth.Status != StatusDisabled && !hasModelError(auth, now) {
-		auth.LastError = nil
-		auth.StatusMessage = ""
-		auth.Status = StatusActive
+		if !hasUnauthorizedAuthFailure(auth) {
+			auth.LastError = nil
+			auth.StatusMessage = ""
+			auth.Status = StatusActive
+		}
 	}
 	auth.Generation++
 	auth.UpdatedAt = now
@@ -519,8 +605,9 @@ func (m *Manager) ResetQuota(ctx context.Context, authID string) (*Auth, []strin
 		cooldownRecordsAfter := m.cooldownStateRecordsForAuthLocked(auth, now)
 		cooldownStateChanged = !cooldownStateRecordsEqual(cooldownRecordsBefore, cooldownRecordsAfter)
 	}
-	errPersist := m.persist(ctx, auth)
+	errPersist := m.persistLocked(ctx, auth)
 	m.mu.Unlock()
+	releaseMutation()
 
 	defer func() {
 		if cooldownStateChanged {
@@ -739,6 +826,17 @@ func cooldownReason(statusMessage string, quota QuotaState, lastErr *Error) stri
 	return ""
 }
 
+// isStaleExecutionResult reports whether an execution result originated from a superseded
+// credential version or an earlier registration epoch than the currently active auth.
+func isStaleExecutionResult(result Result, current *Auth) bool {
+	if current == nil {
+		return false
+	}
+	staleVersion := result.CredentialVersion < current.CredentialVersion && (result.CredentialVersion > 0 || current.CredentialVersion > 1)
+	staleEpoch := result.RegistrationEpoch > 0 && result.RegistrationEpoch < current.RegistrationEpoch
+	return staleVersion || staleEpoch
+}
+
 // MarkResult records an execution result and notifies hooks.
 func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	if result.AuthID == "" {
@@ -761,8 +859,17 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	cooldownStateChanged := false
 	now := time.Now()
 
+	releaseMutation := m.lockAuthMutation(result.AuthID)
+	defer releaseMutation()
 	m.mu.Lock()
 	if auth, ok := m.auths[result.AuthID]; ok && auth != nil {
+		if isStaleExecutionResult(result, auth) {
+			m.mu.Unlock()
+			releaseMutation()
+			m.hook.OnResult(ctx, result)
+			m.publishErrorEvent(result, nil)
+			return
+		}
 		if modelKey == "" && strings.TrimSpace(result.RouteModel) != "" {
 			if m != nil {
 				modelKey = m.selectionModelKeyForAuth(auth, result.RouteModel)
@@ -772,6 +879,13 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			}
 		}
 		now = time.Now()
+		if strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+			if result.Success {
+				proxyutil.RecordSuccess(auth.ID, authProxyHash(auth), now)
+			} else if proxyErr := proxyErrorFromResult(auth, result.Error); proxyErr != nil {
+				_ = proxyutil.RecordFailure(auth.ID, proxyErr, now)
+			}
+		}
 		responseHeaders := internallogging.GetResponseHeaders(ctx)
 		modelState := existingModelState(auth, modelKey)
 		var cooldownRecordsBefore []CooldownStateRecord
@@ -785,9 +899,16 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		} else {
 			auth.Failed++
 		}
+		wasTerminalUnauthorized := hasUnauthorizedAuthFailure(auth)
 
 		if result.Success {
-			if auth.Quota.Reason == "credential_quota" && auth.Quota.NextRecoverAt.After(now) {
+			if wasTerminalUnauthorized {
+				if modelKey != "" {
+					state := ensureModelState(auth, modelKey)
+					modelState = state
+					resetModelState(state, now)
+				}
+			} else if auth.Quota.Reason == "credential_quota" && auth.Quota.NextRecoverAt.After(now) {
 				// Retain active credential-scoped cooldown
 			} else if modelKey != "" {
 				state := ensureModelState(auth, modelKey)
@@ -818,8 +939,10 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 					if result.Error != nil {
 						state.LastError = cloneError(result.Error)
 						state.StatusMessage = result.Error.Message
-						auth.LastError = cloneError(result.Error)
-						auth.StatusMessage = result.Error.Message
+						if !wasTerminalUnauthorized {
+							auth.LastError = cloneError(result.Error)
+							auth.StatusMessage = result.Error.Message
+						}
 					}
 
 					statusCode := statusCodeFromResult(result.Error)
@@ -836,7 +959,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 						next, backoffLevel := nextCloudflareCooldown(state.Quota.BackoffLevel, disableCooling, now)
 						state.NextRetryAfter = next
 						state.StatusMessage = "cloudflare challenge"
-						if auth.LastError != nil {
+						if auth.LastError != nil && !wasTerminalUnauthorized {
 							auth.StatusMessage = "cloudflare challenge"
 						}
 						applyCooldownFields(&state.Quota, QuotaState{
@@ -934,20 +1057,32 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 										})
 									}
 								}
-								auth.Unavailable = true
-								authNext := credentialNext
-								if auth.Quota.Exceeded && auth.Quota.Reason == "credential_quota" &&
-									auth.Quota.NextRecoverAt.After(authNext) {
-									authNext = auth.Quota.NextRecoverAt
+								if !wasTerminalUnauthorized {
+									auth.Unavailable = true
+									authNext := credentialNext
+									if auth.Quota.Exceeded && auth.Quota.Reason == "credential_quota" &&
+										auth.Quota.NextRecoverAt.After(authNext) {
+										authNext = auth.Quota.NextRecoverAt
+									}
+									auth.Quota.Exceeded = true
+									auth.Quota.Reason = "credential_quota"
+									auth.Quota.NextRecoverAt = authNext
+									auth.Quota.BackoffLevel = backoffLevel
+									auth.NextRetryAfter = authNext
 								}
-								auth.Quota.Exceeded = true
-								auth.Quota.Reason = "credential_quota"
-								auth.Quota.NextRecoverAt = authNext
-								auth.Quota.BackoffLevel = backoffLevel
-								auth.NextRetryAfter = authNext
 							}
 						case 408, 500, 502, 503, 504, 520, 521, 522, 523, 524, 525, 526:
-							state.NextRetryAfter = recoverableFailureRetryAfterWithHint(now, result.RetryAfter, disableCooling)
+							if isSharedUpstreamCapacityError(result.Error) {
+								state.StatusMessage = "upstream capacity exhausted"
+								if auth.LastError != nil {
+									auth.StatusMessage = "upstream capacity exhausted"
+								}
+							}
+							next, failCount := nextTransientErrorCooldownAfterFailure(state.TransientFailCount, disableCooling, now, result.Error, result.RetryAfter)
+							state.TransientFailCount = failCount
+							if !next.IsZero() || state.NextRetryAfter.IsZero() {
+								state.NextRetryAfter = next
+							}
 							state.Unavailable = !state.NextRetryAfter.IsZero()
 						default:
 							state.NextRetryAfter = recoverableFailureRetryAfter(now, disableCooling)
@@ -977,8 +1112,17 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 				if result.Error != nil && result.Error.Code == ErrorCodeForceCooldown {
 					disableCooling = false
 				}
-				applyAuthFailureState(auth, result.Error, result.RetryAfter, now, disableCooling)
+				if !wasTerminalUnauthorized {
+					applyAuthFailureState(auth, result.Error, result.RetryAfter, now, disableCooling)
+				}
 			}
+		}
+
+		if wasTerminalUnauthorized {
+			auth.Unavailable = true
+			auth.Status = StatusError
+			auth.NextRefreshAfter = time.Time{}
+			auth.NextRetryAfter = time.Time{}
 		}
 
 		auth.Generation++
@@ -991,7 +1135,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			}
 		}
 
-		_ = m.persist(ctx, auth)
+		_ = m.persistLocked(ctx, auth)
 		authSnapshot = auth.Clone()
 		if trackCooldownState {
 			cooldownRecordsAfter := m.cooldownStateRecordsForAuthLocked(auth, now)
@@ -999,6 +1143,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		}
 	}
 	m.mu.Unlock()
+	releaseMutation()
 	if m.scheduler != nil && authSnapshot != nil {
 		var targetModels []string
 		if !result.CredentialScope && modelKey != "" {
@@ -1044,6 +1189,14 @@ func (m *Manager) updateSessionAffinity(result Result) {
 }
 
 func (m *Manager) recordExecutionResult(ctx context.Context, result Result, auth *Auth, ephemeral bool) {
+	if auth != nil {
+		if result.CredentialVersion == 0 {
+			result.CredentialVersion = auth.CredentialVersion
+		}
+		if result.RegistrationEpoch == 0 {
+			result.RegistrationEpoch = auth.RegistrationEpoch
+		}
+	}
 	if !ephemeral {
 		m.MarkResult(ctx, result)
 		return
@@ -1071,8 +1224,17 @@ func (m *Manager) recordAvailabilityNeutralResult(ctx context.Context, result Re
 	}
 
 	var authSnapshot *Auth
+	releaseMutation := m.lockAuthMutation(result.AuthID)
+	defer releaseMutation()
 	m.mu.Lock()
 	if auth, ok := m.auths[result.AuthID]; ok && auth != nil {
+		if isStaleExecutionResult(result, auth) {
+			m.mu.Unlock()
+			releaseMutation()
+			m.hook.OnResult(ctx, result)
+			m.publishErrorEvent(result, nil)
+			return
+		}
 		now := time.Now()
 		auth.recordRecentRequest(now, result.Success)
 		if result.Success {
@@ -1082,10 +1244,11 @@ func (m *Manager) recordAvailabilityNeutralResult(ctx context.Context, result Re
 		}
 		auth.Generation++
 		auth.UpdatedAt = now
-		_ = m.persist(ctx, auth)
+		_ = m.persistLocked(ctx, auth)
 		authSnapshot = auth.Clone()
 	}
 	m.mu.Unlock()
+	releaseMutation()
 
 	m.hook.OnResult(ctx, result)
 	m.publishErrorEvent(result, authSnapshot)
@@ -1213,6 +1376,7 @@ func resetModelState(state *ModelState, now time.Time) {
 	state.NextRetryAfter = time.Time{}
 	state.LastError = nil
 	applyCooldownFields(&state.Quota, QuotaState{})
+	state.TransientFailCount = 0
 	state.UpdatedAt = now
 }
 
@@ -1295,6 +1459,9 @@ func modelStateIsClean(state *ModelState) bool {
 	if state.Unavailable || state.StatusMessage != "" || !state.NextRetryAfter.IsZero() || state.LastError != nil {
 		return false
 	}
+	if state.TransientFailCount != 0 {
+		return false
+	}
 	if state.Quota.Exceeded || state.Quota.Reason != "" || !state.Quota.NextRecoverAt.IsZero() || state.Quota.BackoffLevel != 0 {
 		return false
 	}
@@ -1303,6 +1470,12 @@ func modelStateIsClean(state *ModelState) bool {
 
 func updateAggregatedAvailability(auth *Auth, now time.Time) {
 	if auth == nil {
+		return
+	}
+	// A terminal unauthorized credential stays blocked until its tokens change.
+	// Model-level results must not make it selectable again.
+	if hasUnauthorizedAuthFailure(auth) {
+		auth.Unavailable = true
 		return
 	}
 	if auth.Quota.Exceeded && auth.Quota.Reason == "credential_quota" && auth.Quota.NextRecoverAt.After(now) {
@@ -1414,6 +1587,10 @@ func clearAuthStateOnSuccess(auth *Auth, now time.Time) {
 	if auth == nil {
 		return
 	}
+	if hasUnauthorizedAuthFailure(auth) {
+		auth.Unavailable = true
+		return
+	}
 	auth.Unavailable = false
 	auth.Status = StatusActive
 	auth.StatusMessage = ""
@@ -1423,6 +1600,7 @@ func clearAuthStateOnSuccess(auth *Auth, now time.Time) {
 	auth.Quota.BackoffLevel = 0
 	auth.LastError = nil
 	auth.NextRetryAfter = time.Time{}
+	auth.TransientFailCount = 0
 	auth.UpdatedAt = now
 }
 
@@ -1470,6 +1648,13 @@ func isRequestScopedError(err error) bool {
 func resultErrorFromError(err error) *Error {
 	if err == nil {
 		return nil
+	}
+	if proxyErr, ok := proxyutil.AsError(err); ok && proxyErr != nil {
+		return &Error{
+			Code:      proxyErr.Code,
+			Message:   proxyErr.Error(),
+			Retryable: proxyErr.Retryable,
+		}
 	}
 	var sourceErr *Error
 	var resultErr *Error
@@ -1680,7 +1865,7 @@ func hasUnauthorizedAuthFailure(auth *Auth) bool {
 	if auth == nil || auth.LastError == nil {
 		return false
 	}
-	if auth.Unavailable && auth.Status == StatusError && auth.NextRefreshAfter.IsZero() &&
+	if auth.Unavailable && auth.Status == StatusError && auth.NextRefreshAfter.IsZero() && auth.NextRetryAfter.IsZero() &&
 		(auth.LastError.StatusCode() == http.StatusUnauthorized || strings.EqualFold(auth.LastError.Code, "unauthorized")) {
 		return true
 	}
@@ -1691,6 +1876,25 @@ func hasUnauthorizedAuthFailure(auth *Auth) bool {
 // with no pending refresh scheduled.
 func HasUnauthorizedAuthFailure(auth *Auth) bool {
 	return hasUnauthorizedAuthFailure(auth)
+}
+
+func hasDisabledInvalidGrantFailure(auth *Auth) bool {
+	if auth == nil {
+		return false
+	}
+	isDisabled := auth.Disabled || auth.Status == StatusDisabled
+	if !isDisabled {
+		return false
+	}
+	if auth.LastError != nil && (isInvalidGrantResultError(auth.LastError) || isInvalidGrantErrorMessage(auth.LastError.Message) || isInvalidGrantErrorMessage(auth.LastError.Code)) {
+		return true
+	}
+	return false
+}
+
+// HasDisabledInvalidGrantFailure reports whether the auth is disabled and has encountered an invalid_grant error.
+func HasDisabledInvalidGrantFailure(auth *Auth) bool {
+	return hasDisabledInvalidGrantFailure(auth)
 }
 
 func refreshErrorFromError(err error) *Error {
@@ -1793,22 +1997,28 @@ func isInvalidGrantError(err error) bool {
 	if err == nil {
 		return false
 	}
-	status := statusCodeFromError(err)
-	if status != http.StatusBadRequest && status != http.StatusUnauthorized {
+	if !isInvalidGrantErrorMessage(err.Error()) {
 		return false
 	}
-	return isInvalidGrantErrorMessage(err.Error())
+	status := statusCodeFromError(err)
+	if status == http.StatusBadRequest || status == http.StatusUnauthorized || status == 0 {
+		return true
+	}
+	return false
 }
 
 func isInvalidGrantResultError(err *Error) bool {
 	if err == nil {
 		return false
 	}
-	status := statusCodeFromResult(err)
-	if status != http.StatusBadRequest && status != http.StatusUnauthorized {
+	if !isInvalidGrantErrorMessage(err.Code) && !isInvalidGrantErrorMessage(err.Message) {
 		return false
 	}
-	return isInvalidGrantErrorMessage(err.Code) || isInvalidGrantErrorMessage(err.Message)
+	status := statusCodeFromResult(err)
+	if status == http.StatusBadRequest || status == http.StatusUnauthorized || status == 0 {
+		return true
+	}
+	return false
 }
 
 func isModelSupportResultError(err *Error) bool {
@@ -2263,8 +2473,16 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 			auth.Quota.NextRecoverAt = next
 			auth.NextRetryAfter = next
 		case 408, 500, 502, 503, 504, 520, 521, 522, 523, 524, 525, 526:
-			auth.StatusMessage = "transient upstream error"
-			auth.NextRetryAfter = recoverableFailureRetryAfterWithHint(now, retryAfter, disableCooling)
+			if isSharedUpstreamCapacityError(resultErr) {
+				auth.StatusMessage = "upstream capacity exhausted"
+			} else {
+				auth.StatusMessage = "transient upstream error"
+			}
+			next, failCount := nextTransientErrorCooldownAfterFailure(auth.TransientFailCount, disableCooling, now, resultErr, retryAfter)
+			auth.TransientFailCount = failCount
+			if !next.IsZero() || auth.NextRetryAfter.IsZero() {
+				auth.NextRetryAfter = next
+			}
 			auth.Unavailable = !auth.NextRetryAfter.IsZero()
 		default:
 			if auth.StatusMessage == "" {

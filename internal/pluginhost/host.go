@@ -11,12 +11,12 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -81,6 +81,7 @@ type Host struct {
 	modelRegistrations     map[string]pluginModelRegistration
 	providerModels         map[string][]*registryModelInfo
 	executorProviders      map[string]struct{}
+	executorDecorators     map[string]ExecutorRequestDecorator
 	accessProviderKeys     map[string]struct{}
 	commandLineFlags       map[string]commandLineFlagRecord
 	commandLineHits        map[string]struct{}
@@ -112,6 +113,7 @@ func New() *Host {
 		modelRegistrations:     make(map[string]pluginModelRegistration),
 		providerModels:         make(map[string][]*registryModelInfo),
 		executorProviders:      make(map[string]struct{}),
+		executorDecorators:     make(map[string]ExecutorRequestDecorator),
 		accessProviderKeys:     make(map[string]struct{}),
 		commandLineFlags:       make(map[string]commandLineFlagRecord),
 		commandLineHits:        make(map[string]struct{}),
@@ -404,6 +406,7 @@ func (h *Host) ApplyConfig(ctx context.Context, cfg *config.Config) {
 	h.snapshot.Store(&Snapshot{enabled: true, records: records, quotaSupportedProviders: make(map[string][]string)})
 	h.mu.Unlock()
 	h.refreshThinkingProviders(records)
+	h.warnCodexExecutorIdentityConfuseFallback()
 	for _, fields := range hotReloadLogs {
 		log.WithFields(fields).Info("pluginhost: plugin hot reloaded")
 	}
@@ -1019,17 +1022,17 @@ func (h *Host) rollbackReplacement(lp *loadedPlugin, item runtimeItemConfig) (ca
 		return capabilityRecord{}, pluginFile{}, false
 	}
 	return capabilityRecord{
-		id:       lp.id,
-		path:     lp.path,
-		version:  lp.version,
-		priority: item.Priority,
-		meta:     plugin.Metadata,
-		plugin:   plugin,
-	}, pluginFile{
-		ID:      lp.id,
-		Path:    lp.path,
-		Version: lp.version,
-	}, true
+			id:       lp.id,
+			path:     lp.path,
+			version:  lp.version,
+			priority: item.Priority,
+			meta:     plugin.Metadata,
+			plugin:   plugin,
+		}, pluginFile{
+			ID:      lp.id,
+			Path:    lp.path,
+			Version: lp.version,
+		}, true
 }
 
 func (h *Host) callRegister(ctx context.Context, lp *loadedPlugin, item runtimeItemConfig) (pluginapi.Plugin, bool) {

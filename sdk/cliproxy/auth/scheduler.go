@@ -9,8 +9,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 )
 
 // schedulerStrategy identifies which built-in routing semantics the scheduler should apply.
@@ -716,10 +716,8 @@ func scheduledAuthPredicate(eligibility authSelectionEligibility, tried map[stri
 		if pinnedAuthID != "" && entry.auth.ID != pinnedAuthID {
 			return false
 		}
-		if len(tried) > 0 {
-			if _, ok := tried[entry.auth.ID]; ok {
-				return false
-			}
+		if authAttempted(tried, entry.auth) {
+			return false
 		}
 		return true
 	}

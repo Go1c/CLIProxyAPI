@@ -5,7 +5,7 @@ import (
 	"context"
 	"strings"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -61,6 +61,9 @@ func (h *Host) RouteModelExcept(ctx context.Context, req pluginapi.ModelRouteReq
 			}
 			return resp, true
 		case pluginapi.ModelRouteTargetSelf, pluginapi.ModelRouteTargetExecutor:
+			if h.executorPluginBlockedByCodexIdentityConfuse(resp.Target) {
+				continue
+			}
 			if !h.executorPluginReady(resp.Target, nextReq) {
 				log.WithFields(log.Fields{"plugin_id": record.id, "target_plugin_id": resp.Target}).Warn("pluginhost: model router returned unavailable executor plugin")
 				continue

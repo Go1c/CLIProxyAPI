@@ -5,10 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
 type streamBridge struct {
@@ -39,8 +41,10 @@ type streamBridgeEmit struct {
 }
 
 type streamBridgeClose struct {
-	errorMessage string
-	accepted     chan struct{}
+	errorMessage      string
+	httpStatus        int
+	retryAfterSeconds *float64
+	accepted          chan struct{}
 }
 
 type rpcStreamEmitRequest struct {
@@ -50,8 +54,42 @@ type rpcStreamEmitRequest struct {
 }
 
 type rpcStreamCloseRequest struct {
-	StreamID string `json:"stream_id"`
-	Error    string `json:"error,omitempty"`
+	StreamID          string   `json:"stream_id"`
+	Error             string   `json:"error,omitempty"`
+	HTTPStatus        int      `json:"http_status,omitempty"`
+	RetryAfterSeconds *float64 `json:"retry_after_seconds,omitempty"`
+}
+
+// streamCloseError carries optional status/retry metadata from a plugin stream close.
+type streamCloseError struct {
+	message    string
+	statusCode int
+	retryAfter *time.Duration
+}
+
+func (e streamCloseError) Error() string {
+	return e.message
+}
+
+func (e streamCloseError) StatusCode() int {
+	return e.statusCode
+}
+
+func (e streamCloseError) RetryAfter() *time.Duration {
+	return e.retryAfter
+}
+
+func streamCloseErrorFromRequest(req rpcStreamCloseRequest) error {
+	message := strings.TrimSpace(req.Error)
+	if message == "" {
+		return nil
+	}
+	err := streamCloseError{message: message, statusCode: req.HTTPStatus}
+	if req.RetryAfterSeconds != nil && *req.RetryAfterSeconds > 0 {
+		retryAfter := time.Duration(*req.RetryAfterSeconds * float64(time.Second))
+		err.retryAfter = &retryAfter
+	}
+	return err
 }
 
 func newStreamBridge() *streamBridge {
@@ -97,8 +135,12 @@ func (s *streamBridgeStream) run() {
 		case request := <-s.closes:
 			s.markClosed()
 			close(request.accepted)
-			if request.errorMessage != "" {
-				queue = append(queue, pluginapi.ExecutorStreamChunk{Err: fmt.Errorf("%s", request.errorMessage)})
+			if err := streamCloseErrorFromRequest(rpcStreamCloseRequest{
+				Error:             request.errorMessage,
+				HTTPStatus:        request.httpStatus,
+				RetryAfterSeconds: request.retryAfterSeconds,
+			}); err != nil {
+				queue = append(queue, pluginapi.ExecutorStreamChunk{Err: err})
 			}
 			for len(queue) > 0 {
 				select {
@@ -162,12 +204,18 @@ func (s *streamBridgeStream) emit(ctx context.Context, chunk pluginapi.ExecutorS
 }
 
 func (s *streamBridgeStream) close(errorMessage string) {
+	s.closeWithMeta(errorMessage, 0, nil)
+}
+
+func (s *streamBridgeStream) closeWithMeta(errorMessage string, statusCode int, retryAfterSeconds *float64) {
 	if s == nil {
 		return
 	}
 	request := streamBridgeClose{
-		errorMessage: errorMessage,
-		accepted:     make(chan struct{}),
+		errorMessage:      errorMessage,
+		httpStatus:        statusCode,
+		retryAfterSeconds: retryAfterSeconds,
+		accepted:          make(chan struct{}),
 	}
 	select {
 	case <-s.finished:
@@ -229,6 +277,10 @@ func (b *streamBridge) emit(ctx context.Context, id string, chunk pluginapi.Exec
 }
 
 func (b *streamBridge) close(id string, errorMessage string) {
+	b.closeWithError(id, errorMessage, 0, nil)
+}
+
+func (b *streamBridge) closeWithError(id string, errorMessage string, statusCode int, retryAfterSeconds *float64) {
 	if b == nil || id == "" {
 		return
 	}
@@ -239,5 +291,5 @@ func (b *streamBridge) close(id string, errorMessage string) {
 	if stream == nil {
 		return
 	}
-	stream.close(errorMessage)
+	stream.closeWithMeta(errorMessage, statusCode, retryAfterSeconds)
 }

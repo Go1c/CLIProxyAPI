@@ -8,8 +8,8 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 )
 
 type claudeCancellationTestExecutor struct {
@@ -281,6 +281,10 @@ func TestManagerClaudeStreamTailCancellationIsAvailabilityNeutral(t *testing.T) 
 }
 
 func TestManagerClaudeUpstreamFailureStillCoolsCredential(t *testing.T) {
+	prevThreshold := transientErrorThreshold.Load()
+	SetTransientErrorThreshold(1)
+	t.Cleanup(func() { transientErrorThreshold.Store(prevThreshold) })
+
 	executor := &claudeCancellationTestExecutor{
 		executeFn: func(context.Context, *Auth) (cliproxyexecutor.Response, error) {
 			return cliproxyexecutor.Response{}, &Error{HTTPStatus: http.StatusInternalServerError, Message: "upstream failure"}
