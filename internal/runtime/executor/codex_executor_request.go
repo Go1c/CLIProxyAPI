@@ -24,9 +24,9 @@ import (
 )
 
 const (
-	codexUserAgent             = "codex-tui/0.146.0 (Mac OS 26.5.2; arm64) Orca/1.4.178 (codex-tui; 0.146.0)"
+	codexUserAgent             = "codex-tui/0.154.0 (Mac OS 26.5.2; arm64) iTerm.app/3.6.11 (codex-tui; 0.154.0)"
 	codexOriginator            = "codex-tui"
-	codexDefaultVersion        = "0.146.0"
+	codexDefaultVersion        = "0.154.0"
 	codexDefaultBetaFeatures   = "remote_compaction_v2"
 	codexDefaultImageToolModel = "gpt-image-2"
 	codexResponsesLiteHeader   = "X-OpenAI-Internal-Codex-Responses-Lite"
@@ -147,7 +147,7 @@ func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Form
 		return nil, nil, err
 	}
 	if cache.ID != "" {
-		// Match local Codex CLI 0.146.0 HTTP Responses headers (Session-Id / Thread-Id /
+		// Match codex-tui 0.154.0 HTTP Responses headers (Session-Id / Thread-Id /
 		// X-Client-Request-Id / X-Codex-Window-Id share the session UUID).
 		httpReq.Header.Set("Session-Id", cache.ID)
 		httpReq.Header.Set("Thread-Id", cache.ID)
@@ -219,7 +219,7 @@ func applyCodexIdentityConfuseHeaders(headers http.Header, state *codexIdentityC
 		return
 	}
 
-	// Local Codex CLI 0.146.0 uses MIME-style names on HTTP and lowercase on websocket upgrades.
+	// codex-tui uses MIME-style names on HTTP and lowercase on websocket upgrades.
 	wsWire := headersHaveCodexWebsocketWireForm(headers)
 	if wsWire {
 		setCodexSessionHeaderCasePreserved(headers, "session-id", state.promptCacheKey)
@@ -406,7 +406,7 @@ func applyCodexHeadersFromSources(r *http.Request, auth *cliproxyauth.Auth, toke
 	if !isAPIKey {
 		if auth != nil && auth.Metadata != nil {
 			if accountID, ok := auth.Metadata["account_id"].(string); ok {
-				// Match local Codex CLI 0.146.0 wire form (lowercase). net/http may
+				// Match codex-tui wire form (lowercase). net/http may
 				// re-canonicalize on the wire for HTTP/1.1; case is preserved for H2/WS maps.
 				setHeaderCasePreserved(r.Header, "chatgpt-account-id", accountID)
 			}
