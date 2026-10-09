@@ -8,14 +8,14 @@ const (
 )
 
 const (
-	DefaultCodexHeaderUserAgent    = "codex-tui/0.146.0 (Mac OS 26.5.2; arm64) Orca/1.4.178 (codex-tui; 0.146.0)"
+	DefaultCodexHeaderUserAgent    = "codex-tui/0.154.0 (Mac OS 26.5.2; arm64) iTerm.app/3.6.11 (codex-tui; 0.154.0)"
 	DefaultCodexHeaderOriginator   = "codex-tui"
-	DefaultCodexHeaderVersion      = "0.146.0"
+	DefaultCodexHeaderVersion      = "0.154.0"
 	DefaultCodexHeaderBetaFeatures = "remote_compaction_v2"
 )
 
 // DefaultCodexHeaderDefaults returns the Codex identity header defaults aligned
-// to the local Codex CLI 0.146.0 profile.
+// to the current codex-tui release profile.
 func DefaultCodexHeaderDefaults() CodexHeaderDefaults {
 	return CodexHeaderDefaults{
 		UserAgent:    DefaultCodexHeaderUserAgent,
